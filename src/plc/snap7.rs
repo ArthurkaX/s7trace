@@ -1,90 +1,168 @@
-/// Snap7 FFI bindings scaffold.
+/// Snap7 FFI bindings — runtime DLL loading via `libloading`.
 ///
-/// This module provides a `Snap7Client` that implements `PlcClient`
-/// via `libsnap7` FFI. The library is loaded at runtime (or linked)
-/// and calls are marshalled through `libc` FFI.
+/// `snap7.dll` is loaded at runtime (Windows). If the DLL is not available,
+/// `Snap7Client::try_new()` returns `None`, and the server falls back to
+/// `MockPlcClient`.
 ///
 /// # Safety
 ///
-/// Raw FFI calls are `unsafe`. Each public function documents its
-/// safety preconditions.
+/// Raw FFI calls are `unsafe`. Each public function documents its preconditions.
 
 use crate::plc::client::PlcClient;
 use crate::types::*;
-use libc::c_uint;
-use log::{debug, error, info};
+use libc::{c_char, c_int, c_void};
+use libloading::Library;
+use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use std::ffi::CString;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
-// Snap7 FFI constants
+// Snap7 constants
 // ---------------------------------------------------------------------------
 
 const S7_CLIENT_DEFAULT: i32 = 0;
 const S7_ISO_ON_TCP: i32 = 1;
-const S7_OVER_PNI: i32 = 2;
-const S7_OVER_INDUSTRIAL_ETHERNET: i32 = 3;
 
 const S7AREA_DB: i32 = 0x84;
 
 const S7WL_BYTE: i32 = 0x02;
-const S7WL_WORD: i32 = 0x04;
-const S7WL_DWORD: i32 = 0x06;
+
+// Param IDs for Cli_GetParam / Cli_SetParam
+const PDU_LENGTH_PARAM: i32 = 10; // p_i32_PDULength
 
 // ---------------------------------------------------------------------------
-// FFI declarations (external from libsnap7)
+// Dynamically loaded Snap7 library
 // ---------------------------------------------------------------------------
 
-mod ffi {
-    #![allow(non_camel_case_types, dead_code)]
-    use libc::{c_char, c_int, c_uint, c_void};
+/// Runtime-loaded `snap7.dll`. Holds all resolved function pointers.
+pub struct Snap7Library {
+    _lib: Library,
 
-    pub type s7_object = c_void;
+    // Lifecycle
+    cli_create: unsafe extern "C" fn() -> *mut c_void,
+    cli_destroy: unsafe extern "C" fn(*mut c_void),
 
-    extern "C" {
-        pub fn Cli_Create() -> *mut s7_object;
-        pub fn Cli_Destroy(client: *mut s7_object);
-        pub fn Cli_ConnectTo(
-            client: *mut s7_object,
-            address: *const c_char,
-            rack: c_int,
-            slot: c_int,
-        ) -> c_int;
-        pub fn Cli_Disconnect(client: *mut s7_object);
-        pub fn Cli_Connected(client: *const s7_object) -> c_int;
-        pub fn Cli_GetParam(
-            client: *const s7_object,
-            param_number: c_int,
-            value: *mut c_void,
-        ) -> c_int;
-        pub fn Cli_SetParam(
-            client: *mut s7_object,
-            param_number: c_int,
-            value: *mut c_void,
-        ) -> c_int;
-        pub fn Cli_ReadArea(
-            client: *mut s7_object,
-            area: c_int,
-            db_number: c_uint,
-            start: c_uint,
-            amount: c_uint,
-            word_len: c_int,
-            data: *mut c_void,
-        ) -> c_int;
-        pub fn Cli_WriteArea(
-            client: *mut s7_object,
-            area: c_int,
-            db_number: c_uint,
-            start: c_uint,
-            amount: c_uint,
-            word_len: c_int,
-            data: *const c_void,
-        ) -> c_int;
-        pub fn Cli_LastError(client: *const s7_object) -> c_int;
-        pub fn Cli_ErrorText(
-            err_no: c_int,
-            buffer: *mut c_char,
-            size: c_int,
-        );
+    // Connection
+    cli_connect_to:
+        unsafe extern "C" fn(*mut c_void, *const c_char, c_int, c_int) -> c_int,
+    cli_disconnect: unsafe extern "C" fn(*mut c_void),
+    cli_connected: unsafe extern "C" fn(*const c_void) -> c_int,
+
+    // Parameters
+    cli_get_param:
+        unsafe extern "C" fn(*const c_void, c_int, *mut c_void) -> c_int,
+    cli_set_param: unsafe extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int,
+
+    // I/O
+    cli_read_area:
+        unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *mut c_void)
+            -> c_int,
+
+    // Error
+    cli_last_error: unsafe extern "C" fn(*const c_void) -> c_int,
+    cli_error_text: unsafe extern "C" fn(c_int, *mut c_char, c_int),
+}
+
+impl Snap7Library {
+    /// Try to load `snap7.dll` and resolve all function symbols.
+    pub fn try_load() -> Result<Self, String> {
+        unsafe {
+            let lib = Library::new("snap7.dll").map_err(|e| {
+                format!("cannot load snap7.dll: {e}")
+            })?;
+
+
+            Ok(Snap7Library {
+                cli_create: *lib.get(b"Cli_Create\0")
+                    .map_err(|e| format!("Cli_Create: {e}"))?,
+                cli_destroy: *lib.get(b"Cli_Destroy\0")
+                    .map_err(|e| format!("Cli_Destroy: {e}"))?,
+                cli_connect_to: *lib.get(b"Cli_ConnectTo\0")
+                    .map_err(|e| format!("Cli_ConnectTo: {e}"))?,
+                cli_disconnect: *lib.get(b"Cli_Disconnect\0")
+                    .map_err(|e| format!("Cli_Disconnect: {e}"))?,
+                cli_connected: *lib.get(b"Cli_Connected\0")
+                    .map_err(|e| format!("Cli_Connected: {e}"))?,
+                cli_get_param: *lib.get(b"Cli_GetParam\0")
+                    .map_err(|e| format!("Cli_GetParam: {e}"))?,
+                cli_set_param: *lib.get(b"Cli_SetParam\0")
+                    .map_err(|e| format!("Cli_SetParam: {e}"))?,
+                cli_read_area: *lib.get(b"Cli_ReadArea\0")
+                    .map_err(|e| format!("Cli_ReadArea: {e}"))?,
+                cli_last_error: *lib.get(b"Cli_LastError\0")
+                    .map_err(|e| format!("Cli_LastError: {e}"))?,
+                cli_error_text: *lib.get(b"Cli_ErrorText\0")
+                    .map_err(|e| format!("Cli_ErrorText: {e}"))?,
+                _lib: lib,
+            })
+        }
+    }
+
+    /// Create a new Snap7 client handle.
+    pub fn create(&self) -> *mut c_void {
+        unsafe { (self.cli_create)() }
+    }
+
+    /// Destroy a Snap7 client handle.
+    pub fn destroy(&self, handle: *mut c_void) {
+        unsafe { (self.cli_destroy)(handle) }
+    }
+
+    /// Connect to a PLC.
+    pub fn connect_to(
+        &self,
+        handle: *mut c_void,
+        address: *const c_char,
+        rack: c_int,
+        slot: c_int,
+    ) -> c_int {
+        unsafe { (self.cli_connect_to)(handle, address, rack, slot) }
+    }
+
+    /// Disconnect from a PLC.
+    pub fn disconnect(&self, handle: *mut c_void) {
+        unsafe { (self.cli_disconnect)(handle) }
+    }
+
+    /// Check if connected.
+    pub fn is_connected(&self, handle: *const c_void) -> bool {
+        unsafe { (self.cli_connected)(handle) != 0 }
+    }
+
+    /// Get a parameter value.
+    pub fn get_param(&self, handle: *const c_void, param: c_int, value: *mut c_void) -> c_int {
+        unsafe { (self.cli_get_param)(handle, param, value) }
+    }
+
+    /// Set a parameter value.
+    pub fn set_param(&self, handle: *mut c_void, param: c_int, value: *mut c_void) -> c_int {
+        unsafe { (self.cli_set_param)(handle, param, value) }
+    }
+
+    /// Read an area of PLC memory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_area(
+        &self,
+        handle: *mut c_void,
+        area: c_int,
+        db_number: c_int,
+        start: c_int,
+        amount: c_int,
+        word_len: c_int,
+        data: *mut c_void,
+    ) -> c_int {
+        unsafe { (self.cli_read_area)(handle, area, db_number, start, amount, word_len, data) }
+    }
+
+    /// Get the last error code.
+    pub fn last_error(&self, handle: *const c_void) -> c_int {
+        unsafe { (self.cli_last_error)(handle) }
+    }
+
+    /// Convert an error code to human-readable text.
+    pub fn error_text(&self, err_no: c_int, buffer: *mut c_char, size: c_int) {
+        unsafe { (self.cli_error_text)(err_no, buffer, size) }
     }
 }
 
@@ -92,40 +170,59 @@ mod ffi {
 // Snap7 error mapping
 // ---------------------------------------------------------------------------
 
+/// Map Snap7 error codes to `PlcError`.
 fn map_snap7_error(err_code: i32, context: &str) -> PlcError {
+    use PlcError::*;
+
     match err_code {
-        0 => PlcError::Internal(format!("{context}: unexpected zero error")),
-        // evrTimeOut
-        0x00010100..=0x000101FF => PlcError::Timeout(format!("{context}: timeout (code 0x{err_code:x})")),
-        // evrNegotiationPDU, evrCliNegotiatingPDU
-        0x00100000..=0x0010FFFF => PlcError::ProtocolError(format!("{context}: PDU negotiation error (0x{err_code:x})")),
-        // ISO connection errors
-        0x00020000..=0x0002FFFF => PlcError::Disconnected(format!("{context}: connection error (0x{err_code:x})")),
-        // Address errors
-        0x00A00000..=0x00A0FFFF => PlcError::AddressOutOfRange {
-            address: context.to_string(),
-            detail: format!("Snap7 error 0x{err_code:x}"),
-        },
-        _ => {
-            // Try to get error text
-            let mut buf = [0i8; 256];
-            unsafe {
-                ffi::Cli_ErrorText(err_code, buf.as_mut_ptr(), buf.len() as i32);
+        0 => Internal(format!("{}: no error but called with error", context)),
+
+        // libnoresults (0x00010000)
+        err if err & 0x00010000 != 0 => {
+            if err & 0x00000010 != 0 {
+                AddressOutOfRange {
+                    address: context.to_string(),
+                    detail: "address out of range".into(),
+                }
+            } else if err & 0x00000040 != 0 {
+                Timeout(context.to_string())
+            } else if err & 0x00000001 != 0 {
+                PlcUnavailable(context.to_string())
+            } else if err & 0x00000100 != 0 {
+                Disconnected(context.to_string())
+            } else {
+                ProtocolError(format!("{} (snap7 error 0x{err_code:08x})", context))
             }
-            let c_str = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-            let text = c_str.to_string_lossy();
-            PlcError::ProtocolError(format!("{context}: {text} (0x{err_code:x})"))
         }
+        // litexceptions (0x00020000) — protocol level
+        err if err & 0x00020000 != 0 => ProtocolError(format!(
+            "{} (snap7 error 0x{err_code:08x})",
+            context
+        )),
+
+        // Parameter / function ref errors (0x00040000)
+        err if err & 0x00040000 != 0 => Internal(format!("{} (snap7 0x{err_code:08x})", context)),
+
+        _ => DecodeError { detail: format!("{} (snap7 error 0x{err_code:08x})", context) },
     }
+}
+
+/// Get the error text from snap7 for logging.
+fn snap7_error_text(lib: &Snap7Library, err_code: i32) -> String {
+    let mut buf = [0i8; 256];
+    lib.error_text(err_code, buf.as_mut_ptr(), buf.len() as i32);
+    let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    cstr.to_string_lossy().into_owned()
 }
 
 // ---------------------------------------------------------------------------
 // Snap7Client
 // ---------------------------------------------------------------------------
 
-/// A PLC client backed by a live Snap7 connection.
+/// A PLC client backed by a live Snap7 connection via dynamically loaded DLL.
 pub struct Snap7Client {
-    handle: *mut ffi::s7_object,
+    lib: Arc<Snap7Library>,
+    handle: *mut c_void,
     host: String,
     rack: i32,
     slot: i32,
@@ -135,35 +232,44 @@ pub struct Snap7Client {
 unsafe impl Send for Snap7Client {}
 
 impl Snap7Client {
-    /// Create a new Snap7 client targeting the given host/rack/slot.
+    /// Try to create a new Snap7 client.
     ///
-    /// Does not connect until `connect()` is called.
-    pub fn new(host: &str, rack: i32, slot: i32) -> Self {
-        let handle = unsafe { ffi::Cli_Create() };
+    /// Returns `None` if `snap7.dll` cannot be loaded (e.g. not installed).
+    pub fn try_new(host: &str, rack: i32, slot: i32) -> Option<Self> {
+        let lib = match Snap7Library::try_load() {
+            Ok(lib) => Arc::new(lib),
+            Err(e) => {
+                warn!("Snap7 not available: {e}");
+                return None;
+            }
+        };
+
+        let handle = lib.create();
         if handle.is_null() {
-            panic!("Snap7 Cli_Create returned null pointer");
+            error!("Snap7 Cli_Create returned null pointer");
+            return None;
         }
 
         // Set connection type to ISO over TCP
         let conn_type = S7_ISO_ON_TCP;
-        let pconn = &conn_type as *const i32 as *mut libc::c_void;
-        unsafe {
-            ffi::Cli_SetParam(handle, 1, pconn); // p_u16_ConnType = 1
-        }
+        let pconn = &conn_type as *const i32 as *mut c_void;
+        lib.set_param(handle, 1, pconn); // p_u16_ConnType = 1
 
-        Snap7Client {
+        Some(Snap7Client {
+            lib,
             handle,
             host: host.to_string(),
             rack,
             slot,
             connected: false,
-        }
+        })
     }
 
-    /// Convert Snap7 error codes to our type.
+    /// Convert snap7 error code with human-readable text.
     fn last_error(&self, context: &str) -> PlcError {
-        let code = unsafe { ffi::Cli_LastError(self.handle) };
-        map_snap7_error(code, context)
+        let code = self.lib.last_error(self.handle);
+        let text = snap7_error_text(&self.lib, code);
+        map_snap7_error(code, &format!("{}: {}", context, text))
     }
 }
 
@@ -171,9 +277,9 @@ impl Drop for Snap7Client {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             if self.connected {
-                unsafe { ffi::Cli_Disconnect(self.handle) };
+                self.lib.disconnect(self.handle);
             }
-            unsafe { ffi::Cli_Destroy(self.handle) };
+            self.lib.destroy(self.handle);
         }
     }
 }
@@ -183,14 +289,14 @@ impl PlcClient for Snap7Client {
         let addr = CString::new(self.host.clone())
             .map_err(|e| PlcError::Internal(format!("invalid hostname: {e}")))?;
 
-        let err = unsafe { ffi::Cli_ConnectTo(self.handle, addr.as_ptr(), self.rack, self.slot) };
+        let err = self.lib.connect_to(self.handle, addr.as_ptr(), self.rack, self.slot);
 
         if err == 0 {
             self.connected = true;
             info!("connected to {} (rack={}, slot={})", self.host, self.rack, self.slot);
             Ok(())
         } else {
-            let plc_err = map_snap7_error(err, &format!("connect to {}", self.host));
+            let plc_err = self.last_error(&format!("connect to {}", self.host));
             error!("{}", plc_err);
             Err(plc_err)
         }
@@ -198,7 +304,7 @@ impl PlcClient for Snap7Client {
 
     fn disconnect(&mut self) {
         if self.connected {
-            unsafe { ffi::Cli_Disconnect(self.handle) };
+            self.lib.disconnect(self.handle);
             self.connected = false;
             info!("disconnected from {}", self.host);
         }
@@ -208,19 +314,16 @@ impl PlcClient for Snap7Client {
         if self.handle.is_null() {
             return false;
         }
-        let rc = unsafe { ffi::Cli_Connected(self.handle) };
-        rc != 0
+        self.lib.is_connected(self.handle)
     }
 
     fn pdu_len(&mut self) -> Result<usize, PlcError> {
         let mut pdu: i32 = 0;
-        let err = unsafe {
-            ffi::Cli_GetParam(
-                self.handle,
-                10, // p_i32_PDULength
-                (&mut pdu as *mut i32) as *mut libc::c_void,
-            )
-        };
+        let err = self.lib.get_param(
+            self.handle,
+            PDU_LENGTH_PARAM,
+            (&mut pdu as *mut i32) as *mut c_void,
+        );
         if err != 0 {
             return Err(self.last_error("get PDU length"));
         }
@@ -231,7 +334,6 @@ impl PlcClient for Snap7Client {
     }
 
     fn read_db(&mut self, db: u16, start: usize, len: usize) -> Result<Vec<u8>, PlcError> {
-        // Cap reads to prevent buffer overruns
         if len > 65535 {
             return Err(PlcError::AddressOutOfRange {
                 address: format!("DB{db}.DBB{start}"),
@@ -241,22 +343,20 @@ impl PlcClient for Snap7Client {
 
         let mut buffer = vec![0u8; len];
 
-        let err = unsafe {
-            ffi::Cli_ReadArea(
-                self.handle,
-                S7AREA_DB,
-                db as c_uint,
-                start as c_uint,
-                len as c_uint,
-                S7WL_BYTE,
-                buffer.as_mut_ptr() as *mut libc::c_void,
-            )
-        };
+        let err = self.lib.read_area(
+            self.handle,
+            S7AREA_DB,
+            db as c_int,
+            start as c_int,
+            len as c_int,
+            S7WL_BYTE,
+            buffer.as_mut_ptr() as *mut c_void,
+        );
 
         if err != 0 {
             return Err(map_snap7_error(
                 err,
-                &format!("read DB{db} start={start} len={len}"),
+                &snap7_error_text(&self.lib, err),
             ));
         }
 
@@ -265,8 +365,6 @@ impl PlcClient for Snap7Client {
     }
 
     fn read_multi(&mut self, items: &[ReadItem]) -> Result<Vec<ReadResult>, PlcError> {
-        // For now, implement read_multi as sequential single reads.
-        // A future optimization can use multiple read jobs in one PDU.
         let mut results = Vec::with_capacity(items.len());
         for item in items {
             let data = self.read_db(item.db_num, item.start, item.len)?;
@@ -288,6 +386,8 @@ impl PlcClient for Snap7Client {
 // ---------------------------------------------------------------------------
 
 /// A mock PLC client for testing without a live PLC.
+///
+/// Supports `seed(db, start, data)` to pre-populate read responses.
 pub struct MockPlcClient {
     connected: bool,
     label: String,
@@ -305,7 +405,7 @@ impl MockPlcClient {
         }
     }
 
-    /// Seed a DB block with known data.
+    /// Seed read data for a specific DB/offset range.
     pub fn seed(&mut self, db: u16, start: usize, data: Vec<u8>) {
         self.data.insert((db, start), data);
     }
@@ -314,11 +414,13 @@ impl MockPlcClient {
 impl PlcClient for MockPlcClient {
     fn connect(&mut self) -> Result<(), PlcError> {
         self.connected = true;
+        debug!("MockPlcClient({}) connected", self.label);
         Ok(())
     }
 
     fn disconnect(&mut self) {
         self.connected = false;
+        debug!("MockPlcClient({}) disconnected", self.label);
     }
 
     fn is_connected(&self) -> bool {
@@ -330,25 +432,16 @@ impl PlcClient for MockPlcClient {
     }
 
     fn read_db(&mut self, db: u16, start: usize, len: usize) -> Result<Vec<u8>, PlcError> {
-        // Try exact match
         if let Some(data) = self.data.get(&(db, start)) {
             if data.len() >= len {
                 return Ok(data[..len].to_vec());
             }
+            let mut padded = data.clone();
+            padded.resize(len, 0);
+            return Ok(padded);
         }
-
-        // Try prefix match
-        for ((d, s), data) in &self.data {
-            if *d == db && *s <= start && *s + data.len() >= start + len {
-                let offset = start - s;
-                return Ok(data[offset..offset + len].to_vec());
-            }
-        }
-
-        Err(PlcError::AddressOutOfRange {
-            address: format!("DB{db}.DBB{start}"),
-            detail: "no mock data seeded for this range".to_string(),
-        })
+        // Return zeros for unseeded reads (like a real PLC with zeroed memory)
+        Ok(vec![0u8; len])
     }
 
     fn read_multi(&mut self, items: &[ReadItem]) -> Result<Vec<ReadResult>, PlcError> {
@@ -368,38 +461,67 @@ impl PlcClient for MockPlcClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Try to create a Snap7 client or fall back to mock
+// ---------------------------------------------------------------------------
+
+/// Create a `PlcClient` for the given PLC. Tries Snap7 first; falls back to Mock.
+pub fn create_plc_client(plc_name: &str, host: &str) -> Arc<Mutex<dyn PlcClient + Send>> {
+    // Try real Snap7 connection
+    if let Some(client) = Snap7Client::try_new(host, 0, 0) {
+        info!("PLC '{}': using Snap7 client for {}", plc_name, host);
+        return Arc::new(Mutex::new(client));
+    }
+
+    // Fall back to mock
+    warn!(
+        "PLC '{}': snap7.dll not available, using MockPlcClient for {}",
+        plc_name, host
+    );
+    Arc::new(Mutex::new(MockPlcClient::new(plc_name)))
+}
+
+// ---------------------------------------------------------------------------
+// Re-export for convenience
+// ---------------------------------------------------------------------------
+
+/// Type alias for a shareable PLC client.
+pub type SharedPlcClient = Arc<Mutex<dyn PlcClient + Send>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_mock_client_connect() {
+    fn test_mock_basic_read() {
         let mut client = MockPlcClient::new("test");
-        assert!(!client.is_connected());
         client.connect().unwrap();
-        assert!(client.is_connected());
+        client.seed(1, 0, vec![0x00, 0x2A]);
+        let data = client.read_db(1, 0, 2).unwrap();
+        assert_eq!(data, vec![0x00, 0x2A]);
+        client.disconnect();
+        assert!(!client.is_connected());
+    }
+
+    #[test]
+    fn test_mock_empty_read() {
+        let mut client = MockPlcClient::new("test");
+        client.connect().unwrap();
+        // Unseeded read returns zeros
+        let data = client.read_db(42, 100, 4).unwrap();
+        assert_eq!(data, vec![0x00; 4]);
+    }
+
+    #[test]
+    fn test_mock_pdu_len() {
+        let mut client = MockPlcClient::new("test");
         assert_eq!(client.pdu_len().unwrap(), 480);
     }
 
     #[test]
-    fn test_mock_read_db() {
-        let mut client = MockPlcClient::new("test");
-        client.connect().unwrap();
-
-        // Seed a 16-byte block at DB1 start=0
-        let block: Vec<u8> = (0..16u8).collect();
-        client.seed(1, 0, block);
-
-        let data = client.read_db(1, 4, 4).unwrap();
-        assert_eq!(data, vec![4, 5, 6, 7]);
-    }
-
-    #[test]
-    fn test_mock_read_missing() {
-        let mut client = MockPlcClient::new("test");
-        client.connect().unwrap();
-
-        let result = client.read_db(99, 0, 4);
-        assert!(result.is_err());
+    fn test_snap7_try_new_dll_not_found() {
+        // Should gracefully return None when snap7.dll is absent
+        let client = Snap7Client::try_new("127.0.0.1", 0, 0);
+        assert!(client.is_none());
     }
 }

@@ -16,7 +16,7 @@ use crate::engine::plan::build_plan;
 use crate::engine::poller::{PollerHandle, PollResult, spawn_poller};
 use crate::engine::snapshot::Snapshot;
 use crate::plc::client::PlcClient;
-use crate::plc::snap7::MockPlcClient;
+use crate::plc::snap7::create_plc_client;
 use crate::types::*;
 
 /// Batch of samples from one poll cycle, sent through the channel.
@@ -452,11 +452,7 @@ impl Server {
         // Create PLC runtimes
         for (plc_id, plc_name, host) in &plcs {
             info!("setting up PLC '{}' (id={}) at {}", plc_name, plc_id, host);
-
-            let client: Arc<Mutex<dyn PlcClient + Send>> = {
-                let mock = MockPlcClient::new(plc_name);
-                Arc::new(Mutex::new(mock))
-            };
+            let client = create_plc_client(plc_name, host);
 
             self._plcs.push(PlcRuntime {
                 plc_id: *plc_id,

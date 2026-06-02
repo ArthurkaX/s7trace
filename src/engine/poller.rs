@@ -3,7 +3,7 @@
 /// Manages per-PLC polling with configurable periods and overrun behavior
 /// (`skip_missed_ticks` by default per architecture doc).
 
- use crate::types::ReadPlan;
+use crate::types::ReadPlan;
 use crate::engine::snapshot::Snapshot;
 use crate::engine::storage::{self, HookState, WriteDecision};
 use crate::plc::client::PlcClient;
@@ -11,6 +11,7 @@ use crate::types::*;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
@@ -236,6 +237,7 @@ pub fn spawn_poller(
     plan: ReadPlan,
     client: Arc<Mutex<dyn PlcClient + Send>>,
     snapshot: Arc<Snapshot>,
+    sample_tx: Sender<PollResult>,
 ) -> PollerHandle {
     let running = Arc::new(Mutex::new(true));
     let thread_running = running.clone();
@@ -258,6 +260,11 @@ pub fn spawn_poller(
                             "PLC {}: cycle {} completed in {:.1}ms ({} samples)",
                             plc_name, r.seq, poller.last_actual_ms, r.samples.len()
                         );
+                        // Send samples to writer (non-blocking)
+                        if sample_tx.send(r).is_err() {
+                            warn!("poller-{}: sample channel closed, stopping", plc_name);
+                            break;
+                        }
                     }
                     Err(e) => {
                         error!("PLC {}: poll cycle failed: {}", plc_name, e);
@@ -286,7 +293,6 @@ pub fn spawn_poller(
         running,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

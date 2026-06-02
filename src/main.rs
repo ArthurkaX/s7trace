@@ -19,16 +19,54 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Most commands need the database. Open it early.
-    let conn = db::schema::open(&cli.db)
-        .with_context(|| format!("opening database {} for s7trace", cli.db))?;
+    match &cli.command {
+        None | Some(Command::Server { dry_run: false }) => {
+            // Server mode
+            dry_run_check(&cli.db)?;
+            engine::server::run_server(&cli.db)
+        }
+        Some(Command::Server { dry_run: true }) => {
+            dry_run_check(&cli.db)
+        }
+        Some(_) => {
+            // CLI mode — open DB and dispatch command
+            let conn = db::schema::open(&cli.db)
+                .with_context(|| format!("opening database {} for s7trace", cli.db))?;
+            let exit_code = dispatch(&cli, &conn)?;
+            std::process::exit(exit_code as i32);
+        }
+    }
+}
 
-    let exit_code = dispatch(&cli, &conn)?;
-    std::process::exit(exit_code as i32);
+/// Validate configuration and exit. Returns Ok(true) if check passed.
+fn dry_run_check(db_path: &str) -> Result<()> {
+    let conn = db::schema::open(db_path)?;
+    let plc_count: i64 = conn.query_row("SELECT COUNT(*) FROM plc", [], |r| r.get(0))?;
+    let pg_count: i64 = conn.query_row("SELECT COUNT(*) FROM poll_group", [], |r| r.get(0))?;
+    let tag_count: i64 = conn.query_row("SELECT COUNT(*) FROM tag WHERE enabled = 1 AND bad = 0", [], |r| r.get(0))?;
+    let set_count: i64 = conn.query_row("SELECT COUNT(*) FROM metric_set WHERE enabled = 1", [], |r| r.get(0))?;
+
+    println!("Database: {db_path}");
+    println!("  PLCs:         {plc_count}");
+    println!("  Poll groups:  {pg_count}");
+    println!("  Active tags:  {tag_count}");
+    println!("  Enabled sets: {set_count}");
+
+    if plc_count == 0 {
+        eprintln!("warning: no PLCs configured. Add one with:");
+        eprintln!("  s7trace sql \"INSERT INTO plc (name, host) VALUES ('my-plc', '192.168.0.1')\" --admin");
+    }
+    if tag_count == 0 {
+        eprintln!("warning: no active tags. The server will start no pollers.");
+    }
+
+    println!("Configuration looks valid.");
+    Ok(())
 }
 
 fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
-    match &cli.command {
+    let cmd = cli.command.as_ref().expect("dispatch called without command");
+    match cmd {
         Command::Sql { query, format: fmt, limit, timeout_ms: _ } => {
             handle_sql(conn, query, fmt, *limit)
         }
@@ -81,6 +119,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             handle_history_delete_dataset(conn, cli, dataset)
         }
         Command::HistoryVacuum { force } => handle_history_vacuum(conn, *force),
+        _ => unreachable!("dispatch called with Server or unknown command"),
     }
 }
 

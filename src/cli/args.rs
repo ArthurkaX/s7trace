@@ -10,11 +10,17 @@ pub struct Cli {
     pub db: String,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Start the s7trace server (daemon mode).
+    Server {
+        /// Run once, check configuration, then exit.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Execute a read-only SQL query.
     Sql {
         /// SQL query string.

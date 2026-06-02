@@ -460,6 +460,8 @@ impl fmt::Display for PlcError {
 // Read items and results
 // ---------------------------------------------------------------------------
 
+
+impl std::error::Error for PlcError {}
 #[derive(Debug, Clone)]
 pub struct ReadItem {
     pub db_num: u16,

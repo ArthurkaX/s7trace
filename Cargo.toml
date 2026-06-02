@@ -1,0 +1,22 @@
+[package]
+name = "s7trace"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only S7 data collection service for Siemens PLCs"
+repository = "https://github.com/example/s7trace"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+env_logger = "0.11"
+libc = "0.2"
+log = "0.4"
+parking_lot = "0.12"
+regex = "1"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }

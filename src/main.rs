@@ -1,0 +1,1190 @@
+use anyhow::{Context, Result};
+use clap::Parser;
+use rusqlite::Connection;
+
+mod cli;
+mod db;
+mod engine;
+mod plc;
+mod types;
+
+use cli::args::{Cli, Command};
+use cli::format::Format;
+use types::*;
+
+fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_micros()
+        .init();
+
+    let cli = Cli::parse();
+
+    // Most commands need the database. Open it early.
+    let conn = db::schema::open(&cli.db)
+        .with_context(|| format!("opening database {} for s7trace", cli.db))?;
+
+    let exit_code = dispatch(&cli, &conn)?;
+    std::process::exit(exit_code as i32);
+}
+
+fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
+    match &cli.command {
+        Command::Sql { query, format: fmt, limit, timeout_ms: _ } => {
+            handle_sql(conn, query, fmt, *limit)
+        }
+        Command::AdminSql { query } => handle_admin_sql(conn, query),
+        Command::CommandList { state } => handle_command_list(conn, state.as_deref()),
+        Command::CommandWait { command_id, poll_ms, timeout_ms } => {
+            handle_command_wait(conn, *command_id, *poll_ms, *timeout_ms)
+        }
+        Command::CommandResult { command_id, format: fmt } => {
+            handle_command_result(conn, *command_id, fmt)
+        }
+        Command::TagAdd { plc, name, address, data_type, poll_group, store_mode, storage_hook, value_role, metric_set, async_mode } => {
+            handle_tag_add(conn, cli, plc, name, address, data_type, poll_group, store_mode, storage_hook, value_role, metric_set.as_deref(), *async_mode)
+        }
+        Command::TagUpdate { tag_id, address, data_type, poll_group, store_mode, storage_hook } => {
+            handle_tag_update(conn, cli, *tag_id, address.as_deref(), data_type.as_deref(), poll_group.as_deref(), store_mode.as_deref(), storage_hook.as_deref())
+        }
+        Command::TagDisable { tag_id } => handle_tag_disable(conn, *tag_id),
+        Command::TagRevalidate { tag_id } => handle_tag_revalidate(conn, cli, *tag_id),
+        Command::Read { plc, address, data_type, format: fmt } => {
+            handle_read(conn, cli, plc, address, data_type, fmt)
+        }
+        Command::ReadRaw { plc, db, start, len, format: fmt, save_probe } => {
+            handle_read_raw(conn, cli, plc, *db, *start, *len, fmt, *save_probe)
+        }
+        Command::Status { format: fmt } => handle_status(conn, fmt),
+        Command::SetCreate { plc, name, description } => {
+            handle_set_create(conn, plc, name, description.as_deref())
+        }
+        Command::SetAddTag { set_name, tag, from_sql } => {
+            handle_set_add_tag(conn, set_name, tag, from_sql.as_deref())
+        }
+        Command::SetRemoveTag { set_name, tag, from_sql } => {
+            handle_set_remove_tag(conn, set_name, tag.as_deref(), from_sql.as_deref())
+        }
+        Command::SetEnable { set_name, async_mode } => {
+            handle_set_enable(conn, cli, set_name, *async_mode)
+        }
+        Command::SetDisable { set_name } => handle_set_disable(conn, cli, set_name),
+        Command::SetList { plc } => handle_set_list(conn, plc.as_deref()),
+        Command::SetShow { set_name } => handle_set_show(conn, set_name),
+        Command::CollectionStart { plc, dataset, sets } => {
+            handle_collection_start(conn, cli, plc, dataset, sets)
+        }
+        Command::CollectionStop { plc } => handle_collection_stop(conn, cli, plc),
+        Command::HistoryClean { plc, before_ts, before, batch_size } => {
+            handle_history_clean(conn, cli, plc, *before_ts, before.as_deref(), *batch_size)
+        }
+        Command::HistoryDeleteDataset { dataset } => {
+            handle_history_delete_dataset(conn, cli, dataset)
+        }
+        Command::HistoryVacuum { force } => handle_history_vacuum(conn, *force),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SQL handlers
+// ---------------------------------------------------------------------------
+
+fn handle_sql(conn: &Connection, query: &str, fmt: &str, limit: u64) -> Result<ExitCode> {
+    // Ensure read-only: reject anything that isn't a SELECT or WITH
+    let trimmed = query.trim().to_uppercase();
+    if !trimmed.starts_with("SELECT") && !trimmed.starts_with("WITH") && !trimmed.starts_with("PRAGMA") {
+        eprintln!("error: only SELECT/WITH/PRAGMA allowed in sql mode");
+        return Ok(ExitCode::BadInput);
+    }
+
+    // Apply default limit if query doesn't have one
+    let limited_query = if trimmed.contains(" LIMIT ") {
+        query.to_string()
+    } else {
+        format!("{query} LIMIT {limit}")
+    };
+
+    let out_fmt = Format::from_str(fmt);
+    let mut stmt = match conn.prepare(&limited_query) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sql error: {e}");
+            return Ok(ExitCode::BadInput);
+        }
+    };
+
+    let col_count = stmt.column_count();
+    let col_names: Vec<String> = (0..col_count)
+        .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
+        .collect();
+
+    let rows = match stmt.query_map([], |row| {
+        let values: Vec<serde_json::Value> = (0..col_count)
+            .map(|i| {
+                match row.get::<_, rusqlite::types::Value>(i) {
+                    Ok(v) => match v {
+                        rusqlite::types::Value::Null => serde_json::Value::Null,
+                        rusqlite::types::Value::Integer(n) => serde_json::Value::Number(n.into()),
+                        rusqlite::types::Value::Real(f) => {
+                            serde_json::Number::from_f64(f)
+                                .map(serde_json::Value::Number)
+                                .unwrap_or(serde_json::Value::Null)
+                        }
+                        rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
+                        rusqlite::types::Value::Blob(b) => {
+                            serde_json::Value::String(format!("{b:02x?}"))
+                        }
+                    },
+                    Err(_) => serde_json::Value::Null,
+                }
+            })
+            .collect();
+        Ok(values)
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("sql error: {e}");
+            return Ok(ExitCode::BadInput);
+        }
+    };
+
+    match out_fmt {
+        Format::Table => {
+            // Print header
+            println!("{}", col_names.join("\t"));
+            for row in rows {
+                let row = row?;
+                let vals: Vec<String> = row
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Null => "NULL".to_string(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                println!("{}", vals.join("\t"));
+            }
+        }
+        Format::Json => {
+            let results: Vec<Vec<serde_json::Value>> = rows
+                .filter_map(|r| r.ok())
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&results).unwrap_or_default());
+        }
+        Format::Jsonl => {
+            for row in rows {
+                if let Ok(values) = row {
+                    let obj: serde_json::Value = serde_json::json!({
+                        "row": values,
+                    });
+                    println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+                }
+            }
+        }
+        Format::Text => {
+            for row in rows {
+                let row = row?;
+                let vals: Vec<String> = row
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => v.to_string(),
+                    })
+                    .collect();
+                println!("{}", vals.join(" "));
+            }
+        }
+    }
+
+    Ok(ExitCode::Ok)
+}
+
+fn handle_admin_sql(conn: &Connection, query: &str) -> Result<ExitCode> {
+    match conn.execute_batch(query) {
+        Ok(_) => {
+            println!("ok rows_affected={}", conn.changes());
+            Ok(ExitCode::Ok)
+        }
+        Err(e) => {
+            eprintln!("admin sql error: {e}");
+            Ok(ExitCode::BadInput)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command queue handlers
+// ---------------------------------------------------------------------------
+
+fn handle_command_list(conn: &Connection, state: Option<&str>) -> Result<ExitCode> {
+    let commands = db::command_queue::list_pending(conn, state)?;
+    println!("{:<8} {:<12} {:<10} {:<20}", "ID", "State", "Kind", "Created");
+    for cmd in &commands {
+        println!(
+            "{:<8} {:<12?} {:<10?} {:<20}",
+            cmd.id, cmd.state, cmd.kind, cmd.created_ts
+        );
+    }
+    Ok(ExitCode::Ok)
+}
+
+fn handle_command_wait(conn: &Connection, command_id: i64, poll_ms: u64, timeout_ms: u64) -> Result<ExitCode> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let poll_dur = std::time::Duration::from_millis(poll_ms);
+
+    while std::time::Instant::now() < deadline {
+        if let Some(result) = db::command_queue::get_result(conn, command_id)? {
+            handle_command_result_inner(&result, &Format::Text)?;
+            return if result.ok { Ok(ExitCode::Ok) } else { Ok(ExitCode::PlcError) };
+        }
+        std::thread::sleep(poll_dur);
+    }
+
+    eprintln!("timeout waiting for command {command_id}");
+    Ok(ExitCode::Overload)
+}
+
+fn handle_command_result(conn: &Connection, command_id: i64, fmt: &str) -> Result<ExitCode> {
+    let out_fmt = Format::from_str(fmt);
+    match db::command_queue::get_result(conn, command_id)? {
+        Some(result) => handle_command_result_inner(&result, &out_fmt),
+        None => {
+            eprintln!("command {command_id}: no result yet (still pending or unknown)");
+            Ok(ExitCode::Overload)
+        }
+    }
+}
+
+fn handle_command_result_inner(result: &CommandResult, fmt: &Format) -> Result<ExitCode> {
+    match fmt {
+        Format::Text => {
+            if result.ok {
+                if let Some(ref json) = result.result_json {
+                    println!("success command_id={} result={json}", result.command_id);
+                } else {
+                    println!("success command_id={}", result.command_id);
+                }
+            } else {
+                let err = result.error.as_deref().unwrap_or("unknown error");
+                println!("bad command_id={} detail=\"{err}\"", result.command_id);
+            }
+        }
+        _ => {
+            cli::format::print_result(*fmt, "result", result);
+        }
+    }
+    Ok(if result.ok { ExitCode::Ok } else { ExitCode::PlcError })
+}
+
+// ---------------------------------------------------------------------------
+// Tag handlers
+// ---------------------------------------------------------------------------
+
+fn handle_tag_add(
+    conn: &Connection,
+    _cli: &Cli,
+    plc: &str,
+    name: &str,
+    address: &str,
+    data_type: &str,
+    poll_group: &str,
+    store_mode: &str,
+    storage_hook: &str,
+    value_role: &str,
+    metric_set: Option<&str>,
+    async_mode: bool,
+) -> Result<ExitCode> {
+    // Validate inputs
+    let dt: DataType = data_type.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
+    let _sm: StoreMode = store_mode.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
+    let _sh: StorageHook = storage_hook.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
+    let addr = S7Address::parse(address)
+        .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+
+    // Find PLC
+    let plc_id: i64 = conn.query_row(
+        "SELECT id FROM plc WHERE name = ?1",
+        rusqlite::params![plc],
+        |row| row.get(0),
+    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found. Create it first."))?;
+
+    // Find or create poll group
+    let poll_group_id: i64 = match conn.query_row(
+        "SELECT id FROM poll_group WHERE name = ?1",
+        rusqlite::params![poll_group],
+        |row| row.get(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            let period = match poll_group {
+                "fast" => 40,
+                "medium" => 250,
+                _ => 1000,
+            };
+            conn.execute(
+                "INSERT INTO poll_group (name, period_ms) VALUES (?1, ?2)",
+                rusqlite::params![poll_group, period],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    let now = now_us();
+    let byte_size = dt.byte_size() as i64;
+
+    // Insert tag
+    conn.execute(
+        "INSERT INTO tag
+            (plc_id, name, address, db_num, byte_offset, byte_size, data_type,
+             value_role, poll_group_id, store_mode, storage_hook, enabled, created_ts, updated_ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?12)",
+        rusqlite::params![
+            plc_id, name, address, addr.db_num, addr.byte_offset, byte_size,
+            data_type, value_role, poll_group_id, store_mode, storage_hook, now,
+        ],
+    )?;
+    let tag_id = conn.last_insert_rowid();
+
+    // Add to default metric set if none specified
+    let set_name = metric_set.unwrap_or("default");
+    let set_id: i64 = match conn.query_row(
+        "SELECT id FROM metric_set WHERE plc_id = ?1 AND name = ?2",
+        rusqlite::params![plc_id, set_name],
+        |row| row.get(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            conn.execute(
+                "INSERT INTO metric_set (plc_id, name, enabled, created_ts, updated_ts)
+                 VALUES (?1, ?2, 1, ?3, ?3)",
+                rusqlite::params![plc_id, set_name, now],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    conn.execute(
+        "INSERT OR IGNORE INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![set_id, tag_id, plc_id, now],
+    )?;
+
+    // Schedule delayed config apply
+    if !async_mode {
+        // For now, report success with pending apply state
+        println!(
+            "success value=null apply_state=pending tag_id={tag_id} set={set_name}"
+        );
+    } else {
+        // Enqueue as command
+        let req = serde_json::json!({
+            "action": "tag_add",
+            "plc_id": plc_id,
+            "tag_id": tag_id,
+        });
+        let cmd_id = db::command_queue::enqueue(
+            conn, CommandKind::Control, &req.to_string(), Some(plc_id), None, None,
+        )?;
+        println!("queued command_id={cmd_id}");
+    }
+
+    Ok(ExitCode::Ok)
+}
+
+fn handle_tag_update(
+    conn: &Connection,
+    _cli: &Cli,
+    tag_id: i64,
+    address: Option<&str>,
+    data_type: Option<&str>,
+    poll_group: Option<&str>,
+    store_mode: Option<&str>,
+    storage_hook: Option<&str>,
+) -> Result<ExitCode> {
+    let now = now_us();
+
+    if let Some(addr_str) = address {
+        let addr = S7Address::parse(addr_str)
+            .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+        conn.execute(
+            "UPDATE tag SET address = ?1, db_num = ?2, byte_offset = ?3, updated_ts = ?4, desired_version = desired_version + 1 WHERE id = ?5",
+            rusqlite::params![addr_str, addr.db_num, addr.byte_offset, now, tag_id],
+        )?;
+    }
+
+    if let Some(dt) = data_type {
+        let byte_size = dt.parse::<DataType>()
+            .map_err(|e: String| anyhow::anyhow!("{e}"))?
+            .byte_size() as i64;
+        conn.execute(
+            "UPDATE tag SET data_type = ?1, byte_size = ?2, updated_ts = ?3, desired_version = desired_version + 1 WHERE id = ?4",
+            rusqlite::params![dt, byte_size, now, tag_id],
+        )?;
+    }
+
+    if let Some(pg) = poll_group {
+        let pg_id: i64 = conn.query_row(
+            "SELECT id FROM poll_group WHERE name = ?1",
+            rusqlite::params![pg],
+            |row| row.get(0),
+        ).map_err(|_| anyhow::anyhow!("poll group '{pg}' not found"))?;
+        conn.execute(
+            "UPDATE tag SET poll_group_id = ?1, updated_ts = ?2, desired_version = desired_version + 1 WHERE id = ?3",
+            rusqlite::params![pg_id, now, tag_id],
+        )?;
+    }
+
+    if let Some(sm) = store_mode {
+        conn.execute(
+            "UPDATE tag SET store_mode = ?1, updated_ts = ?2, desired_version = desired_version + 1 WHERE id = ?3",
+            rusqlite::params![sm, now, tag_id],
+        )?;
+    }
+
+    if let Some(sh) = storage_hook {
+        conn.execute(
+            "UPDATE tag SET storage_hook = ?1, updated_ts = ?2, desired_version = desired_version + 1 WHERE id = ?3",
+            rusqlite::params![sh, now, tag_id],
+        )?;
+    }
+
+    // Schedule config apply
+    db::config_apply::schedule(
+        conn,
+        ApplyScope::Tag,
+        None, None, None, Some(tag_id),
+        "tag_updated",
+        db::config_apply::PLAN_COOLDOWN_MS,
+        None,
+    )?;
+
+    println!("success tag_id={tag_id} apply_state=pending");
+    Ok(ExitCode::Ok)
+}
+
+fn handle_tag_disable(conn: &Connection, tag_id: i64) -> Result<ExitCode> {
+    conn.execute(
+        "UPDATE tag SET enabled = 0, updated_ts = ?1 WHERE id = ?2",
+        rusqlite::params![now_us(), tag_id],
+    )?;
+
+    if conn.changes() == 0 {
+        eprintln!("tag {tag_id}: not found");
+        return Ok(ExitCode::BadInput);
+    }
+
+    db::config_apply::schedule(
+        conn,
+        ApplyScope::Tag,
+        None, None, None, Some(tag_id),
+        "tag_disabled",
+        db::config_apply::PLAN_COOLDOWN_MS,
+        None,
+    )?;
+
+    println!("success tag_id={tag_id} enabled=0 apply_state=pending");
+    Ok(ExitCode::Ok)
+}
+
+fn handle_tag_revalidate(
+    conn: &Connection,
+    _cli: &Cli,
+    tag_id: i64,
+) -> Result<ExitCode> {
+    // Enqueue a revalidation command
+    let req = serde_json::json!({
+        "action": "tag_revalidate",
+        "tag_id": tag_id,
+    });
+    let cmd_id = db::command_queue::enqueue(
+        conn, CommandKind::Control, &req.to_string(), None, None, None,
+    )?;
+    println!("queued command_id={cmd_id}");
+    Ok(ExitCode::Ok)
+}
+
+// ---------------------------------------------------------------------------
+// Read handlers
+// ---------------------------------------------------------------------------
+
+fn handle_read(
+    conn: &Connection,
+    _cli: &Cli,
+    plc: &str,
+    address: &str,
+    data_type: &str,
+    fmt: &str,
+) -> Result<ExitCode> {
+    // Enqueue a PLC read command
+    let req = serde_json::json!({
+        "action": "read",
+        "plc": plc,
+        "address": address,
+        "data_type": data_type,
+        "format": fmt,
+    });
+    let cmd_id = db::command_queue::enqueue(
+        conn, CommandKind::PlcRead, &req.to_string(), None, None, None,
+    )?;
+    println!("queued command_id={cmd_id}");
+    println!("info: use 's7trace command wait {cmd_id}' or 's7trace command result {cmd_id}' to get the result");
+    Ok(ExitCode::Ok)
+}
+
+fn handle_read_raw(
+    conn: &Connection,
+    _cli: &Cli,
+    plc: &str,
+    db: u16,
+    start: usize,
+    len: usize,
+    fmt: &str,
+    save_probe: bool,
+) -> Result<ExitCode> {
+    let req = serde_json::json!({
+        "action": "read_raw",
+        "plc": plc,
+        "db": db,
+        "start": start,
+        "len": len,
+        "format": fmt,
+        "save_probe": save_probe,
+    });
+    let cmd_id = db::command_queue::enqueue(
+        conn, CommandKind::PlcRead, &req.to_string(), None, None, None,
+    )?;
+    println!("queued command_id={cmd_id}");
+    if save_probe {
+        println!("info: raw probe will be saved to the database");
+    }
+    println!("info: use 's7trace command wait {cmd_id}' to get the result");
+    Ok(ExitCode::Ok)
+}
+
+// ---------------------------------------------------------------------------
+// Status handler
+// ---------------------------------------------------------------------------
+
+fn handle_status(conn: &Connection, fmt: &str) -> Result<ExitCode> {
+    let out_fmt = Format::from_str(fmt);
+
+    // Gather PLCs
+    let mut stmt = conn.prepare(
+        "SELECT id, name, host, enabled, last_ok_ts, last_error FROM plc"
+    )?;
+    let plcs: Vec<serde_json::Value> = stmt
+        .query_map([], |row| {
+            let _id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let host: String = row.get(2)?;
+            let enabled: bool = row.get::<_, i64>(3)? != 0;
+            let last_ok_ts: Option<i64> = row.get(4)?;
+            let last_error: Option<String> = row.get(5)?;
+
+            Ok(serde_json::json!({
+                "name": name,
+                "host": host,
+                "enabled": enabled,
+                "last_ok_ts": last_ok_ts,
+                "last_error": last_error,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let bad_tags: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tag WHERE bad = 1",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    let active_tags: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM v_active_tag",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    let pending_count = db::config_apply::pending_count(conn).unwrap_or(0);
+    let command_pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM command_request WHERE state = 'pending'",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    let status = serde_json::json!({
+        "plcs": plcs,
+        "tags": {
+            "active": active_tags,
+            "bad": bad_tags,
+        },
+        "command_queue": {
+            "pending": command_pending,
+        },
+        "config_apply": {
+            "pending": pending_count,
+        },
+    });
+
+    match out_fmt {
+        Format::Text | Format::Table => {
+            println!("PLCs:");
+            for plc in &plcs {
+                println!(
+                    "  {} (host={}, enabled={})",
+                    plc["name"], plc["host"], plc["enabled"]
+                );
+            }
+            println!("Tags: active={active_tags}, bad={bad_tags}");
+            println!("Command queue pending: {command_pending}");
+            println!("Config apply pending: {pending_count}");
+        }
+        _ => {
+            println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+        }
+    }
+
+    // Show problems (bad tags)
+    let mut pstmt = conn.prepare(
+        "SELECT t.name, t.address, t.bad_class, t.bad_detail
+         FROM tag t WHERE t.bad = 1 LIMIT 20"
+    )?;
+    let has_problems = pstmt.exists([])?;
+    if has_problems {
+        println!("\nProblems:");
+        let problems = pstmt.query_map([], |row| {
+            let name: String = row.get(0)?;
+            let address: String = row.get(1)?;
+            let bc: Option<String> = row.get(2)?;
+            let bd: Option<String> = row.get(3)?;
+            Ok((name, address, bc, bd))
+        })?;
+        for p in problems {
+            if let Ok((name, addr, bc, bd)) = p {
+                let detail = bd.unwrap_or_default();
+                println!("  bad_tag: {name} ({addr}) class={bc:?} detail=\"{detail}\"");
+            }
+        }
+    }
+
+    Ok(ExitCode::Ok)
+}
+
+// ---------------------------------------------------------------------------
+// Metric set handlers
+// ---------------------------------------------------------------------------
+
+fn handle_set_create(
+    conn: &Connection,
+    plc: &str,
+    name: &str,
+    description: Option<&str>,
+) -> Result<ExitCode> {
+    let plc_id: i64 = conn.query_row(
+        "SELECT id FROM plc WHERE name = ?1",
+        rusqlite::params![plc],
+        |row| row.get(0),
+    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+
+    let now = now_us();
+    conn.execute(
+        "INSERT INTO metric_set (plc_id, name, enabled, description, created_ts, updated_ts)
+         VALUES (?1, ?2, 0, ?3, ?4, ?4)",
+        rusqlite::params![plc_id, name, description, now],
+    )?;
+
+    let id = conn.last_insert_rowid();
+    println!("success set_id={id} name={name} plc={plc}");
+    Ok(ExitCode::Ok)
+}
+
+fn handle_set_add_tag(
+    conn: &Connection,
+    set_name: &str,
+    tag: &str,
+    from_sql: Option<&str>,
+) -> Result<ExitCode> {
+    // Resolve set
+    let set: (i64, i64) = conn.query_row(
+        "SELECT ms.id, ms.plc_id FROM metric_set ms WHERE ms.name = ?1",
+        rusqlite::params![set_name],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
+    let (set_id, plc_id) = set;
+
+    let now = now_us();
+
+    if let Some(sql) = from_sql {
+        // Add tags from SQL result (must return tag_id column)
+        let sql_upper = sql.trim().to_uppercase();
+        if !sql_upper.starts_with("SELECT") {
+            return Err(anyhow::anyhow!("--from-sql must be a SELECT query"));
+        }
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            let tag_id: i64 = row.get(0)?;
+            Ok(tag_id)
+        })?;
+        let mut count = 0;
+        for row in rows {
+            let tag_id = row?;
+            conn.execute(
+                "INSERT OR IGNORE INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![set_id, tag_id, plc_id, now],
+            )?;
+            count += 1;
+        }
+        println!("success added={count} tags to set '{set_name}'");
+    } else {
+        // Add by tag name or ID
+        let tag_id: i64 = if let Ok(id) = tag.parse::<i64>() {
+            id
+        } else {
+            conn.query_row(
+                "SELECT id FROM tag WHERE plc_id = ?1 AND name = ?2",
+                rusqlite::params![plc_id, tag],
+                |row| row.get(0),
+            ).map_err(|_| anyhow::anyhow!("tag '{tag}' not found"))?
+        };
+
+        conn.execute(
+            "INSERT OR IGNORE INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![set_id, tag_id, plc_id, now],
+        )?;
+        println!("success tag={tag_id} added to set '{set_name}'");
+    }
+
+    Ok(ExitCode::Ok)
+}
+
+fn handle_set_remove_tag(
+    conn: &Connection,
+    set_name: &str,
+    tag: Option<&str>,
+    from_sql: Option<&str>,
+) -> Result<ExitCode> {
+    let set_id: i64 = conn.query_row(
+        "SELECT id FROM metric_set WHERE name = ?1",
+        rusqlite::params![set_name],
+        |row| row.get(0),
+    ).map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
+
+    if let Some(sql) = from_sql {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            let tag_id: i64 = row.get(0)?;
+            Ok(tag_id)
+        })?;
+        let mut count = 0;
+        for row in rows {
+            let tag_id = row?;
+            conn.execute(
+                "DELETE FROM metric_set_tag WHERE metric_set_id = ?1 AND tag_id = ?2",
+                rusqlite::params![set_id, tag_id],
+            )?;
+            count += 1;
+        }
+        println!("success removed={count} tags from set '{set_name}'");
+    } else if let Some(tag_str) = tag {
+        if let Ok(tag_id) = tag_str.parse::<i64>() {
+            conn.execute(
+                "DELETE FROM metric_set_tag WHERE metric_set_id = ?1 AND tag_id = ?2",
+                rusqlite::params![set_id, tag_id],
+            )?;
+        } else {
+            // Try by name via subquery
+            conn.execute(
+                "DELETE FROM metric_set_tag WHERE metric_set_id = ?1 AND tag_id IN (SELECT id FROM tag WHERE name = ?2)",
+                rusqlite::params![set_id, tag_str],
+            )?;
+        }
+        println!("success tag removed from set '{set_name}'");
+    }
+
+    Ok(ExitCode::Ok)
+}
+
+fn handle_set_enable(
+    conn: &Connection,
+    _cli: &Cli,
+    set_name: &str,
+    async_mode: bool,
+) -> Result<ExitCode> {
+    let now = now_us();
+    conn.execute(
+        "UPDATE metric_set SET enabled = 1, updated_ts = ?1 WHERE name = ?2",
+        rusqlite::params![now, set_name],
+    )?;
+
+    if conn.changes() == 0 {
+        eprintln!("metric set '{set_name}' not found");
+        return Ok(ExitCode::BadInput);
+    }
+
+    // Schedule config apply
+    let set_id: i64 = conn.query_row(
+        "SELECT id FROM metric_set WHERE name = ?1",
+        rusqlite::params![set_name],
+        |row| row.get(0),
+    )?;
+
+    db::config_apply::schedule(
+        conn,
+        ApplyScope::MetricSet,
+        None, None, Some(set_id), None,
+        "metric_set_enabled",
+        db::config_apply::PLAN_COOLDOWN_MS,
+        None,
+    )?;
+
+    if async_mode {
+        let req = serde_json::json!({
+            "action": "set_enable",
+            "set_name": set_name,
+        });
+        let cmd_id = db::command_queue::enqueue(
+            conn, CommandKind::Control, &req.to_string(), None, None, None,
+        )?;
+        println!("queued command_id={cmd_id}");
+    } else {
+        println!("success set={set_name} enabled=1 apply_state=pending");
+    }
+
+    Ok(ExitCode::Ok)
+}
+
+fn handle_set_disable(
+    conn: &Connection,
+    _cli: &Cli,
+    set_name: &str,
+) -> Result<ExitCode> {
+    let now = now_us();
+    conn.execute(
+        "UPDATE metric_set SET enabled = 0, updated_ts = ?1 WHERE name = ?2",
+        rusqlite::params![now, set_name],
+    )?;
+
+    if conn.changes() == 0 {
+        eprintln!("metric set '{set_name}' not found");
+        return Ok(ExitCode::BadInput);
+    }
+
+    let set_id: i64 = conn.query_row(
+        "SELECT id FROM metric_set WHERE name = ?1",
+        rusqlite::params![set_name],
+        |row| row.get(0),
+    )?;
+
+    db::config_apply::schedule(
+        conn,
+        ApplyScope::MetricSet,
+        None, None, Some(set_id), None,
+        "metric_set_disabled",
+        db::config_apply::PLAN_COOLDOWN_MS,
+        None,
+    )?;
+
+    println!("success set={set_name} enabled=0 apply_state=pending");
+    Ok(ExitCode::Ok)
+}
+
+fn handle_set_list(conn: &Connection, plc: Option<&str>) -> Result<ExitCode> {
+    let query = if let Some(plc_name) = plc {
+        format!(
+            "SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
+             FROM v_metric_set_status vms WHERE vms.plc = '{}'",
+            plc_name.replace('\'', "''")
+        )
+    } else {
+        "SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
+         FROM v_metric_set_status vms ORDER BY vms.plc, vms.metric_set".to_string()
+    };
+
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map([], |row| {
+        let plc: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let enabled: bool = row.get::<_, i64>(2)? != 0;
+        let total: i64 = row.get(3)?;
+        let healthy: i64 = row.get(4)?;
+        let bad: i64 = row.get(5)?;
+        Ok((plc, name, enabled, total, healthy, bad))
+    })?;
+
+    println!("{:<20} {:<30} {:<8} {:<6} {:<8} {:<4}", "PLC", "Set", "Enabled", "Total", "Healthy", "Bad");
+    for row in rows {
+        let (plc, name, enabled, total, healthy, bad) = row?;
+        println!("{plc:<20} {name:<30} {enabled:<8} {total:<6} {healthy:<8} {bad:<4}");
+    }
+
+    Ok(ExitCode::Ok)
+}
+
+fn handle_set_show(conn: &Connection, set_name: &str) -> Result<ExitCode> {
+    let set_info = conn.query_row(
+        "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
+         FROM metric_set ms WHERE ms.name = ?1",
+        rusqlite::params![set_name],
+        |row| {
+            let id: i64 = row.get(0)?;
+            let plc_id: i64 = row.get(1)?;
+            let name: String = row.get(2)?;
+            let enabled: bool = row.get::<_, i64>(3)? != 0;
+            let desc: Option<String> = row.get(4)?;
+            Ok((id, plc_id, name, enabled, desc))
+        },
+    ).map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
+
+    let (_id, _plc_id, _name, enabled, _desc) = &set_info;
+
+    println!("Set: {set_name}");
+    println!("Enabled: {enabled}");
+
+    // List members
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, t.address, t.data_type, t.bad, t.bad_class
+         FROM v_metric_set_member vmsm
+         JOIN tag t ON t.id = vmsm.tag_id
+         WHERE vmsm.metric_set = ?1"
+    )?;
+    let members = stmt.query_map(rusqlite::params![set_name], |row| {
+        let id: i64 = row.get(0)?;
+        let name: String = row.get(1)?;
+        let address: String = row.get(2)?;
+        let dt: String = row.get(3)?;
+        let bad: bool = row.get::<_, i64>(4)? != 0;
+        let bc: Option<String> = row.get(5)?;
+        Ok((id, name, address, dt, bad, bc))
+    })?;
+
+    println!("\nMembers:");
+    for member in members {
+        let (id, name, address, dt, bad, bc) = member?;
+        let bad_str = if bad {
+            format!(" BAD={}", bc.as_deref().unwrap_or("unknown"))
+        } else {
+            String::new()
+        };
+        println!("  #{id} {name} ({address}, {dt}){bad_str}");
+    }
+
+    Ok(ExitCode::Ok)
+}
+
+// ---------------------------------------------------------------------------
+// Collection handlers
+// ---------------------------------------------------------------------------
+
+fn handle_collection_start(
+    conn: &Connection,
+    _cli: &Cli,
+    plc: &str,
+    dataset: &str,
+    sets: &[String],
+) -> Result<ExitCode> {
+    let plc_id: i64 = conn.query_row(
+        "SELECT id FROM plc WHERE name = ?1",
+        rusqlite::params![plc],
+        |row| row.get(0),
+    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+
+    // Check no active dataset for this PLC
+    let active: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dataset WHERE plc_id = ?1 AND state = 'active'",
+        rusqlite::params![plc_id],
+        |row| row.get(0),
+    )?;
+    if active > 0 {
+        eprintln!("error: PLC '{plc}' already has an active dataset. Stop it first.");
+        return Ok(ExitCode::BadInput);
+    }
+
+    // Enqueue collection start
+    let req = serde_json::json!({
+        "action": "collection_start",
+        "plc_id": plc_id,
+        "plc": plc,
+        "dataset": dataset,
+        "sets": sets,
+    });
+    let cmd_id = db::command_queue::enqueue(
+        conn, CommandKind::Control, &req.to_string(), Some(plc_id), None, None,
+    )?;
+    println!("queued command_id={cmd_id}");
+    Ok(ExitCode::Ok)
+}
+
+fn handle_collection_stop(
+    conn: &Connection,
+    _cli: &Cli,
+    plc: &str,
+) -> Result<ExitCode> {
+    let plc_id: i64 = conn.query_row(
+        "SELECT id FROM plc WHERE name = ?1",
+        rusqlite::params![plc],
+        |row| row.get(0),
+    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+
+    let req = serde_json::json!({
+        "action": "collection_stop",
+        "plc_id": plc_id,
+        "plc": plc,
+    });
+    let cmd_id = db::command_queue::enqueue(
+        conn, CommandKind::Control, &req.to_string(), Some(plc_id), None, None,
+    )?;
+    println!("queued command_id={cmd_id}");
+    Ok(ExitCode::Ok)
+}
+
+// ---------------------------------------------------------------------------
+// History handlers
+// ---------------------------------------------------------------------------
+
+fn handle_history_clean(
+    conn: &Connection,
+    _cli: &Cli,
+    plc: &str,
+    before_ts: Option<i64>,
+    before: Option<&str>,
+    batch_size: u64,
+) -> Result<ExitCode> {
+    let plc_id: i64 = conn.query_row(
+        "SELECT id FROM plc WHERE name = ?1",
+        rusqlite::params![plc],
+        |row| row.get(0),
+    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+
+    // Check no active dataset
+    let active: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dataset WHERE plc_id = ?1 AND state = 'active'",
+        rusqlite::params![plc_id],
+        |row| row.get(0),
+    )?;
+    if active > 0 {
+        eprintln!("error: PLC '{plc}' has active datasets. Stop collection first.");
+        return Ok(ExitCode::BadInput);
+    }
+
+    let cutoff = match (before_ts, before) {
+        (Some(ts), _) => ts,
+        (_, Some(iso)) => {
+            // Parse ISO 8601 to epoch microseconds
+            let dt = chrono::NaiveDateTime::parse_from_str(
+                &iso.replace('T', " "),
+                "%Y-%m-%d %H:%M:%S",
+            ).map_err(|e| anyhow::anyhow!("invalid datetime '{iso}': {e}"))?;
+            dt.and_utc().timestamp_micros()
+        }
+        (None, None) => {
+            eprintln!("error: specify --before-ts or --before");
+            return Ok(ExitCode::BadInput);
+        }
+    };
+
+    let req = serde_json::json!({
+        "action": "history_clean",
+        "plc_id": plc_id,
+        "cutoff_ts": cutoff,
+        "batch_size": batch_size,
+    });
+    let cmd_id = db::command_queue::enqueue(
+        conn, CommandKind::Admin, &req.to_string(), Some(plc_id), None, None,
+    )?;
+    println!("queued command_id={cmd_id}");
+    Ok(ExitCode::Ok)
+}
+
+fn handle_history_delete_dataset(
+    conn: &Connection,
+    _cli: &Cli,
+    dataset: &str,
+) -> Result<ExitCode> {
+    // Check dataset exists and is stopped
+    let state: String = conn.query_row(
+        "SELECT state FROM dataset WHERE name = ?1",
+        rusqlite::params![dataset],
+        |row| row.get(0),
+    ).map_err(|_| anyhow::anyhow!("dataset '{dataset}' not found"))?;
+
+    if state == "active" {
+        eprintln!("error: dataset '{dataset}' is active. Stop collection first.");
+        return Ok(ExitCode::BadInput);
+    }
+
+    let req = serde_json::json!({
+        "action": "delete_dataset",
+        "dataset": dataset,
+    });
+    let cmd_id = db::command_queue::enqueue(
+        conn, CommandKind::Admin, &req.to_string(), None, None, None,
+    )?;
+    println!("queued command_id={cmd_id}");
+    Ok(ExitCode::Ok)
+}
+
+fn handle_history_vacuum(conn: &Connection, force: bool) -> Result<ExitCode> {
+    if !force {
+        // Check for active datasets
+        let active: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM dataset WHERE state = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        if active > 0 {
+            eprintln!("warning: {active} active dataset(s). VACUUM may block polling.");
+            eprintln!("Use --force to proceed anyway.");
+            return Ok(ExitCode::BadInput);
+        }
+    }
+
+    conn.execute_batch("VACUUM")?;
+    println!("success vacuum completed");
+    Ok(ExitCode::Ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_sql_select() {
+        let conn = db::schema::open_memory().unwrap();
+        let result = handle_sql(&conn, "SELECT 1 AS col", "json", 10);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_sql_rejects_write() {
+        let conn = db::schema::open_memory().unwrap();
+        let result = handle_sql(&conn, "DELETE FROM tag", "json", 10);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
+    }
+
+    #[test]
+    fn test_set_create_and_list() {
+        let conn = db::schema::open_memory().unwrap();
+        // Need a PLC first
+        conn.execute(
+            "INSERT INTO plc (name, host) VALUES ('test-plc', '127.0.0.1')",
+            [],
+        ).unwrap();
+
+        handle_set_create(&conn, "test-plc", "my_set", None).unwrap();
+        let id: i64 = conn.query_row(
+            "SELECT id FROM metric_set WHERE name = 'my_set'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn test_tag_disable_unknown() {
+        let conn = db::schema::open_memory().unwrap();
+        let result = handle_tag_disable(&conn, 999);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
+    }
+}

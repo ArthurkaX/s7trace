@@ -114,6 +114,109 @@ pub struct ValidationResult {
     pub ts_us: TimestampUs,
 }
 
+/// Insert a tag (and its metric_set membership) in the database,
+/// then validate it via `client_arc`. Optionally schedule a config apply.
+///
+/// Used both by CLI sync mode (using a freshly created client) and by
+/// the server command worker (using the in-process PLC registry).
+pub struct InsertedTag {
+    pub tag_id: i64,
+    pub plc_id: i64,
+    pub poll_group_id: i64,
+    pub metric_set_id: i64,
+}
+
+pub fn insert_tag(
+    conn: &Connection,
+    plc_name: &str,
+    name: &str,
+    address: &S7Address,
+    data_type: DataType,
+    poll_group: &str,
+    store_mode: &str,
+    storage_hook: &str,
+    value_role: &str,
+    metric_set: Option<&str>,
+) -> Result<InsertedTag> {
+    let plc_id: i64 = conn
+        .query_row(
+            "SELECT id FROM plc WHERE name = ?1",
+            rusqlite::params![plc_name],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found. Create it first."))?;
+
+    let poll_group_id: i64 = match conn.query_row(
+        "SELECT id FROM poll_group WHERE name = ?1",
+        rusqlite::params![poll_group],
+        |row| row.get(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            let period = match poll_group {
+                "fast" => 40,
+                "medium" => 250,
+                _ => 1000,
+            };
+            conn.execute(
+                "INSERT INTO poll_group (name, period_ms) VALUES (?1, ?2)",
+                rusqlite::params![poll_group, period],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    let now = now_us();
+    let byte_size = data_type.byte_size() as i64;
+    let dt_str = data_type.to_string();
+    let address_str = format!("DB{}.DB{}{}", address.db_num, byte_size_label(data_type), address.byte_offset);
+
+    conn.execute(
+        "INSERT INTO tag
+            (plc_id, name, address, db_num, byte_offset, byte_size, data_type,
+             value_role, poll_group_id, store_mode, storage_hook, enabled, created_ts, updated_ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?12)",
+        rusqlite::params![
+            plc_id, name, address_str, address.db_num, address.byte_offset, byte_size,
+            dt_str, value_role, poll_group_id, store_mode, storage_hook, now,
+        ],
+    )?;
+    let tag_id = conn.last_insert_rowid();
+
+    let set_name = metric_set.unwrap_or("default");
+    let metric_set_id: i64 = match conn.query_row(
+        "SELECT id FROM metric_set WHERE plc_id = ?1 AND name = ?2",
+        rusqlite::params![plc_id, set_name],
+        |row| row.get(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            conn.execute(
+                "INSERT INTO metric_set (plc_id, name, enabled, created_ts, updated_ts)
+                 VALUES (?1, ?2, 1, ?3, ?3)",
+                rusqlite::params![plc_id, set_name, now],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    conn.execute(
+        "INSERT OR IGNORE INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![metric_set_id, tag_id, plc_id, now],
+    )?;
+
+    Ok(InsertedTag { tag_id, plc_id, poll_group_id, metric_set_id })
+}
+
+fn byte_size_label(dt: DataType) -> &'static str {
+    match dt {
+        DataType::Bool => "X",
+        DataType::I16 | DataType::U16 => "W",
+        DataType::I32 | DataType::U32 | DataType::F32 => "D",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

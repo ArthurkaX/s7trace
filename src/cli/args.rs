@@ -9,6 +9,18 @@ pub struct Cli {
     #[arg(short = 'd', long = "db", default_value = "s7trace.db", env = "S7TRACE_DB")]
     pub db: String,
 
+    /// If set, all PLC- and command-related operations go through the
+    /// remote server at this URL (e.g. http://10.0.0.1:8080). The local
+    /// --db is still used for read-only SQL queries that can be answered
+    /// from a replica. Use this when the server runs on-site and the CLI
+    /// has no direct PLC access.
+    #[arg(long = "remote-server", env = "S7TRACE_REMOTE_SERVER", global = true)]
+    pub remote_server: Option<String>,
+
+    /// Maximum time to wait for a remote command to complete, in ms.
+    #[arg(long = "remote-timeout-ms", default_value_t = 30_000, global = true)]
+    pub remote_timeout_ms: u64,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

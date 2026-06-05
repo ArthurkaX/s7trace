@@ -95,7 +95,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             handle_command_result(conn, *command_id, fmt)
         }
         Command::TagAdd { plc, name, address, data_type, poll_group, store_mode, storage_hook, value_role, metric_set, async_mode } => {
-            handle_tag_add(conn, cli, plc, name, address, data_type, poll_group, store_mode, storage_hook, value_role, metric_set.as_deref(), *async_mode)
+            handle_tag_add(cli, conn, plc, name, address, data_type, poll_group, store_mode, storage_hook, value_role, metric_set.as_deref(), *async_mode)
         }
         Command::TagUpdate { tag_id, address, data_type, poll_group, store_mode, storage_hook } => {
             handle_tag_update(conn, cli, *tag_id, address.as_deref(), data_type.as_deref(), poll_group.as_deref(), store_mode.as_deref(), storage_hook.as_deref())
@@ -103,12 +103,12 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
         Command::TagDisable { tag_id } => handle_tag_disable(conn, *tag_id),
         Command::TagRevalidate { tag_id } => handle_tag_revalidate(conn, cli, *tag_id),
         Command::Read { plc, address, data_type, format: fmt } => {
-            handle_read(conn, cli, plc, address, data_type, fmt)
+            handle_read(cli, conn, plc, address, data_type, fmt)
         }
         Command::ReadRaw { plc, db, start, len, format: fmt, save_probe } => {
             handle_read_raw(conn, cli, plc, *db, *start, *len, fmt, *save_probe)
         }
-        Command::Status { format: fmt } => handle_status(conn, fmt),
+        Command::Status { format: fmt } => handle_status(cli, conn, fmt),
         Command::SetCreate { plc, name, description } => {
             handle_set_create(conn, plc, name, description.as_deref())
         }
@@ -335,8 +335,8 @@ fn handle_command_result_inner(result: &CommandResult, fmt: &Format) -> Result<E
 // ---------------------------------------------------------------------------
 
 fn handle_tag_add(
+    cli: &Cli,
     conn: &Connection,
-    _cli: &Cli,
     plc: &str,
     name: &str,
     address: &str,
@@ -348,88 +348,70 @@ fn handle_tag_add(
     metric_set: Option<&str>,
     async_mode: bool,
 ) -> Result<ExitCode> {
-    // Validate inputs
     let dt: DataType = data_type.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
     let _sm: StoreMode = store_mode.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
     let _sh: StorageHook = storage_hook.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
     let addr = S7Address::parse(address)
         .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
 
-    // Find PLC
-    let plc_id: i64 = conn.query_row(
-        "SELECT id FROM plc WHERE name = ?1",
-        rusqlite::params![plc],
-        |row| row.get(0),
-    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found. Create it first."))?;
-
-    // Find or create poll group
-    let poll_group_id: i64 = match conn.query_row(
-        "SELECT id FROM poll_group WHERE name = ?1",
-        rusqlite::params![poll_group],
-        |row| row.get(0),
-    ) {
-        Ok(id) => id,
-        Err(_) => {
-            let period = match poll_group {
-                "fast" => 40,
-                "medium" => 250,
-                _ => 1000,
-            };
-            conn.execute(
-                "INSERT INTO poll_group (name, period_ms) VALUES (?1, ?2)",
-                rusqlite::params![poll_group, period],
-            )?;
-            conn.last_insert_rowid()
+    // Remote mode: send tag_add_full to the server, which will insert +
+    // validate + schedule apply on its side. CLI doesn't need PLC access.
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "tag_add_full",
+            "plc": plc,
+            "name": name,
+            "address": address,
+            "data_type": data_type,
+            "poll_group": poll_group,
+            "store_mode": store_mode,
+            "storage_hook": storage_hook,
+            "value_role": value_role,
+            "metric_set": metric_set,
+        });
+        let id = cli::remote::enqueue_command(
+            base, "control", &req.to_string(), Some("cli"), None, timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) = cli::remote::wait_command(
+            base, id, timeout, std::time::Duration::from_millis(200),
+        )?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
         }
-    };
+        return Ok(ExitCode::Ok);
+    }
 
-    let now = now_us();
-    let byte_size = dt.byte_size() as i64;
-
-    // Insert tag
-    conn.execute(
-        "INSERT INTO tag
-            (plc_id, name, address, db_num, byte_offset, byte_size, data_type,
-             value_role, poll_group_id, store_mode, storage_hook, enabled, created_ts, updated_ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?12)",
-        rusqlite::params![
-            plc_id, name, address, addr.db_num, addr.byte_offset, byte_size,
-            data_type, value_role, poll_group_id, store_mode, storage_hook, now,
-        ],
+    let inserted = db::validation::insert_tag(
+        conn, plc, name, &addr, dt, poll_group, store_mode, storage_hook,
+        value_role, metric_set,
     )?;
-    let tag_id = conn.last_insert_rowid();
-
-    // Add to default metric set if none specified
-    let set_name = metric_set.unwrap_or("default");
-    let set_id: i64 = match conn.query_row(
-        "SELECT id FROM metric_set WHERE plc_id = ?1 AND name = ?2",
-        rusqlite::params![plc_id, set_name],
-        |row| row.get(0),
-    ) {
-        Ok(id) => id,
-        Err(_) => {
-            conn.execute(
-                "INSERT INTO metric_set (plc_id, name, enabled, created_ts, updated_ts)
-                 VALUES (?1, ?2, 1, ?3, ?3)",
-                rusqlite::params![plc_id, set_name, now],
-            )?;
-            conn.last_insert_rowid()
-        }
-    };
-
-    conn.execute(
-        "INSERT OR IGNORE INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
-         VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![set_id, tag_id, plc_id, now],
-    )?;
+    let tag_id = inserted.tag_id;
+    let set_name = metric_set.unwrap_or("default").to_string();
 
     // Schedule delayed config apply
+    let _ = db::config_apply::schedule(
+        conn,
+        ApplyScope::Tag,
+        Some(inserted.plc_id),
+        None,
+        None,
+        Some(tag_id),
+        &format!("tag_add id={tag_id}"),
+        db::config_apply::PLAN_COOLDOWN_MS,
+        None,
+    );
+
     if !async_mode {
         // Synchronous validation: read one sample from the PLC now and
         // mark the tag as good or bad before reporting back.
         let plc_row: (String, String, i64, i64) = conn.query_row(
             "SELECT host, name, rack, slot FROM plc WHERE id = ?1",
-            rusqlite::params![plc_id],
+            rusqlite::params![inserted.plc_id],
             |row| Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -467,11 +449,11 @@ fn handle_tag_add(
         // Enqueue as command
         let req = serde_json::json!({
             "action": "tag_add",
-            "plc_id": plc_id,
+            "plc_id": inserted.plc_id,
             "tag_id": tag_id,
         });
         let cmd_id = db::command_queue::enqueue(
-            conn, CommandKind::Control, &req.to_string(), Some(plc_id), None, None,
+            conn, CommandKind::Control, &req.to_string(), Some(inserted.plc_id), None, None,
         )?;
         println!("queued command_id={cmd_id}");
     }
@@ -596,14 +578,39 @@ fn handle_tag_revalidate(
 // ---------------------------------------------------------------------------
 
 fn handle_read(
+    cli: &Cli,
     conn: &Connection,
-    _cli: &Cli,
     plc: &str,
     address: &str,
     data_type: &str,
     fmt: &str,
 ) -> Result<ExitCode> {
-    // Enqueue a PLC read command
+    // Remote mode: send to server, wait, print result.
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "read",
+            "plc": plc,
+            "address": address,
+            "data_type": data_type,
+            "format": fmt,
+        });
+        let id = cli::remote::enqueue_command(
+            base, "plc_read", &req.to_string(), Some("cli"), None, timeout,
+        )?;
+        let (state, result, ok, err) = cli::remote::wait_command(
+            base, id, timeout, std::time::Duration::from_millis(200),
+        )?;
+        if ok {
+            println!("{result}");
+        } else {
+            eprintln!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
+    // Local mode: enqueue a PLC read command (server must be running)
     let req = serde_json::json!({
         "action": "read",
         "plc": plc,
@@ -653,7 +660,21 @@ fn handle_read_raw(
 // Status handler
 // ---------------------------------------------------------------------------
 
-fn handle_status(conn: &Connection, fmt: &str) -> Result<ExitCode> {
+fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
+    // Remote mode: fetch JSON from server and pretty-print.
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let v = cli::remote::get_status(base, timeout)?;
+        if fmt == "json" || fmt == "jsonl" {
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        } else {
+            // text mode: try to read the same text format we produce locally
+            // by reading the local DB. If that's unavailable, fall back to JSON.
+            println!("(remote server: {base})");
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        return Ok(ExitCode::Ok);
+    }
     let out_fmt = Format::from_str(fmt);
 
     // Gather PLCs

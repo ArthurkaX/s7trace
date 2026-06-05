@@ -472,6 +472,80 @@ fn execute_command(
         Control => {
             let action = req["action"].as_str().unwrap_or("");
             match action {
+                "tag_add_full" => {
+                    // Full remote tag add: PLC + name + address + dt + ... — server
+                    // does INSERT into tag + metric_set_tag, validates via PLC
+                    // client, schedules apply. Returns tag_id, ok, value.
+                    let plc_name = req["plc"].as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing plc"))?;
+                    let name = req["name"].as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing name"))?;
+                    let address_str = req["address"].as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing address"))?;
+                    let data_type_str = req["data_type"].as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing data_type"))?;
+                    let poll_group = req["poll_group"].as_str().unwrap_or("slow");
+                    let store_mode = req["store_mode"].as_str().unwrap_or("on_change");
+                    let storage_hook = req["storage_hook"].as_str().unwrap_or("on_change");
+                    let value_role = req["value_role"].as_str().unwrap_or("state");
+                    let metric_set = req["metric_set"].as_str();
+
+                    let dt: DataType = data_type_str.parse()
+                        .map_err(|e: String| anyhow::anyhow!("invalid data_type: {e}"))?;
+                    let _sm: StoreMode = store_mode.parse()
+                        .map_err(|e: String| anyhow::anyhow!("invalid store_mode: {store_mode}"))?;
+                    let _sh: StorageHook = storage_hook.parse()
+                        .map_err(|e: String| anyhow::anyhow!("invalid storage_hook: {storage_hook}"))?;
+                    let addr = S7Address::parse(address_str)
+                        .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+
+                    let inserted = db::validation::insert_tag(
+                        conn, plc_name, name, &addr, dt, poll_group, store_mode,
+                        storage_hook, value_role, metric_set,
+                    )?;
+                    let tag_id = inserted.tag_id;
+
+                    // Validation
+                    let client_arc = {
+                        let reg = plcs.lock();
+                        reg.get(&inserted.plc_id).cloned()
+                            .ok_or_else(|| anyhow::anyhow!("PLC client not available for {}", inserted.plc_id))?
+                    };
+                    let result = db::validation::validate_tag(conn, &client_arc, tag_id)?;
+
+                    if result.ok {
+                        snapshot.update(
+                            tag_id, inserted.plc_id, name, address_str, dt,
+                            result.value_i, result.value_f, result.ts_us,
+                        );
+                    }
+
+                    let _ = db::config_apply::schedule(
+                        conn, ApplyScope::Tag, Some(inserted.plc_id), None, None, Some(tag_id),
+                        &format!("tag_add_full id={tag_id}"),
+                        db::config_apply::PLAN_COOLDOWN_MS, None,
+                    );
+
+                    let val_str = if let Some(v) = result.value_i {
+                        if let Some(f) = result.value_f {
+                            format!("value={v} float={f}")
+                        } else {
+                            format!("value={v}")
+                        }
+                    } else if let Some(f) = result.value_f {
+                        format!("value={f}")
+                    } else {
+                        "value=null".into()
+                    };
+
+                    if result.ok {
+                        Ok((true, format!("{val_str} apply_state=pending tag_id={tag_id}")))
+                    } else {
+                        let bc = result.bad_class.as_ref().map(|b| b.to_string()).unwrap_or_default();
+                        let det = result.detail.as_deref().unwrap_or("");
+                        Ok((false, format!("bad bad_class={bc} detail=\"{det}\" tag_id={tag_id}")))
+                    }
+                }
                 "tag_add" => {
                     let plc_id = req["plc_id"].as_i64()
                         .ok_or_else(|| anyhow::anyhow!("missing plc_id"))?;

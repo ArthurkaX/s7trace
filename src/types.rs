@@ -362,21 +362,42 @@ pub struct S7Address {
 }
 
 impl S7Address {
-    /// Parse an address string like `DB5999.DBW120` or `DB10.DBD240`.
+    /// Parse an address string like `DB5999.DBW120` or `DB5997.DBX10.1`.
     ///
-    /// Format: `DB<num>.<DBW|DBD|DBX|DBB><offset>`
-    /// - DBW = word (2 bytes)
-    /// - DBD = double word (4 bytes)
-    /// - DBB = byte (1 byte)
-    /// - DBX = bit (bit_offset)
+    /// Format:
+    /// - `DB<n>.<DBW|DBD|DBB><byte_offset>` (byte/word/dword)
+    /// - `DB<n>.<DBX><byte>.<bit>` (bit at byte.bit; S7-300 standard)
+    /// - Legacy: `DB<n>.<DBX><linear_bit>` (linear bit offset, must be < 8
+    ///   for non-byte-aligned form; just use DBX<byte>.<bit> in new code)
+    ///
+    /// Examples:
+    ///   DB5999.DBW8      — word at byte 8 in DB5999
+    ///   DB5997.DBX10.1   — bit 1 of byte 10 in DB5997 (Siemens notation)
+    ///   DB1.DBD240       — dword at byte 240
     pub fn parse(s: &str) -> Result<S7Address, String> {
-        let re = regex::Regex::new(
+        // Try bit-with-dot form first: DB<n>.DBX<num>.<bit>
+        let re_bit_dot = regex::Regex::new(
+            r"^DB(\d+)\.DBX(\d+)\.(\d+)$",
+        ).expect("valid S7 address regex");
+        if let Some(caps) = re_bit_dot.captures(s) {
+            let db_num: u16 = caps[1].parse().map_err(|e| format!("invalid DB number: {e}"))?;
+            let byte: usize = caps[2].parse().map_err(|e| format!("invalid byte offset: {e}"))?;
+            let bit: u8 = caps[3].parse().map_err(|e| format!("invalid bit offset: {e}"))?;
+            if bit > 7 {
+                return Err(format!("bit index must be 0..7, got {bit}"));
+            }
+            return Ok(S7Address {
+                db_num,
+                byte_offset: byte,
+                bit_offset: Some(bit),
+            });
+        }
+        // Then try the simple form: DB<n>.<DB{W|D|B|X})<num>
+        let re_simple = regex::Regex::new(
             r"^DB(\d+)\.(DB[WDBX])(\d+)$",
-        )
-        .expect("valid S7 address regex");
-
-        let caps = re.captures(s).ok_or_else(|| {
-            format!("invalid address format: {s}")
+        ).expect("valid S7 address regex");
+        let caps = re_simple.captures(s).ok_or_else(|| {
+            format!("invalid address format: {s} (expected DB<n>.DBW<n>, DB<n>.DBX<n>.<bit>, etc.)")
         })?;
 
         let db_num: u16 = caps[1].parse().map_err(|e| format!("invalid DB number: {e}"))?;
@@ -394,6 +415,65 @@ impl S7Address {
             }),
             _ => Err(format!("unknown area type: {area}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_s7_word() {
+        let a = S7Address::parse("DB5999.DBW22").unwrap();
+        assert_eq!(a.db_num, 5999);
+        assert_eq!(a.byte_offset, 22);
+        assert_eq!(a.bit_offset, None);
+    }
+
+    #[test]
+    fn test_parse_s7_dword() {
+        let a = S7Address::parse("DB10.DBD240").unwrap();
+        assert_eq!(a.db_num, 10);
+        assert_eq!(a.byte_offset, 240);
+        assert_eq!(a.bit_offset, None);
+    }
+
+    #[test]
+    fn test_parse_s7_bit_with_dot() {
+        // Real S7-300 style: DB<n>.DBX<byte>.<bit>
+        let a = S7Address::parse("DB5997.DBX10.1").unwrap();
+        assert_eq!(a.db_num, 5997);
+        assert_eq!(a.byte_offset, 10);
+        assert_eq!(a.bit_offset, Some(1));
+    }
+
+    #[test]
+    fn test_parse_s7_bit_byte7() {
+        let a = S7Address::parse("DB1.DBX7.0").unwrap();
+        assert_eq!(a.db_num, 1);
+        assert_eq!(a.byte_offset, 7);
+        assert_eq!(a.bit_offset, Some(0));
+    }
+
+    #[test]
+    fn test_parse_s7_legacy_bit() {
+        // Linear bit: 10 = byte 1, bit 2
+        let a = S7Address::parse("DB5.DBX10").unwrap();
+        assert_eq!(a.db_num, 5);
+        assert_eq!(a.byte_offset, 1);
+        assert_eq!(a.bit_offset, Some(2));
+    }
+
+    #[test]
+    fn test_parse_s7_bit_out_of_range() {
+        assert!(S7Address::parse("DB1.DBX10.8").is_err());
+    }
+
+    #[test]
+    fn test_parse_s7_invalid() {
+        assert!(S7Address::parse("DB10.DBW").is_err());
+        assert!(S7Address::parse("invalid").is_err());
+        assert!(S7Address::parse("DB10.DBW22.1").is_err());
     }
 }
 

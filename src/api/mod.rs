@@ -92,7 +92,7 @@ fn handle_conn(mut stream: TcpStream, db: Arc<Mutex<Connection>>) -> std::io::Re
 
     // Route
     let (path, query) = split_query(&target);
-    let resp = route(&db, &method, path, query, &body);
+    let resp = route(&db, &method, &path, &query, &body);
 
     let body_str = resp.body;
     let status_line = match resp.status {
@@ -149,34 +149,29 @@ impl Response {
     }
 }
 
-fn split_query(target: &str) -> (&str, &[(&str, &str)]) {
-    // Manual parse without bringing in url crate. Returns owned path + Vec of
-    // (key, value) refs into a static buffer would be ideal, but we have
-    // to leak a bit: the function will return a small Vec<(&str,&str)> that
-    // borrows from a leaked String. For simplicity we leak the target.
-    let leaked: &'static str = Box::leak(target.to_string().into_boxed_str());
-    let (path, query_str) = match leaked.split_once('?') {
-        Some((p, q)) => (p, q),
-        None => (leaked, ""),
+fn split_query(target: &str) -> (String, Vec<(String, String)>) {
+    let (path, query_str) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q),
+        None => (target.to_string(), ""),
     };
-    let mut params: Vec<(&str, &str)> = Vec::new();
+    let mut params: Vec<(String, String)> = Vec::new();
     if !query_str.is_empty() {
         for pair in query_str.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
-                params.push((k, v));
+                params.push((k.to_string(), v.to_string()));
             } else if !pair.is_empty() {
-                params.push((pair, ""));
+                params.push((pair.to_string(), String::new()));
             }
         }
     }
-    (path, Box::leak(params.into_boxed_slice()))
+    (path, params)
 }
 
 fn route(
     db: &Arc<Mutex<Connection>>,
     method: &str,
     path: &str,
-    query: &[(&str, &str)],
+    query: &[(String, String)],
     body: &[u8],
 ) -> Response {
     // Strip /v1 prefix if present
@@ -231,11 +226,11 @@ fn route(
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn qparam<'a>(query: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
-    query.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| *v)
+fn qparam<'a>(query: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    query.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
 }
 
-fn param_owned<'a>(query: &[(&'a str, &'a str)], key: &str) -> Option<String> {
+fn param_owned<'a>(query: &'a [(String, String)], key: &str) -> Option<String> {
     qparam(query, key).map(|s| urldecode(s))
 }
 
@@ -310,7 +305,7 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
         .unwrap_or(0);
     let config_apply_pending: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM config_apply WHERE state IN ('pending','debouncing','applying')",
+            "SELECT COUNT(*) FROM config_apply WHERE state IN ('pending','applying')",
             [],
             |r| r.get(0),
         )
@@ -325,7 +320,7 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
     }))
 }
 
-fn handle_tags(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Response {
+fn handle_tags(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
     let plc = param_owned(query, "plc");
     let enabled = param_owned(query, "enabled");
     let bad_only = matches!(param_owned(query, "bad"), Some(ref v) if v == "1" || v == "true");
@@ -384,7 +379,7 @@ fn handle_tags(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Response 
     Response::json(serde_json::json!({"tags": out, "count": out.len()}))
 }
 
-fn handle_sample(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Response {
+fn handle_sample(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
     let tag = match param_owned(query, "tag") {
         Some(t) => t,
         None => return Response::err(400, "missing tag parameter"),
@@ -409,7 +404,7 @@ fn handle_sample(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Respons
     };
 
     let mut sql = String::from(
-        "SELECT ts, value_i, value_f, span_id, COALESCE(reason, '') FROM sample WHERE tag_id = ?1",
+        "SELECT ts, vi, vf, span_id, '' AS reason FROM sample WHERE tag_id = ?1",
     );
     if since_ts.is_some() {
         sql.push_str(" AND ts >= ?");
@@ -419,10 +414,6 @@ fn handle_sample(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Respons
     }
     sql.push_str(" ORDER BY ts DESC LIMIT ?");
 
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(e) => return Response::err(500, &format!("prepare: {e}")),
-    };
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(tag_id)];
     if let Some(t) = since_ts {
         params.push(Box::new(t));
@@ -431,10 +422,8 @@ fn handle_sample(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Respons
         params.push(Box::new(t));
     }
     params.push(Box::new(limit));
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
 
-    let mut out: Vec<serde_json::Value> = Vec::new();
-    out = run_sample_query(&conn, &sql, &params);
+    let out = run_sample_query(&conn, &sql, &params);
     Response::json(serde_json::json!({"tag_id": tag_id, "samples": out, "count": out.len()}))
 }
 
@@ -463,7 +452,7 @@ fn run_sample_query(
     out
 }
 
-fn handle_rollup(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Response {
+fn handle_rollup(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
     let tag = match param_owned(query, "tag") {
         Some(t) => t,
         None => return Response::err(400, "missing tag parameter"),
@@ -487,9 +476,9 @@ fn handle_rollup(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Respons
     };
 
     let mut sql = String::from(
-        "SELECT window_start_ts, window_end_ts, first_value_i, first_value_f,
-                last_value_i, last_value_f, min_value_i, min_value_f,
-                max_value_i, max_value_f, sample_count
+        "SELECT window_start_ts, window_end_ts, first_vi, first_vf,
+                last_vi, last_vf, min_vi, min_vf,
+                max_vi, max_vf, sample_count
          FROM sample_rollup WHERE tag_id = ?1",
     );
     if since_ts.is_some() {
@@ -520,14 +509,14 @@ fn handle_rollup(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Respons
             out.push(serde_json::json!({
                 "window_start_ts": row.get::<_, i64>(0).unwrap_or(0),
                 "window_end_ts": row.get::<_, i64>(1).unwrap_or(0),
-                "first_value_i": row.get::<_, Option<i64>>(2).unwrap_or(None),
-                "first_value_f": row.get::<_, Option<f64>>(3).unwrap_or(None),
-                "last_value_i": row.get::<_, Option<i64>>(4).unwrap_or(None),
-                "last_value_f": row.get::<_, Option<f64>>(5).unwrap_or(None),
-                "min_value_i": row.get::<_, Option<i64>>(6).unwrap_or(None),
-                "min_value_f": row.get::<_, Option<f64>>(7).unwrap_or(None),
-                "max_value_i": row.get::<_, Option<i64>>(8).unwrap_or(None),
-                "max_value_f": row.get::<_, Option<f64>>(9).unwrap_or(None),
+                "first_vi": row.get::<_, Option<i64>>(2).unwrap_or(None),
+                "first_vf": row.get::<_, Option<f64>>(3).unwrap_or(None),
+                "last_vi": row.get::<_, Option<i64>>(4).unwrap_or(None),
+                "last_vf": row.get::<_, Option<f64>>(5).unwrap_or(None),
+                "min_vi": row.get::<_, Option<i64>>(6).unwrap_or(None),
+                "min_vf": row.get::<_, Option<f64>>(7).unwrap_or(None),
+                "max_vi": row.get::<_, Option<i64>>(8).unwrap_or(None),
+                "max_vf": row.get::<_, Option<f64>>(9).unwrap_or(None),
                 "sample_count": row.get::<_, i64>(10).unwrap_or(0),
             }));
         }
@@ -535,7 +524,7 @@ fn handle_rollup(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Respons
     Response::json(serde_json::json!({"tag_id": tag_id, "rollups": out, "count": out.len()}))
 }
 
-fn handle_event(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Response {
+fn handle_event(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
     let since_ts = param_owned(query, "since_ts").and_then(|s| s.parse::<i64>().ok());
     let kind = param_owned(query, "kind");
     let tag_filter = param_owned(query, "tag");
@@ -592,7 +581,7 @@ fn handle_event(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Response
     Response::json(serde_json::json!({"events": out, "count": out.len()}))
 }
 
-fn handle_command_list(db: &Arc<Mutex<Connection>>, query: &[(&str, &str)]) -> Response {
+fn handle_command_list(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
     let state = param_owned(query, "state");
     let limit: i64 = param_owned(query, "limit")
         .and_then(|s| s.parse().ok())

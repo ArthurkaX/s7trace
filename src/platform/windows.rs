@@ -26,21 +26,21 @@ use rusqlite::Connection;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::OnceLock;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, DrawTextW, EndPaint, InvalidateRect, PAINTSTRUCT, DT_LEFT, DT_NOPREFIX,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetMessageW, GetSystemMetrics, LoadIconW, PostQuitMessage, RegisterClassExW,
     SetTimer, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    HMENU, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN, SM_CYSCREEN,
+    HMENU, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN, SM_CYSCREEN,
     SW_HIDE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK,
     WM_PAINT, WM_RBUTTONUP, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED,
     WS_SYSMENU, WS_VISIBLE,
@@ -339,7 +339,7 @@ unsafe extern "system" fn wndproc(
             paint(hwnd);
             0
         }
-        WM_SIZE => {
+        _WM_SIZE => {
             // Re-layout buttons on resize (not needed for fixed-size window)
             InvalidateRect(hwnd, std::ptr::null(), 1);
             0
@@ -374,7 +374,7 @@ unsafe extern "system" fn wndproc(
 fn handle_command(hwnd: HWND, id: u16) {
     let st = state_from_ptr();
     let db = st.db.clone();
-    let mut status = st.cached_status.lock();
+    let status = st.cached_status.lock();
     unsafe {
     match id {
         IDB_START | IDM_START => {
@@ -403,7 +403,7 @@ fn handle_command(hwnd: HWND, id: u16) {
 fn show_tray_menu(hwnd: HWND) {
     unsafe {
         let st = state_from_ptr();
-        let mut pt: POINT = std::mem::zeroed();
+        let pt: POINT = std::mem::zeroed();
         // Use cursor pos for popup placement
         let _ = pt; // Win32 GetCursorPos is in another feature; skip
         // We still call TrackPopupMenu — but without cursor pos it pops at 0,0.

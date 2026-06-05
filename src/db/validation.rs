@@ -24,23 +24,25 @@ pub fn validate_tag(
     client_arc: &Arc<Mutex<dyn PlcClient + Send>>,
     tag_id: i64,
 ) -> Result<ValidationResult> {
-    // Load tag
-    let (plc_id, db_num, byte_offset, byte_size, data_type_str): (i64, i64, i64, i64, String) =
+    // Load tag — includes bit_offset for Bool tags
+    let (plc_id, db_num, byte_offset, bit_offset, byte_size, data_type_str): (i64, i64, i64, Option<i64>, i64, String) =
         conn.query_row(
-            "SELECT plc_id, db_num, byte_offset, byte_size, data_type
+            "SELECT plc_id, db_num, byte_offset, bit_offset, byte_size, data_type
              FROM tag WHERE id = ?1",
             rusqlite::params![tag_id],
             |row| Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
             )),
         )?;
 
     let dt: DataType = data_type_str.parse()
         .map_err(|e: String| anyhow::anyhow!("invalid data_type '{data_type_str}': {e}"))?;
+    let bit_off = bit_offset.map(|b| b as u8);
 
     let now = now_us();
     let mut client = client_arc.lock();
@@ -49,7 +51,7 @@ pub fn validate_tag(
     match read_result {
         Ok(data) => {
             drop(client);
-            let (vi, vf) = crate::engine::storage::decode_value(&data, dt);
+            let (vi, vf) = crate::engine::storage::decode_value(&data, dt, bit_off);
             conn.execute(
                 "UPDATE tag
                  SET bad = 0,
@@ -169,15 +171,20 @@ pub fn insert_tag(
     let now = now_us();
     let byte_size = data_type.byte_size() as i64;
     let dt_str = data_type.to_string();
-    let address_str = format!("DB{}.DB{}{}", address.db_num, byte_size_label(data_type), address.byte_offset);
+    let address_str = if let Some(bit) = address.bit_offset {
+        format!("DB{}.DBX{}.{}", address.db_num, address.byte_offset, bit)
+    } else {
+        format!("DB{}.DB{}{}", address.db_num, byte_size_label(data_type), address.byte_offset)
+    };
 
     conn.execute(
         "INSERT INTO tag
-            (plc_id, name, address, db_num, byte_offset, byte_size, data_type,
+            (plc_id, name, address, db_num, byte_offset, bit_offset, byte_size, data_type,
              value_role, poll_group_id, store_mode, storage_hook, enabled, created_ts, updated_ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?13)",
         rusqlite::params![
-            plc_id, name, address_str, address.db_num, address.byte_offset, byte_size,
+            plc_id, name, address_str, address.db_num, address.byte_offset,
+            address.bit_offset.map(|b| b as i64), byte_size,
             dt_str, value_role, poll_group_id, store_mode, storage_hook, now,
         ],
     )?;

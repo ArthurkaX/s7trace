@@ -4,7 +4,6 @@
 /// (`skip_missed_ticks` by default per architecture doc).
 
 use crate::types::ReadPlan;
-use crate::engine::snapshot::Snapshot;
 use crate::engine::storage::{self, HookState, RollupPayload, WriteDecision};
 use crate::plc::client::PlcClient;
 use crate::types::*;
@@ -155,12 +154,9 @@ impl PlcPoller {
     }
 
     /// Execute one poll cycle against the given PLC client.
-    ///
-    /// Returns `None` if the cycle should be skipped due to overrun.
     pub fn poll_once(
         &mut self,
         client: &mut dyn PlcClient,
-        snapshot: &Snapshot,
     ) -> Result<PollResult, PlcError> {
         let started_ts = now_us();
         let started = Instant::now();
@@ -203,14 +199,8 @@ impl PlcPoller {
                             }
                             let tag_data = &data[offset_in_span..end];
 
-                            let (vi, vf) = storage::decode_value(tag_data, tag.data_type);
+                            let (vi, vf) = storage::decode_value(tag_data, tag.data_type, tag.bit_offset);
                             let ts = now_us();
-
-                            // Update snapshot
-                            snapshot.update(
-                                tag_id, self.plc_id, &tag.name, &tag.address,
-                                tag.data_type, vi, vf, ts,
-                            );
 
                             // Snapshot previous counter value (if any) before
                             // evaluate() updates the hook state, so we can
@@ -427,7 +417,6 @@ pub fn spawn_poller(
     plan: ReadPlan,
     tags: Vec<TagRow>,
     client: Arc<Mutex<dyn PlcClient + Send>>,
-    snapshot: Arc<Snapshot>,
     sample_tx: Sender<PollResult>,
 ) -> PollerHandle {
     let running = Arc::new(Mutex::new(true));
@@ -436,6 +425,7 @@ pub fn spawn_poller(
     std::thread::Builder::new()
         .name(format!("poller-{}", plc_name))
         .spawn(move || {
+            let plc_client = client; // rename to avoid shadow conflict with the MutexGuard
             info!("poller started for {} (period={}ms)", plc_name, period_ms);
 
             let mut poller = PlcPoller::new(plc_id, &plc_name, plan, period_ms, OverrunMode::SkipMissedTicks);
@@ -445,8 +435,8 @@ pub fn spawn_poller(
 
             while *thread_running.lock() {
                 let cycle_start = Instant::now();
-                let mut client = client.lock();
-                let result = poller.poll_once(&mut *client, &snapshot);
+                let mut inner = plc_client.lock();
+                let result = poller.poll_once(&mut *inner);
 
                 match result {
                     Ok(r) => {
@@ -470,10 +460,22 @@ pub fn spawn_poller(
                     }
                     Err(e) => {
                         error!("PLC {}: poll cycle failed: {}", plc_name, e);
+                        // On disconnect, try to reconnect immediately
+                        if matches!(&e, PlcError::Disconnected(_) | PlcError::Timeout(_)) {
+                            warn!("poller-{}: attempting reconnect...", plc_name);
+                            drop(inner); // release the MutexGuard
+                            let mut guard = plc_client.lock();
+                            match guard.connect() {
+                                Ok(()) => info!("poller-{}: reconnected OK", plc_name),
+                                Err(e2) => error!("poller-{}: reconnect failed: {}", plc_name, e2),
+                            }
+                            drop(guard);
+                            continue;
+                        }
                     }
                 }
 
-                drop(client);
+                drop(inner);
 
                 let elapsed = cycle_start.elapsed();
                 let target = Duration::from_millis(period_ms);
@@ -529,17 +531,15 @@ mod tests {
         let plan = build_plan(1, 1, &tags, 480, 8);
         let mut poller = PlcPoller::new(1, "test", plan, 100, OverrunMode::SkipMissedTicks);
         poller.init_tags(&tags);
-        let snapshot = Snapshot::new();
 
         plc.seed(1, 0, vec![0x00, 0x2A]);
 
-        let result = poller.poll_once(&mut plc, &snapshot).unwrap();
+        let result = poller.poll_once(&mut plc).unwrap();
         assert_eq!(result.seq, 1);
         assert!(result.cycle_info.ok);
 
-        // Should have produced a sample from decoding
-        let tag_snap = snapshot.get_by_id(1).unwrap();
-        assert_eq!(tag_snap.last_value_i, Some(42));
+        // Should have produced a sample with decoded value 42
+        assert_eq!(result.samples.len(), 1);
     }
 
     #[test]
@@ -580,9 +580,8 @@ mod tests {
         let plan = build_plan(1, 1, &tags, 480, 8);
         let mut poller = PlcPoller::new(1, "test", plan, 100, OverrunMode::SkipMissedTicks);
         poller.init_tags(&tags);
-        let snapshot = Snapshot::new();
 
-        let result = poller.poll_once(&mut plc, &snapshot).unwrap();
+        let result = poller.poll_once(&mut plc).unwrap();
         assert!(result.cycle_info.ok);
         assert!(result.bad_tags.is_empty());
     }

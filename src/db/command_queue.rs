@@ -75,34 +75,45 @@ pub fn claim_next(conn: &Connection) -> Result<Option<CommandRequest>> {
         params![now, MAX_ATTEMPTS],
     )?;
 
-    // Claim next pending
-    conn.execute(
-        "UPDATE command_request
-         SET state = 'running',
-             claimed_ts = ?1,
-             lease_expires_ts = ?2,
-             heartbeat_ts = ?1,
-             attempt_count = attempt_count + 1
-         WHERE id = (
-             SELECT id FROM command_request
+    // Select the next pending row id first, then update by that specific id.
+    // This avoids the race where a reclaimed lease flips another row to
+    // running between the UPDATE and the SELECT.
+    let target_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM command_request
              WHERE state = 'pending'
              ORDER BY priority ASC, id ASC
-             LIMIT 1
-         )",
-        params![now, now + DEFAULT_LEASE_MS * 1000],
-    )?;
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
 
-    if conn.changes() == 0 {
-        return Ok(None);
-    }
+    let claimed_id = match target_id {
+        Some(id) => {
+            conn.execute(
+                "UPDATE command_request
+                 SET state = 'running',
+                     claimed_ts = ?1,
+                     lease_expires_ts = ?2,
+                     heartbeat_ts = ?1,
+                     attempt_count = attempt_count + 1
+                 WHERE id = ?3 AND state = 'pending'",
+                params![now, now + DEFAULT_LEASE_MS * 1000, id],
+            )?;
+            if conn.changes() == 0 {
+                return Ok(None);
+            }
+            id
+        }
+        None => return Ok(None),
+    };
 
     let row = conn.query_row(
         "SELECT id, created_ts, state, kind, request_json, plc_id
          FROM command_request
-         WHERE state = 'running'
-         ORDER BY id DESC
-         LIMIT 1",
-        [],
+         WHERE id = ?1",
+        params![claimed_id],
         |row| {
             let state_str: String = row.get(2)?;
             let kind_str: String = row.get(3)?;

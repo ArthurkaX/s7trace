@@ -16,12 +16,10 @@
 
 use crate::plc::client::PlcClient;
 use crate::types::*;
-use anyhow::Context;
-use log::{debug, info};
+use log::info;
 use std::sync::OnceLock;
 use std::time::Duration;
 use turbos7::S7Client;
-use turbos7::protocol::s7;
 
 /// One global runtime. Created on first call, never torn down.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -133,6 +131,14 @@ impl PlcClient for Turbo7Client {
                 .read_area(S7_AREA_DB, db, start as u32, len as u16)
                 .await
         });
+        if res.is_err() {
+            // Transport errors (IO / connection) mean the client is stale.
+            // Clear inner so the poller reconnect loop has a chance to
+            // re-establish the connection on the next cycle.
+            if res.as_ref().err().map_or(false, |e| matches!(e, turbos7::Error::Io(_) | turbos7::Error::Connection(_) | turbos7::Error::Timeout)) {
+                self.inner = None;
+            }
+        }
         res.map_err(|e| plc_error_from_turbos7(&e))
     }
 

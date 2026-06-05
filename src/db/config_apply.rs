@@ -103,30 +103,41 @@ pub fn schedule(
 pub fn claim_due(conn: &Connection) -> Result<Option<ConfigApplyRow>> {
     let now = now_us();
 
-    conn.execute(
-        "UPDATE config_apply
-         SET state = 'applying'
-         WHERE id = (
-             SELECT id FROM config_apply
+    // Select the target id first, then update by that specific id.
+    let target_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM config_apply
              WHERE state = 'pending' AND apply_after_ts <= ?1
              ORDER BY apply_after_ts, id
-             LIMIT 1
-         )",
-        params![now],
-    )?;
+             LIMIT 1",
+            params![now],
+            |row| row.get(0),
+        )
+        .ok();
 
-    if conn.changes() == 0 {
-        return Ok(None);
-    }
+    let claimed_id = match target_id {
+        Some(id) => {
+            conn.execute(
+                "UPDATE config_apply
+                 SET state = 'applying'
+                 WHERE id = ?1 AND state = 'pending'",
+                params![id],
+            )?;
+            if conn.changes() == 0 {
+                return Ok(None);
+            }
+            id
+        }
+        None => return Ok(None),
+    };
 
     let row = conn.query_row(
         "SELECT id, created_ts, updated_ts, apply_after_ts, applied_ts,
                 state, scope, plc_id, poll_group_id, metric_set_id, tag_id,
                 reason, cooldown_ms, details_json
          FROM config_apply
-         WHERE state = 'applying'
-         ORDER BY id DESC LIMIT 1",
-        [],
+         WHERE id = ?1",
+        params![claimed_id],
         |row| {
             let state_str: String = row.get(5)?;
             let scope_str: String = row.get(6)?;

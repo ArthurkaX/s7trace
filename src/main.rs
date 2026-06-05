@@ -1132,19 +1132,19 @@ fn handle_set_disable(
 }
 
 fn handle_set_list(conn: &Connection, plc: Option<&str>) -> Result<ExitCode> {
-    let query = if let Some(plc_name) = plc {
-        format!(
-            "SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
-             FROM v_metric_set_status vms WHERE vms.plc = '{}'",
-            plc_name.replace('\'', "''")
-        )
+    let (query, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if plc.is_some() {
+        ("SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
+          FROM v_metric_set_status vms WHERE vms.plc = ?1 ORDER BY vms.plc, vms.metric_set",
+         vec![Box::new(plc.unwrap().to_string())])
     } else {
-        "SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
-         FROM v_metric_set_status vms ORDER BY vms.plc, vms.metric_set".to_string()
+        ("SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
+          FROM v_metric_set_status vms ORDER BY vms.plc, vms.metric_set",
+         Vec::new())
     };
 
-    let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map([], |row| {
+    let mut stmt = conn.prepare(query)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(param_refs.iter().copied()), |row| {
         let plc: String = row.get(0)?;
         let name: String = row.get(1)?;
         let enabled: bool = row.get::<_, i64>(2)? != 0;

@@ -285,18 +285,9 @@ impl PlcClient for MockPlcClient {
 }
 
 // ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
-
-/// Create a `PlcClient` for the given PLC. Uses `Snap7Client` (pure Rust).
-pub fn create_plc_client(plc_name: &str, host: &str, rack: u16, slot: u16) -> Arc<Mutex<dyn PlcClient + Send>> {
-    info!(
-        "PLC '{}': creating client for {} (rack={}, slot={})",
-        plc_name, host, rack, slot
-    );
-    let client = Snap7Client::new(host, rack, slot);
-    Arc::new(Mutex::new(client))
-}
+// Factory removed: use `turbos7_backend::create_plc_client` instead.
+// The unified factory routes to rust7/turbos7/mock based on
+// S7TRACE_PLC_BACKEND. Keep MockPlcClient here for tests.
 
 #[cfg(test)]
 mod tests {

@@ -12,7 +12,7 @@ mod types;
 
 use cli::args::{Cli, Command};
 use cli::format::Format;
-use plc::snap7::create_plc_client;
+use plc::create_plc_client;
 use types::*;
 
 fn main() -> Result<()> {

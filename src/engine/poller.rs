@@ -425,6 +425,7 @@ pub fn spawn_poller(
     plc_name: String,
     period_ms: u64,
     plan: ReadPlan,
+    tags: Vec<TagRow>,
     client: Arc<Mutex<dyn PlcClient + Send>>,
     snapshot: Arc<Snapshot>,
     sample_tx: Sender<PollResult>,
@@ -438,6 +439,9 @@ pub fn spawn_poller(
             info!("poller started for {} (period={}ms)", plc_name, period_ms);
 
             let mut poller = PlcPoller::new(plc_id, &plc_name, plan, period_ms, OverrunMode::SkipMissedTicks);
+            // Initialize per-tag hook state from the active tags. Without
+            // this, tag_states is empty and samples are never written.
+            poller.init_tags(&tags);
 
             while *thread_running.lock() {
                 let cycle_start = Instant::now();
@@ -446,10 +450,18 @@ pub fn spawn_poller(
 
                 match result {
                     Ok(r) => {
-                        debug!(
-                            "PLC {}: cycle {} completed in {:.1}ms ({} samples)",
-                            plc_name, r.seq, poller.last_actual_ms, r.samples.len()
-                        );
+                        if r.samples.is_empty() && r.spans.is_empty() {
+                            warn!(
+                                "poller-{}: cycle {} had empty samples+spans (decision path?)",
+                                plc_name, r.seq
+                            );
+                        } else {
+                            info!(
+                                "poller-{}: cycle {} in {:.1}ms ({} samples, {} spans)",
+                                plc_name, r.seq, poller.last_actual_ms,
+                                r.samples.len(), r.spans.len()
+                            );
+                        }
                         // Send samples to writer (non-blocking)
                         if sample_tx.send(r).is_err() {
                             warn!("poller-{}: sample channel closed, stopping", plc_name);

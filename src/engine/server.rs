@@ -25,7 +25,7 @@ use crate::engine::plan::build_plan;
 use crate::engine::poller::{PollerHandle, PollResult, spawn_poller};
 use crate::engine::snapshot::Snapshot;
 use crate::plc::client::PlcClient;
-use crate::plc::snap7::create_plc_client;
+use crate::plc::create_plc_client;
 use crate::types::*;
 use crate::api;
 
@@ -169,6 +169,7 @@ fn spawn_one_poller(
         plc_name.to_string(),
         period_ms,
         plan,
+        tags,
         client,
         snapshot.clone(),
         sample_tx.clone(),
@@ -686,11 +687,16 @@ fn execute_command(
                     }
 
                     // Create dataset
-                    conn.execute(
-                        "INSERT INTO dataset (plc_id, name, state, created_ts)
-                         VALUES (?1, ?2, 'active', ?3)",
-                        rusqlite::params![plc_id, dataset, now_us()],
+                    let now = now_us();
+                    let n = conn.execute(
+                        "INSERT INTO dataset (plc_id, name, state, created_ts, updated_ts)
+                         VALUES (?1, ?2, 'active', ?3, ?3)",
+                        rusqlite::params![plc_id, dataset, now],
                     )?;
+                    info!(
+                        "collection_start: inserted dataset id=? plc_id={} name='{}' rows_affected={}",
+                        plc_id, dataset, n
+                    );
 
                     // Find poll groups for this PLC
                     let pg_rows: Vec<(i64, String, u64)> = {
@@ -859,17 +865,30 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
         )?;
     }
 
-    let dataset_id: Option<i64> = conn
+    // Find the active dataset for this PLC. Datasets are not directly
+    // linked to poll groups in the schema; the active dataset for the
+    // PLC is the one to attach new cycles to. If there is no active
+    // dataset, the sample-writer skips the write (pollers only produce
+    // data while a collection is running).
+    let dataset_id_opt: Option<i64> = conn
         .query_row(
-            "SELECT ds.id FROM dataset ds
-             JOIN poll_group pg ON pg.plc_id = ds.plc_id
-             WHERE ds.plc_id = ?1 AND ds.state = 'active'
-             AND pg.id = ?2
-             LIMIT 1",
-            rusqlite::params![ci.plc_id, ci.poll_group_id],
+            "SELECT id FROM dataset
+             WHERE plc_id = ?1 AND state = 'active'
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![ci.plc_id],
             |row| row.get(0),
         )
         .ok();
+    let dataset_id = match dataset_id_opt {
+        Some(id) => id,
+        None => {
+            debug!(
+                "no active dataset for plc_id={} poll_group_id={}, skipping cycle write",
+                ci.plc_id, ci.poll_group_id
+            );
+            return Ok(());
+        }
+    };
 
     conn.execute(
         "INSERT INTO poll_cycle
@@ -887,14 +906,17 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
     // for each cycle-local span id.
     let mut span_rowids: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     for s in &batch.spans {
+        // read_span has (plc_id, poll_group_id, db_num, byte_offset,
+        // byte_len, active) per docs/schema.sql. `ok` is implicit in
+        // the parent poll_cycle row.
         conn.execute(
             "INSERT INTO read_span
-                (plc_id, poll_group_id, seq, db_num, byte_offset, byte_len, ok, dataset_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (plc_id, poll_group_id, db_num, byte_offset, byte_len, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
-                ci.plc_id, ci.poll_group_id, ci.seq as i64,
+                ci.plc_id, ci.poll_group_id,
                 s.db_num as i64, s.byte_offset as i64, s.byte_len as i64,
-                s.ok as i32, dataset_id,
+                1i32,
             ],
         )?;
         span_rowids.insert(s.span_id, conn.last_insert_rowid());

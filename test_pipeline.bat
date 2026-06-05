@@ -1,0 +1,55 @@
+@echo off
+setlocal
+set DB=test_pipeline.db
+set BIN=target\release\s7trace.exe
+
+del %DB% 2>nul
+
+echo === 1. Init PLC2 ===
+%BIN% --db %DB% admin-sql "INSERT INTO plc (id, name, host, rack, slot) VALUES (1, 'PLC2', '192.168.0.51', 0, 2)"
+if %errorlevel% neq 0 exit /b %errorlevel%
+%BIN% --db %DB% admin-sql "INSERT INTO poll_group (id, name, period_ms) VALUES (1, 'fast', 40)"
+%BIN% --db %DB% admin-sql "INSERT INTO metric_set (plc_id, name, enabled) VALUES (1, 'test', 1)"
+echo OK
+
+echo.
+echo === 2. Dry-run ===
+%BIN% --db %DB% server --dry-run
+
+echo.
+echo === 3. Tag add (enqueue) ===
+%BIN% --db %DB% tag add --plc PLC2 --name s_TRS5_FB_TRK_Track_Samo.o_ST_PEC_Miss --address DB1291.DBX3400.0 --type bool --poll-group fast --store-mode on-change --storage-hook on_change --value-role raw --metric-set test --async
+
+echo.
+echo === 4. Enqueue PLC read ===
+%BIN% --db %DB% read --plc PLC2 --address DB1291.DBX3400.0 --type bool
+
+echo.
+echo === 5. Start server (background) ===
+start /MIN /B %BIN% --db %DB%
+rem Wait for server to initialize
+C:\Windows\System32\timeout.exe /t 3 /nobreak >nul
+C:\Windows\System32\tasklist.exe /fi "imagename eq s7trace.exe" 2>nul | C:\Windows\System32\find.exe "s7trace" >nul && echo Server running || echo Server NOT running
+
+echo.
+echo === 6. Command list (server processed) ===
+%BIN% --db %DB% command list --state finished
+
+echo.
+echo === 7. Status ===
+%BIN% --db %DB% status --format json
+
+echo.
+echo === 8. Collection start ===
+%BIN% --db %DB% collection start --plc PLC2 --dataset test_run_001 --set test
+
+echo.
+echo === 9. Status after collection start ===
+%BIN% --db %DB% status --format json
+
+echo.
+echo === 10. Collection stop ===
+%BIN% --db %DB% collection stop --plc PLC2
+
+echo.
+echo === DONE ===

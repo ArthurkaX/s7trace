@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use log::info;
 use rusqlite::Connection;
 
-const SCHEMA_SQL: &str = include_str!("../../docs/schema.sql");
+/// Migration file 0001 — must be byte-identical to the SQL kept in
+/// `docs/schema.sql` (used by out-of-band tools and CI).
+const MIGRATION_0001: &str = include_str!("../../migrations/0001_initial.sql");
 
 /// Open or create the database, run pending migrations.
 pub fn open(path: &str) -> Result<Connection> {
@@ -17,6 +19,16 @@ pub fn open(path: &str) -> Result<Connection> {
     conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
+    // The schema is applied as a single embedded migration; it brings
+    // `schema_meta` with it. We do not pre-create it here, otherwise
+    // re-opening a freshly-created DB would fail on the duplicate
+    // CREATE TABLE.
+
+    // Embedded migrations applied in order. Real migrations live under
+    // `migrations/*.sql` (loaded via include_str!). For now only 0001 is
+    // embedded; future versions add 0002, 0003, ...
+    const EMBEDDED: &[(&str, &str)] = &[("0001_initial", MIGRATION_0001)];
+
     let version: String = conn
         .query_row(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'",
@@ -25,15 +37,14 @@ pub fn open(path: &str) -> Result<Connection> {
         )
         .unwrap_or_default();
 
-    match version.as_str() {
-        "" => {
-            info!("fresh database, applying initial schema");
-            apply_initial(&conn)?;
-        }
-        "1" => {
-            info!("database at schema version 1");
-        }
-        _ => {
+    if version.is_empty() {
+        info!("fresh database, applying initial schema");
+        apply_migrations(&conn, EMBEDDED)?;
+    } else {
+        info!("database at schema version {version}");
+        // Future: detect version < current and apply pending migrations.
+        // For now only version 1 exists.
+        if version != "1" {
             anyhow::bail!(
                 "database schema version '{version}' is newer than this binary (max 1). \
                  Upgrade the binary first."
@@ -56,10 +67,17 @@ pub fn open(path: &str) -> Result<Connection> {
     Ok(conn)
 }
 
-fn apply_initial(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA_SQL)
-        .context("applying initial schema from docs/schema.sql")?;
-    info!("initial schema applied");
+/// Apply all embedded migrations that haven't been recorded as applied
+/// yet. The migration files are expected to be idempotent
+/// (`CREATE TABLE IF NOT EXISTS` style); this is a deliberate choice so
+/// that opening an existing database is safe even if it was bootstrapped
+/// from `docs/schema.sql` directly.
+fn apply_migrations(conn: &Connection, migrations: &[(&str, &str)]) -> Result<()> {
+    for (name, sql) in migrations {
+        info!("applying migration {name}");
+        conn.execute_batch(sql)
+            .with_context(|| format!("applying migration {name}"))?;
+    }
     Ok(())
 }
 
@@ -67,7 +85,9 @@ fn apply_initial(conn: &Connection) -> Result<()> {
 pub fn open_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    apply_initial(&conn)?;
+    // `schema_meta` is part of the embedded schema (see schema.sql / 0001
+    // migration) so we don't pre-create it here.
+    apply_migrations(&conn, &[("0001_initial", MIGRATION_0001)])?;
     Ok(conn)
 }
 
@@ -86,5 +106,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, "1");
+    }
+
+    #[test]
+    fn test_migration_file_matches_docs() {
+        // `migrations/0001_initial.sql` and `docs/schema.sql` must stay
+        // byte-identical so that re-opening a database is always safe.
+        // If you change the schema, update both files.
+        let docs_sql = std::fs::read_to_string("docs/schema.sql")
+            .expect("read docs/schema.sql");
+        assert_eq!(
+            MIGRATION_0001, docs_sql,
+            "migrations/0001_initial.sql and docs/schema.sql diverged"
+        );
     }
 }

@@ -19,7 +19,9 @@ CREATE TABLE plc (
     slot INTEGER NOT NULL DEFAULT 2,
     enabled INTEGER NOT NULL DEFAULT 1,
     last_ok_ts INTEGER,
-    last_error TEXT
+    last_error TEXT,
+    connectivity TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (connectivity IN ('online', 'offline', 'unknown'))
 );
 
 CREATE TABLE poll_group (

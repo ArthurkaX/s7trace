@@ -20,6 +20,12 @@ pub enum Command {
         /// Run once, check configuration, then exit.
         #[arg(long)]
         dry_run: bool,
+        /// Bind the HTTP control API to this address (e.g. 127.0.0.1:8080).
+        #[arg(long)]
+        http_bind: Option<String>,
+        /// Open the Windows control window (Windows only; ignored elsewhere).
+        #[arg(long)]
+        control_window: bool,
     },
     /// Execute a read-only SQL query.
     Sql {
@@ -228,19 +234,26 @@ pub enum Command {
         description: Option<String>,
     },
 
-    /// Add a tag to a metric set.
+    /// Add tags to a metric set. Accepts a single tag (name or ID) or
+    /// a comma-separated list (`--tag tag1,tag2,tag3`). For bulk import
+    /// use `--from-sql` (returns tag IDs) or `--from-file` (one tag name
+    /// per line, `#`-comments allowed).
     SetAddTag {
         /// Metric set name.
         #[arg(long = "set")]
         set_name: String,
 
-        /// Tag name or ID.
+        /// Tag name, ID, or comma-separated list.
         #[arg(long = "tag")]
-        tag: String,
+        tag: Option<String>,
 
         /// Add tags from SQL result (returns tag IDs).
         #[arg(long = "from-sql")]
         from_sql: Option<String>,
+
+        /// Add tags from a text file (one name per line).
+        #[arg(long = "from-file")]
+        from_file: Option<String>,
     },
 
     /// Remove a tag from a metric set.

@@ -261,4 +261,45 @@ mod tests {
         // Should be same row (debounced)
         assert_eq!(id1, id2);
     }
+
+    #[test]
+    fn test_apply_tag_version_flip() {
+        // Simulates what apply_worker does: claim_due + apply + finish_apply
+        // should reflect in tag.applied_version == desired_version.
+        let conn = open_memory().unwrap();
+        conn.execute("INSERT INTO plc (id, name, host) VALUES (1, 'p', 'h')", []).unwrap();
+        conn.execute("INSERT INTO poll_group (id, name, period_ms) VALUES (1, 'fast', 40)", []).unwrap();
+        conn.execute(
+            "INSERT INTO tag (id, plc_id, name, address, db_num, byte_offset, byte_size,
+                              data_type, poll_group_id, store_mode, storage_hook,
+                              enabled, created_ts, updated_ts, desired_version, applied_version, apply_state)
+             VALUES (10, 1, 't', 'DB1.DBW0', 1, 0, 2, 'i16', 1, 'on_change', 'on_change',
+                     1, 0, 0, 5, 0, 'pending')",
+            [],
+        ).unwrap();
+
+        let id = schedule(
+            &conn, ApplyScope::Tag, Some(1), Some(1), None, Some(10),
+            "test", 0, None,
+        ).unwrap();
+        assert!(id > 0);
+
+        let row = claim_due(&conn).unwrap().unwrap();
+        assert_eq!(row.id, id);
+
+        // Mimic apply_worker Tag-scope update
+        conn.execute(
+            "UPDATE tag SET applied_version = desired_version, apply_state = 'applied' WHERE id = ?1",
+            rusqlite::params![row.tag_id],
+        ).unwrap();
+        finish_apply(&conn, row.id).unwrap();
+
+        let (applied, desired, state): (i64, i64, String) = conn.query_row(
+            "SELECT applied_version, desired_version, apply_state FROM tag WHERE id = 10",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(applied, 5);
+        assert_eq!(desired, 5);
+        assert_eq!(state, "applied");
+    }
 }

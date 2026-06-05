@@ -8,6 +8,10 @@ use anyhow::{Context, Result};
 use log::warn;
 use rusqlite::{params, Connection};
 
+pub use crate::types::CommandKind;
+pub use crate::types::CommandRequest;
+pub use crate::types::CommandResult;
+
 /// Default lease duration (30 s).
 pub const DEFAULT_LEASE_MS: i64 = 30_000;
 
@@ -167,6 +171,41 @@ pub fn finish_bad(conn: &Connection, command_id: i64, error: &str) -> Result<()>
     )?;
 
     Ok(())
+}
+
+/// Get a single command request by id.
+pub fn get_request(conn: &Connection, command_id: i64) -> Result<Option<CommandRequest>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, created_ts, state, kind, request_json, plc_id
+         FROM command_request WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query(params![command_id])?;
+    if let Some(row) = rows.next()? {
+        let state_str: String = row.get(2)?;
+        let kind_str: String = row.get(3)?;
+        Ok(Some(CommandRequest {
+            id: row.get(0)?,
+            created_ts: row.get(1)?,
+            state: serde_json::from_str(&format!("\"{state_str}\"")).unwrap_or(CommandState::Pending),
+            kind: serde_json::from_str(&format!("\"{kind_str}\"")).unwrap_or(CommandKind::Query),
+            request_json: row.get(4)?,
+            plc_id: row.get(5)?,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Cancel a pending command. Returns `true` if cancelled, `false` if the
+/// command was not in `pending` state.
+pub fn cancel(conn: &Connection, command_id: i64) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE command_request
+         SET state = 'cancelled', finished_ts = ?1
+         WHERE id = ?2 AND state = 'pending'",
+        params![now_us(), command_id],
+    )?;
+    Ok(n > 0)
 }
 
 /// Get command result.

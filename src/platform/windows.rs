@@ -29,7 +29,9 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DrawTextW, EndPaint, InvalidateRect, DT_LEFT, DT_NOPREFIX, PAINTSTRUCT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+    DrawTextW, EndPaint, FillRect, GetSysColorBrush, InvalidateRect, SelectObject, SetBkMode,
+    DT_LEFT, DT_NOPREFIX, PAINTSTRUCT, SRCCOPY,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -40,8 +42,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetMessageW, GetSystemMetrics, LoadIconW, PostQuitMessage, RegisterClassExW, SetTimer,
     SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HMENU, IDI_APPLICATION,
     MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
-    WM_USER, WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
+    WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONUP,
+    WM_TIMER, WM_USER, WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
 
 const WM_TRAYICON: u32 = WM_USER + 1;
@@ -392,6 +394,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             0
         }
+        WM_ERASEBKGND => {
+            // Prevent background erasure — we fully overwrite the
+            // client area in WM_PAINT, so the default erase-then-draw
+            // cycle causes visible flicker.
+            1
+        }
         WM_PAINT => {
             paint(hwnd);
             0
@@ -420,8 +428,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         _ => {
-            // Default: handle resize and pass through
-            InvalidateRect(hwnd, std::ptr::null(), 1);
+            // Pass through to default — do NOT invalidate here.
+            // The timer-based refresh_status drives redraws, and
+            // extra InvalidateRect calls cause flicker.
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
     }
@@ -693,6 +702,33 @@ fn paint(hwnd: HWND) {
     unsafe {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let hdc = BeginPaint(hwnd, &mut ps);
+        let (cx, cy) = (
+            ps.rcPaint.right - ps.rcPaint.left,
+            ps.rcPaint.bottom - ps.rcPaint.top,
+        );
+        if cx <= 0 || cy <= 0 {
+            EndPaint(hwnd, &ps);
+            return;
+        }
+
+        // Double-buffer: draw to memory DC, then BitBlt to screen.
+        // This eliminates flicker from repeated GDI text drawing.
+        let mem_dc = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, cx, cy);
+        let old_bmp = SelectObject(mem_dc, bmp);
+
+        // Fill background with button face color
+        let bg_brush = GetSysColorBrush(15); // COLOR_BTNFACE
+        let mut bg_rect = windows_sys::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: cx,
+            bottom: cy,
+        };
+        FillRect(mem_dc, &mut bg_rect, bg_brush);
+
+        // Transparent background for all text
+        SetBkMode(mem_dc, 1); // TRANSPARENT
 
         let uptime = app_started().elapsed();
         let uptime_str = format!(
@@ -719,7 +755,7 @@ fn paint(hwnd: HWND) {
             bottom: 30,
         };
         DrawTextW(
-            hdc,
+            mem_dc,
             header.as_ptr(),
             -1,
             &mut header_rect,
@@ -738,32 +774,28 @@ fn paint(hwnd: HWND) {
             bottom: 50,
         };
         DrawTextW(
-            hdc,
+            mem_dc,
             counts.as_ptr(),
             -1,
             &mut counts_rect,
             DT_LEFT | DT_NOPREFIX,
         );
 
-        // Dashboard table header
+        // Dashboard table
         let mut table_text =
             String::from("PLC            Task (metric set)     Dataset            State    Tags\n");
         table_text
             .push_str("----------------------------------------------------------------------\n");
 
-        // Row heights for click hit-testing (y starting at 56)
         let row_top = 56;
         let row_height = 15;
         let table_bottom = row_top + snap.rows.len() as i32 * row_height;
 
         for (i, row) in snap.rows.iter().enumerate() {
-            // Compute state string
             let state = row_state(row);
             let tags_str = format!("{}/{}", row.tags_active, row.tags_bad);
             let ds_str = row.dataset_name.as_deref().unwrap_or("---");
             let set_str = row.metric_set_name.as_deref().unwrap_or("---");
-
-            // Selection marker
             let prefix = if sel == i as isize { "> " } else { "  " };
             table_text.push_str(&format!(
                 "{}{:<13} {:<20} {:<18} {:<7} {}\n",
@@ -779,7 +811,7 @@ fn paint(hwnd: HWND) {
         };
         let table_w = win_string(&table_text);
         DrawTextW(
-            hdc,
+            mem_dc,
             table_w.as_ptr(),
             -1,
             &mut table_rect,
@@ -803,14 +835,14 @@ fn paint(hwnd: HWND) {
         };
         let info_w = win_string(&info_text);
         DrawTextW(
-            hdc,
+            mem_dc,
             info_w.as_ptr(),
             -1,
             &mut info_rect,
             DT_LEFT | DT_NOPREFIX,
         );
 
-        // Last command result
+        // Last events
         let mut ev_text = String::from("Last events:\n");
         for e in &snap.last_events {
             ev_text.push_str(&format!("  {e}\n"));
@@ -826,7 +858,21 @@ fn paint(hwnd: HWND) {
             bottom: ev_y + 120,
         };
         let ev_w = win_string(&ev_text);
-        DrawTextW(hdc, ev_w.as_ptr(), -1, &mut ev_rect, DT_LEFT | DT_NOPREFIX);
+        DrawTextW(
+            mem_dc,
+            ev_w.as_ptr(),
+            -1,
+            &mut ev_rect,
+            DT_LEFT | DT_NOPREFIX,
+        );
+
+        // Blit the memory DC to the screen DC in one shot
+        BitBlt(hdc, 0, 0, cx, cy, mem_dc, 0, 0, SRCCOPY);
+
+        // Cleanup
+        SelectObject(mem_dc, old_bmp);
+        DeleteObject(bmp);
+        DeleteDC(mem_dc);
 
         EndPaint(hwnd, &ps);
     }

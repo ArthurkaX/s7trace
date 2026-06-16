@@ -39,11 +39,12 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, GetSystemMetrics, LoadIconW, PostQuitMessage, RegisterClassExW, SetTimer,
-    SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HMENU, IDI_APPLICATION,
-    MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONUP,
-    WM_TIMER, WM_USER, WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
+    GetCursorPos, GetMessageW, GetSystemMetrics, LoadIconW, PostQuitMessage, RegisterClassExW,
+    SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, HMENU, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN,
+    SM_CYSCREEN, SW_HIDE, SW_SHOW, TPM_RIGHTBUTTON, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WM_USER,
+    WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
 
 const WM_TRAYICON: u32 = WM_USER + 1;
@@ -53,7 +54,6 @@ const IDM_OPEN: u16 = 1001;
 const IDM_START: u16 = 1002;
 const IDM_STOP: u16 = 1003;
 const IDM_EXIT: u16 = 1004;
-const IDM_TOGGLE: u16 = 1005;
 
 const IDB_START: u16 = 2001;
 const IDB_STOP: u16 = 2002;
@@ -468,18 +468,14 @@ fn handle_command(hwnd: HWND, id: u16) {
 fn show_tray_menu(hwnd: HWND) {
     unsafe {
         let st = state_from_ptr();
-        let pt: POINT = std::mem::zeroed();
-        // Use cursor pos for popup placement
-        let _ = pt; // Win32 GetCursorPos is in another feature; skip
-                    // We still call TrackPopupMenu — but without cursor pos it pops at 0,0.
-                    // For brevity, use the constants we have. The user can right-click the icon
-                    // to get the menu; placement accuracy is a known limitation.
-                    // Real impl: import user32::GetCursorPos.
-        windows_sys::Win32::UI::WindowsAndMessaging::TrackPopupMenu(
+        let mut pt: POINT = std::mem::zeroed();
+        GetCursorPos(&mut pt);
+        SetForegroundWindow(hwnd);
+        TrackPopupMenu(
             st.hmenu_tray,
-            0,
-            0,
-            0,
+            TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
             0,
             hwnd,
             std::ptr::null(),
@@ -740,7 +736,9 @@ fn paint(hwnd: HWND) {
 
         // Top status line
         let header = win_string(&format!(
-            "s7trace                       Status: {}  Uptime {}",
+            "s7trace  PLCs:{}  Datasets:{}  Status: {}  Uptime {}",
+            snap.plc_count,
+            snap.active_dataset_count,
             if snap.server_running {
                 "RUNNING"
             } else {

@@ -119,9 +119,10 @@ impl PlcClient for Turbo7Client {
     }
 
     fn read_db(&mut self, db: u16, start: usize, len: usize) -> Result<Vec<u8>, PlcError> {
-        let client = self.inner.as_mut().ok_or_else(|| {
-            PlcError::Disconnected("read_db: not connected".into())
-        })?;
+        let client = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PlcError::Disconnected("read_db: not connected".into()))?;
         // S7 area code for Data Blocks = 0x84. turbos7 doesn't export
         // the constant from protocol::s7 (it only exposes wordlen),
         // so we use the literal here. See S7 protocol spec.
@@ -135,7 +136,12 @@ impl PlcClient for Turbo7Client {
             // Transport errors (IO / connection) mean the client is stale.
             // Clear inner so the poller reconnect loop has a chance to
             // re-establish the connection on the next cycle.
-            if res.as_ref().err().map_or(false, |e| matches!(e, turbos7::Error::Io(_) | turbos7::Error::Connection(_) | turbos7::Error::Timeout)) {
+            if res.as_ref().err().map_or(false, |e| {
+                matches!(
+                    e,
+                    turbos7::Error::Io(_) | turbos7::Error::Connection(_) | turbos7::Error::Timeout
+                )
+            }) {
                 self.inner = None;
             }
         }
@@ -158,7 +164,10 @@ impl PlcClient for Turbo7Client {
     }
 
     fn label(&self) -> String {
-        format!("{}:{} (rack={}, slot={})", self.host, self.port, self.rack, self.slot)
+        format!(
+            "{}:{} (rack={}, slot={})",
+            self.host, self.port, self.rack, self.slot
+        )
     }
 }
 
@@ -183,7 +192,6 @@ fn plc_error_from_turbos7(e: &turbos7::Error) -> PlcError {
         TErr::InvalidData => PlcError::DecodeError {
             detail: format!("invalid_data: {e}"),
         },
-        _ => PlcError::ProtocolError(format!("turbos7: {e}")),
     }
 }
 
@@ -241,8 +249,14 @@ mod tests {
 
     #[test]
     fn test_parse_host() {
-        assert_eq!(Turbo7Client::parse_host("192.168.0.1"), ("192.168.0.1".into(), 102));
-        assert_eq!(Turbo7Client::parse_host("192.168.0.1:2000"), ("192.168.0.1".into(), 2000));
+        assert_eq!(
+            Turbo7Client::parse_host("192.168.0.1"),
+            ("192.168.0.1".into(), 102)
+        );
+        assert_eq!(
+            Turbo7Client::parse_host("192.168.0.1:2000"),
+            ("192.168.0.1".into(), 2000)
+        );
         assert_eq!(Turbo7Client::parse_host("plc:102"), ("plc".into(), 102));
     }
 

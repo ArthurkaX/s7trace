@@ -1,4 +1,7 @@
 /target
+/temp
 *.db
 *.db-shm
 *.db-wal
+
+plan.md

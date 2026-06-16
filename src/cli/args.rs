@@ -1,12 +1,19 @@
 /// CLI argument definitions using clap derive.
-
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "s7trace", about = "Read-only S7 data collection service for Siemens PLCs")]
+#[command(
+    name = "s7trace",
+    about = "Read-only S7 data collection service for Siemens PLCs"
+)]
 pub struct Cli {
     /// Path to SQLite database.
-    #[arg(short = 'd', long = "db", default_value = "s7trace.db", env = "S7TRACE_DB")]
+    #[arg(
+        short = 'd',
+        long = "db",
+        default_value = "s7trace.db",
+        env = "S7TRACE_DB"
+    )]
     pub db: String,
 
     /// If set, all PLC- and command-related operations go through the
@@ -38,6 +45,9 @@ pub enum Command {
         /// Open the Windows control window (Windows only; ignored elsewhere).
         #[arg(long)]
         control_window: bool,
+        /// Use strict overrun mode: don't skip missed poll ticks (useful for commissioning).
+        #[arg(long)]
+        strict_overrun: bool,
     },
     /// Execute a read-only SQL query.
     Sql {

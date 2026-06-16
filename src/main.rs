@@ -24,26 +24,38 @@ fn main() -> Result<()> {
 
     match &cli.command {
         None | Some(Command::Server { dry_run: false, .. }) => {
-            let (dry_run, http_bind, control_window) = match &cli.command {
-                Some(Command::Server { dry_run, http_bind, control_window }) => {
-                    (*dry_run, http_bind.clone(), *control_window)
-                }
-                _ => (false, None, false),
+            let (dry_run, http_bind, control_window, strict_overrun) = match &cli.command {
+                Some(Command::Server {
+                    dry_run,
+                    http_bind,
+                    control_window,
+                    strict_overrun,
+                }) => (
+                    *dry_run,
+                    http_bind.clone(),
+                    *control_window,
+                    *strict_overrun,
+                ),
+                _ => (false, None, false, false),
             };
             if dry_run {
                 return dry_run_check(&cli.db);
             }
             dry_run_check(&cli.db)?;
+            let overrun_mode = if strict_overrun {
+                engine::poller::OverrunMode::Strict
+            } else {
+                engine::poller::OverrunMode::SkipMissedTicks
+            };
             let config = engine::server::ServerConfig {
                 db_path: cli.db.clone(),
                 http_bind,
                 control_window,
+                overrun_mode,
             };
             engine::server::run_server_with_config(config)
         }
-        Some(Command::Server { .. }) => {
-            dry_run_check(&cli.db)
-        }
+        Some(Command::Server { .. }) => dry_run_check(&cli.db),
         Some(_) => {
             // CLI mode — open DB and dispatch command
             let conn = db::schema::open(&cli.db)
@@ -59,8 +71,16 @@ fn dry_run_check(db_path: &str) -> Result<()> {
     let conn = db::schema::open(db_path)?;
     let plc_count: i64 = conn.query_row("SELECT COUNT(*) FROM plc", [], |r| r.get(0))?;
     let pg_count: i64 = conn.query_row("SELECT COUNT(*) FROM poll_group", [], |r| r.get(0))?;
-    let tag_count: i64 = conn.query_row("SELECT COUNT(*) FROM tag WHERE enabled = 1 AND bad = 0", [], |r| r.get(0))?;
-    let set_count: i64 = conn.query_row("SELECT COUNT(*) FROM metric_set WHERE enabled = 1", [], |r| r.get(0))?;
+    let tag_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tag WHERE enabled = 1 AND bad = 0",
+        [],
+        |r| r.get(0),
+    )?;
+    let set_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM metric_set WHERE enabled = 1",
+        [],
+        |r| r.get(0),
+    )?;
 
     println!("Database: {db_path}");
     println!("  PLCs:         {plc_count}");
@@ -81,46 +101,113 @@ fn dry_run_check(db_path: &str) -> Result<()> {
 }
 
 fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
-    let cmd = cli.command.as_ref().expect("dispatch called without command");
+    let cmd = cli
+        .command
+        .as_ref()
+        .expect("dispatch called without command");
     match cmd {
-        Command::Sql { query, format: fmt, limit, timeout_ms: _ } => {
-            handle_sql(conn, query, fmt, *limit)
-        }
+        Command::Sql {
+            query,
+            format: fmt,
+            limit,
+            timeout_ms: _,
+        } => handle_sql(conn, query, fmt, *limit),
         Command::AdminSql { query } => handle_admin_sql(conn, query),
         Command::CommandList { state } => handle_command_list(conn, state.as_deref()),
-        Command::CommandWait { command_id, poll_ms, timeout_ms } => {
-            handle_command_wait(conn, *command_id, *poll_ms, *timeout_ms)
-        }
-        Command::CommandResult { command_id, format: fmt } => {
-            handle_command_result(conn, *command_id, fmt)
-        }
-        Command::TagAdd { plc, name, address, data_type, poll_group, store_mode, storage_hook, value_role, metric_set, async_mode } => {
-            handle_tag_add(cli, conn, plc, name, address, data_type, poll_group, store_mode, storage_hook, value_role, metric_set.as_deref(), *async_mode)
-        }
-        Command::TagUpdate { tag_id, address, data_type, poll_group, store_mode, storage_hook } => {
-            handle_tag_update(conn, cli, *tag_id, address.as_deref(), data_type.as_deref(), poll_group.as_deref(), store_mode.as_deref(), storage_hook.as_deref())
-        }
+        Command::CommandWait {
+            command_id,
+            poll_ms,
+            timeout_ms,
+        } => handle_command_wait(conn, *command_id, *poll_ms, *timeout_ms),
+        Command::CommandResult {
+            command_id,
+            format: fmt,
+        } => handle_command_result(conn, *command_id, fmt),
+        Command::TagAdd {
+            plc,
+            name,
+            address,
+            data_type,
+            poll_group,
+            store_mode,
+            storage_hook,
+            value_role,
+            metric_set,
+            async_mode,
+        } => handle_tag_add(
+            cli,
+            conn,
+            plc,
+            name,
+            address,
+            data_type,
+            poll_group,
+            store_mode,
+            storage_hook,
+            value_role,
+            metric_set.as_deref(),
+            *async_mode,
+        ),
+        Command::TagUpdate {
+            tag_id,
+            address,
+            data_type,
+            poll_group,
+            store_mode,
+            storage_hook,
+        } => handle_tag_update(
+            conn,
+            cli,
+            *tag_id,
+            address.as_deref(),
+            data_type.as_deref(),
+            poll_group.as_deref(),
+            store_mode.as_deref(),
+            storage_hook.as_deref(),
+        ),
         Command::TagDisable { tag_id } => handle_tag_disable(conn, *tag_id),
         Command::TagRevalidate { tag_id } => handle_tag_revalidate(conn, cli, *tag_id),
-        Command::Read { plc, address, data_type, format: fmt } => {
-            handle_read(cli, conn, plc, address, data_type, fmt)
-        }
-        Command::ReadRaw { plc, db, start, len, format: fmt, save_probe } => {
-            handle_read_raw(conn, cli, plc, *db, *start, *len, fmt, *save_probe)
-        }
+        Command::Read {
+            plc,
+            address,
+            data_type,
+            format: fmt,
+        } => handle_read(cli, conn, plc, address, data_type, fmt),
+        Command::ReadRaw {
+            plc,
+            db,
+            start,
+            len,
+            format: fmt,
+            save_probe,
+        } => handle_read_raw(conn, cli, plc, *db, *start, *len, fmt, *save_probe),
         Command::Status { format: fmt } => handle_status(cli, conn, fmt),
-        Command::SetCreate { plc, name, description } => {
-            handle_set_create(conn, plc, name, description.as_deref())
-        }
-        Command::SetAddTag { set_name, tag, from_sql, from_file } => {
-            handle_set_add_tag(conn, set_name, tag.as_deref(), from_sql.as_deref(), from_file.as_deref())
-        }
-        Command::SetRemoveTag { set_name, tag, from_sql } => {
-            handle_set_remove_tag(conn, set_name, tag.as_deref(), from_sql.as_deref())
-        }
-        Command::SetEnable { set_name, async_mode } => {
-            handle_set_enable(conn, cli, set_name, *async_mode)
-        }
+        Command::SetCreate {
+            plc,
+            name,
+            description,
+        } => handle_set_create(conn, plc, name, description.as_deref()),
+        Command::SetAddTag {
+            set_name,
+            tag,
+            from_sql,
+            from_file,
+        } => handle_set_add_tag(
+            conn,
+            set_name,
+            tag.as_deref(),
+            from_sql.as_deref(),
+            from_file.as_deref(),
+        ),
+        Command::SetRemoveTag {
+            set_name,
+            tag,
+            from_sql,
+        } => handle_set_remove_tag(conn, set_name, tag.as_deref(), from_sql.as_deref()),
+        Command::SetEnable {
+            set_name,
+            async_mode,
+        } => handle_set_enable(conn, cli, set_name, *async_mode),
         Command::SetDisable { set_name } => handle_set_disable(conn, cli, set_name),
         Command::SetList { plc } => handle_set_list(conn, plc.as_deref()),
         Command::SetShow { set_name } => handle_set_show(conn, set_name),
@@ -128,9 +215,12 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             handle_collection_start(conn, cli, plc, dataset, sets)
         }
         Command::CollectionStop { plc } => handle_collection_stop(conn, cli, plc),
-        Command::HistoryClean { plc, before_ts, before, batch_size } => {
-            handle_history_clean(conn, cli, plc, *before_ts, before.as_deref(), *batch_size)
-        }
+        Command::HistoryClean {
+            plc,
+            before_ts,
+            before,
+            batch_size,
+        } => handle_history_clean(conn, cli, plc, *before_ts, before.as_deref(), *batch_size),
         Command::HistoryDeleteDataset { dataset } => {
             handle_history_delete_dataset(conn, cli, dataset)
         }
@@ -146,7 +236,10 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
 fn handle_sql(conn: &Connection, query: &str, fmt: &str, limit: u64) -> Result<ExitCode> {
     // Ensure read-only: reject anything that isn't a SELECT or WITH
     let trimmed = query.trim().to_uppercase();
-    if !trimmed.starts_with("SELECT") && !trimmed.starts_with("WITH") && !trimmed.starts_with("PRAGMA") {
+    if !trimmed.starts_with("SELECT")
+        && !trimmed.starts_with("WITH")
+        && !trimmed.starts_with("PRAGMA")
+    {
         eprintln!("error: only SELECT/WITH/PRAGMA allowed in sql mode");
         return Ok(ExitCode::BadInput);
     }
@@ -174,23 +267,19 @@ fn handle_sql(conn: &Connection, query: &str, fmt: &str, limit: u64) -> Result<E
 
     let rows = match stmt.query_map([], |row| {
         let values: Vec<serde_json::Value> = (0..col_count)
-            .map(|i| {
-                match row.get::<_, rusqlite::types::Value>(i) {
-                    Ok(v) => match v {
-                        rusqlite::types::Value::Null => serde_json::Value::Null,
-                        rusqlite::types::Value::Integer(n) => serde_json::Value::Number(n.into()),
-                        rusqlite::types::Value::Real(f) => {
-                            serde_json::Number::from_f64(f)
-                                .map(serde_json::Value::Number)
-                                .unwrap_or(serde_json::Value::Null)
-                        }
-                        rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
-                        rusqlite::types::Value::Blob(b) => {
-                            serde_json::Value::String(format!("{b:02x?}"))
-                        }
-                    },
-                    Err(_) => serde_json::Value::Null,
-                }
+            .map(|i| match row.get::<_, rusqlite::types::Value>(i) {
+                Ok(v) => match v {
+                    rusqlite::types::Value::Null => serde_json::Value::Null,
+                    rusqlite::types::Value::Integer(n) => serde_json::Value::Number(n.into()),
+                    rusqlite::types::Value::Real(f) => serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null),
+                    rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
+                    rusqlite::types::Value::Blob(b) => {
+                        serde_json::Value::String(format!("{b:02x?}"))
+                    }
+                },
+                Err(_) => serde_json::Value::Null,
             })
             .collect();
         Ok(values)
@@ -220,10 +309,11 @@ fn handle_sql(conn: &Connection, query: &str, fmt: &str, limit: u64) -> Result<E
             }
         }
         Format::Json => {
-            let results: Vec<Vec<serde_json::Value>> = rows
-                .filter_map(|r| r.ok())
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&results).unwrap_or_default());
+            let results: Vec<Vec<serde_json::Value>> = rows.filter_map(|r| r.ok()).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&results).unwrap_or_default()
+            );
         }
         Format::Jsonl => {
             for row in rows {
@@ -272,7 +362,10 @@ fn handle_admin_sql(conn: &Connection, query: &str) -> Result<ExitCode> {
 
 fn handle_command_list(conn: &Connection, state: Option<&str>) -> Result<ExitCode> {
     let commands = db::command_queue::list_pending(conn, state)?;
-    println!("{:<8} {:<12} {:<10} {:<20}", "ID", "State", "Kind", "Created");
+    println!(
+        "{:<8} {:<12} {:<10} {:<20}",
+        "ID", "State", "Kind", "Created"
+    );
     for cmd in &commands {
         println!(
             "{:<8} {:<12?} {:<10?} {:<20}",
@@ -282,14 +375,23 @@ fn handle_command_list(conn: &Connection, state: Option<&str>) -> Result<ExitCod
     Ok(ExitCode::Ok)
 }
 
-fn handle_command_wait(conn: &Connection, command_id: i64, poll_ms: u64, timeout_ms: u64) -> Result<ExitCode> {
+fn handle_command_wait(
+    conn: &Connection,
+    command_id: i64,
+    poll_ms: u64,
+    timeout_ms: u64,
+) -> Result<ExitCode> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let poll_dur = std::time::Duration::from_millis(poll_ms);
 
     while std::time::Instant::now() < deadline {
         if let Some(result) = db::command_queue::get_result(conn, command_id)? {
             handle_command_result_inner(&result, &Format::Text)?;
-            return if result.ok { Ok(ExitCode::Ok) } else { Ok(ExitCode::PlcError) };
+            return if result.ok {
+                Ok(ExitCode::Ok)
+            } else {
+                Ok(ExitCode::PlcError)
+            };
         }
         std::thread::sleep(poll_dur);
     }
@@ -327,7 +429,11 @@ fn handle_command_result_inner(result: &CommandResult, fmt: &Format) -> Result<E
             cli::format::print_result(*fmt, "result", result);
         }
     }
-    Ok(if result.ok { ExitCode::Ok } else { ExitCode::PlcError })
+    Ok(if result.ok {
+        ExitCode::Ok
+    } else {
+        ExitCode::PlcError
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -348,11 +454,16 @@ fn handle_tag_add(
     metric_set: Option<&str>,
     async_mode: bool,
 ) -> Result<ExitCode> {
-    let dt: DataType = data_type.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
-    let _sm: StoreMode = store_mode.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
-    let _sh: StorageHook = storage_hook.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
-    let addr = S7Address::parse(address)
-        .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+    let dt: DataType = data_type
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+    let _sm: StoreMode = store_mode
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+    let _sh: StorageHook = storage_hook
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+    let addr = S7Address::parse(address).map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
 
     // Remote mode: send tag_add_full to the server, which will insert +
     // validate + schedule apply on its side. CLI doesn't need PLC access.
@@ -371,12 +482,16 @@ fn handle_tag_add(
             "metric_set": metric_set,
         });
         let id = cli::remote::enqueue_command(
-            base, "control", &req.to_string(), Some("cli"), None, timeout,
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
         )?;
         println!("queued command_id={id}");
-        let (state, result, ok, err) = cli::remote::wait_command(
-            base, id, timeout, std::time::Duration::from_millis(200),
-        )?;
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
         if ok {
             println!("success {result}");
         } else {
@@ -387,8 +502,16 @@ fn handle_tag_add(
     }
 
     let inserted = db::validation::insert_tag(
-        conn, plc, name, &addr, dt, poll_group, store_mode, storage_hook,
-        value_role, metric_set,
+        conn,
+        plc,
+        name,
+        &addr,
+        dt,
+        poll_group,
+        store_mode,
+        storage_hook,
+        value_role,
+        metric_set,
     )?;
     let tag_id = inserted.tag_id;
     let set_name = metric_set.unwrap_or("default").to_string();
@@ -409,16 +532,20 @@ fn handle_tag_add(
     if !async_mode {
         // Synchronous validation: read one sample from the PLC now and
         // mark the tag as good or bad before reporting back.
-        let plc_row: (String, String, i64, i64) = conn.query_row(
-            "SELECT host, name, rack, slot FROM plc WHERE id = ?1",
-            rusqlite::params![inserted.plc_id],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            )),
-        ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+        let plc_row: (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT host, name, rack, slot FROM plc WHERE id = ?1",
+                rusqlite::params![inserted.plc_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
         let (host, plc_name, rack, slot) = plc_row;
 
         let client = create_plc_client(&plc_name, &host, rack as u16, slot as u16);
@@ -435,15 +562,15 @@ fn handle_tag_add(
             } else {
                 "value=null".to_string()
             };
-            println!(
-                "success {val_str} apply_state=pending tag_id={tag_id} set={set_name}"
-            );
+            println!("success {val_str} apply_state=pending tag_id={tag_id} set={set_name}");
         } else {
-            let bc = result.bad_class.as_ref().map(|b| b.to_string()).unwrap_or_default();
+            let bc = result
+                .bad_class
+                .as_ref()
+                .map(|b| b.to_string())
+                .unwrap_or_default();
             let det = result.detail.as_deref().unwrap_or("");
-            println!(
-                "bad bad_class={bc} detail=\"{det}\" tag_id={tag_id} set={set_name}"
-            );
+            println!("bad bad_class={bc} detail=\"{det}\" tag_id={tag_id} set={set_name}");
         }
     } else {
         // Enqueue as command
@@ -453,7 +580,12 @@ fn handle_tag_add(
             "tag_id": tag_id,
         });
         let cmd_id = db::command_queue::enqueue(
-            conn, CommandKind::Control, &req.to_string(), Some(inserted.plc_id), None, None,
+            conn,
+            CommandKind::Control,
+            &req.to_string(),
+            Some(inserted.plc_id),
+            None,
+            None,
         )?;
         println!("queued command_id={cmd_id}");
     }
@@ -474,8 +606,8 @@ fn handle_tag_update(
     let now = now_us();
 
     if let Some(addr_str) = address {
-        let addr = S7Address::parse(addr_str)
-            .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+        let addr =
+            S7Address::parse(addr_str).map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
         conn.execute(
             "UPDATE tag SET address = ?1, db_num = ?2, byte_offset = ?3, updated_ts = ?4, desired_version = desired_version + 1 WHERE id = ?5",
             rusqlite::params![addr_str, addr.db_num, addr.byte_offset, now, tag_id],
@@ -483,7 +615,8 @@ fn handle_tag_update(
     }
 
     if let Some(dt) = data_type {
-        let byte_size = dt.parse::<DataType>()
+        let byte_size = dt
+            .parse::<DataType>()
             .map_err(|e: String| anyhow::anyhow!("{e}"))?
             .byte_size() as i64;
         conn.execute(
@@ -493,11 +626,13 @@ fn handle_tag_update(
     }
 
     if let Some(pg) = poll_group {
-        let pg_id: i64 = conn.query_row(
-            "SELECT id FROM poll_group WHERE name = ?1",
-            rusqlite::params![pg],
-            |row| row.get(0),
-        ).map_err(|_| anyhow::anyhow!("poll group '{pg}' not found"))?;
+        let pg_id: i64 = conn
+            .query_row(
+                "SELECT id FROM poll_group WHERE name = ?1",
+                rusqlite::params![pg],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow::anyhow!("poll group '{pg}' not found"))?;
         conn.execute(
             "UPDATE tag SET poll_group_id = ?1, updated_ts = ?2, desired_version = desired_version + 1 WHERE id = ?3",
             rusqlite::params![pg_id, now, tag_id],
@@ -522,7 +657,10 @@ fn handle_tag_update(
     db::config_apply::schedule(
         conn,
         ApplyScope::Tag,
-        None, None, None, Some(tag_id),
+        None,
+        None,
+        None,
+        Some(tag_id),
         "tag_updated",
         db::config_apply::PLAN_COOLDOWN_MS,
         None,
@@ -546,7 +684,10 @@ fn handle_tag_disable(conn: &Connection, tag_id: i64) -> Result<ExitCode> {
     db::config_apply::schedule(
         conn,
         ApplyScope::Tag,
-        None, None, None, Some(tag_id),
+        None,
+        None,
+        None,
+        Some(tag_id),
         "tag_disabled",
         db::config_apply::PLAN_COOLDOWN_MS,
         None,
@@ -556,18 +697,19 @@ fn handle_tag_disable(conn: &Connection, tag_id: i64) -> Result<ExitCode> {
     Ok(ExitCode::Ok)
 }
 
-fn handle_tag_revalidate(
-    conn: &Connection,
-    _cli: &Cli,
-    tag_id: i64,
-) -> Result<ExitCode> {
+fn handle_tag_revalidate(conn: &Connection, _cli: &Cli, tag_id: i64) -> Result<ExitCode> {
     // Enqueue a revalidation command
     let req = serde_json::json!({
         "action": "tag_revalidate",
         "tag_id": tag_id,
     });
     let cmd_id = db::command_queue::enqueue(
-        conn, CommandKind::Control, &req.to_string(), None, None, None,
+        conn,
+        CommandKind::Control,
+        &req.to_string(),
+        None,
+        None,
+        None,
     )?;
     println!("queued command_id={cmd_id}");
     Ok(ExitCode::Ok)
@@ -596,11 +738,15 @@ fn handle_read(
             "format": fmt,
         });
         let id = cli::remote::enqueue_command(
-            base, "plc_read", &req.to_string(), Some("cli"), None, timeout,
+            base,
+            "plc_read",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
         )?;
-        let (state, result, ok, err) = cli::remote::wait_command(
-            base, id, timeout, std::time::Duration::from_millis(200),
-        )?;
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
         if ok {
             println!("{result}");
         } else {
@@ -619,7 +765,12 @@ fn handle_read(
         "format": fmt,
     });
     let cmd_id = db::command_queue::enqueue(
-        conn, CommandKind::PlcRead, &req.to_string(), None, None, None,
+        conn,
+        CommandKind::PlcRead,
+        &req.to_string(),
+        None,
+        None,
+        None,
     )?;
     println!("queued command_id={cmd_id}");
     println!("info: use 's7trace command wait {cmd_id}' or 's7trace command result {cmd_id}' to get the result");
@@ -646,7 +797,12 @@ fn handle_read_raw(
         "save_probe": save_probe,
     });
     let cmd_id = db::command_queue::enqueue(
-        conn, CommandKind::PlcRead, &req.to_string(), None, None, None,
+        conn,
+        CommandKind::PlcRead,
+        &req.to_string(),
+        None,
+        None,
+        None,
     )?;
     println!("queued command_id={cmd_id}");
     if save_probe {
@@ -678,9 +834,8 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
     let out_fmt = Format::from_str(fmt);
 
     // Gather PLCs
-    let mut stmt = conn.prepare(
-        "SELECT id, name, host, enabled, last_ok_ts, last_error, connectivity FROM plc"
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT id, name, host, enabled, last_ok_ts, last_error, connectivity FROM plc")?;
     let plcs: Vec<serde_json::Value> = stmt
         .query_map([], |row| {
             let id: i64 = row.get(0)?;
@@ -693,7 +848,7 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
 
             // Active datasets for this PLC
             let mut ds_stmt = conn.prepare(
-                "SELECT name, started_ts FROM dataset WHERE plc_id = ?1 AND state = 'active'"
+                "SELECT name, started_ts FROM dataset WHERE plc_id = ?1 AND state = 'active'",
             )?;
             let datasets: Vec<serde_json::Value> = ds_stmt
                 .query_map(rusqlite::params![id], |r| {
@@ -716,7 +871,7 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                  FROM poll_group pg
                  JOIN tag t ON t.poll_group_id = pg.id
                  WHERE t.plc_id = ?1
-                 ORDER BY pg.id"
+                 ORDER BY pg.id",
             )?;
             let poll_groups: Vec<serde_json::Value> = pg_stmt
                 .query_map(rusqlite::params![id], |r| {
@@ -743,7 +898,7 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                          WHERE mst.metric_set_id = ms.id AND t.bad = 0 AND t.enabled = 1)
                  FROM metric_set ms
                  WHERE ms.plc_id = ?1
-                 ORDER BY ms.id"
+                 ORDER BY ms.id",
             )?;
             let metric_sets: Vec<serde_json::Value> = ms_stmt
                 .query_map(rusqlite::params![id], |r| {
@@ -776,29 +931,31 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
         .filter_map(|r| r.ok())
         .collect();
 
-    let bad_tags: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tag WHERE bad = 1",
-        [],
-        |row| row.get(0),
-    ).unwrap_or(0);
+    let bad_tags: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tag WHERE bad = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
 
-    let active_tags: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM v_active_tag",
-        [],
-        |row| row.get(0),
-    ).unwrap_or(0);
+    let active_tags: i64 = conn
+        .query_row("SELECT COUNT(*) FROM v_active_tag", [], |row| row.get(0))
+        .unwrap_or(0);
 
     let pending_count = db::config_apply::pending_count(conn).unwrap_or(0);
-    let command_pending: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM command_request WHERE state = 'pending'",
-        [],
-        |row| row.get(0),
-    ).unwrap_or(0);
-    let command_running: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM command_request WHERE state = 'running'",
-        [],
-        |row| row.get(0),
-    ).unwrap_or(0);
+    let command_pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM command_request WHERE state = 'pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let command_running: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM command_request WHERE state = 'running'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
     let status = serde_json::json!({
         "plcs": plcs,
@@ -821,7 +978,11 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
             for plc in &plcs {
                 println!(
                     "  {} (host={}, enabled={}, conn={}) last_ok={:?}",
-                    plc["name"], plc["host"], plc["enabled"], plc["connectivity"], plc["last_ok_ts"]
+                    plc["name"],
+                    plc["host"],
+                    plc["enabled"],
+                    plc["connectivity"],
+                    plc["last_ok_ts"]
                 );
                 if let Some(err) = plc["last_error"].as_str() {
                     if !err.is_empty() {
@@ -829,7 +990,10 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                     }
                 }
                 for pg in plc["poll_groups"].as_array().unwrap_or(&Vec::new()) {
-                    let actual = pg["actual_ms"].as_f64().map(|f| format!("{f:.1}")).unwrap_or_else(|| "-".into());
+                    let actual = pg["actual_ms"]
+                        .as_f64()
+                        .map(|f| format!("{f:.1}"))
+                        .unwrap_or_else(|| "-".into());
                     println!(
                         "    poll_group {} target={}ms actual={}ms overruns={}",
                         pg["name"], pg["target_ms"], actual, pg["overrun_count"]
@@ -842,10 +1006,7 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                     );
                 }
                 for ds in plc["datasets"].as_array().unwrap_or(&Vec::new()) {
-                    println!(
-                        "    dataset {} started={:?}",
-                        ds["name"], ds["started_ts"]
-                    );
+                    println!("    dataset {} started={:?}", ds["name"], ds["started_ts"]);
                 }
             }
             println!("Tags: active={active_tags}, bad={bad_tags}");
@@ -853,14 +1014,17 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
             println!("Config apply pending: {pending_count}");
         }
         _ => {
-            println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&status).unwrap_or_default()
+            );
         }
     }
 
     // Show problems (bad tags)
     let mut pstmt = conn.prepare(
         "SELECT t.name, t.address, t.bad_class, t.bad_detail
-         FROM tag t WHERE t.bad = 1 LIMIT 20"
+         FROM tag t WHERE t.bad = 1 LIMIT 20",
     )?;
     let has_problems = pstmt.exists([])?;
     if has_problems {
@@ -893,11 +1057,13 @@ fn handle_set_create(
     name: &str,
     description: Option<&str>,
 ) -> Result<ExitCode> {
-    let plc_id: i64 = conn.query_row(
-        "SELECT id FROM plc WHERE name = ?1",
-        rusqlite::params![plc],
-        |row| row.get(0),
-    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+    let plc_id: i64 = conn
+        .query_row(
+            "SELECT id FROM plc WHERE name = ?1",
+            rusqlite::params![plc],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
 
     let now = now_us();
     conn.execute(
@@ -919,11 +1085,13 @@ fn handle_set_add_tag(
     from_file: Option<&str>,
 ) -> Result<ExitCode> {
     // Resolve set
-    let set: (i64, i64) = conn.query_row(
-        "SELECT ms.id, ms.plc_id FROM metric_set ms WHERE ms.name = ?1",
-        rusqlite::params![set_name],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
+    let set: (i64, i64) = conn
+        .query_row(
+            "SELECT ms.id, ms.plc_id FROM metric_set ms WHERE ms.name = ?1",
+            rusqlite::params![set_name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
     let (set_id, plc_id) = set;
 
     let now = now_us();
@@ -932,18 +1100,20 @@ fn handle_set_add_tag(
     let mut tag_ids: Vec<i64> = Vec::new();
 
     if let Some(path) = from_file {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
         for line in content.lines() {
             let name = line.trim();
             if name.is_empty() || name.starts_with('#') {
                 continue;
             }
-            let id: i64 = conn.query_row(
-                "SELECT id FROM tag WHERE plc_id = ?1 AND name = ?2",
-                rusqlite::params![plc_id, name],
-                |row| row.get(0),
-            ).map_err(|_| anyhow::anyhow!("tag '{name}' not found"))?;
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM tag WHERE plc_id = ?1 AND name = ?2",
+                    rusqlite::params![plc_id, name],
+                    |row| row.get(0),
+                )
+                .map_err(|_| anyhow::anyhow!("tag '{name}' not found"))?;
             tag_ids.push(id);
         }
     } else if let Some(sql) = from_sql {
@@ -973,7 +1143,8 @@ fn handle_set_add_tag(
                     "SELECT id FROM tag WHERE plc_id = ?1 AND name = ?2",
                     rusqlite::params![plc_id, piece],
                     |row| row.get(0),
-                ).map_err(|_| anyhow::anyhow!("tag '{piece}' not found"))?
+                )
+                .map_err(|_| anyhow::anyhow!("tag '{piece}' not found"))?
             };
             tag_ids.push(id);
         }
@@ -1006,11 +1177,13 @@ fn handle_set_remove_tag(
     tag: Option<&str>,
     from_sql: Option<&str>,
 ) -> Result<ExitCode> {
-    let set_id: i64 = conn.query_row(
-        "SELECT id FROM metric_set WHERE name = ?1",
-        rusqlite::params![set_name],
-        |row| row.get(0),
-    ).map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
+    let set_id: i64 = conn
+        .query_row(
+            "SELECT id FROM metric_set WHERE name = ?1",
+            rusqlite::params![set_name],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
 
     if let Some(sql) = from_sql {
         let mut stmt = conn.prepare(sql)?;
@@ -1074,7 +1247,10 @@ fn handle_set_enable(
     db::config_apply::schedule(
         conn,
         ApplyScope::MetricSet,
-        None, None, Some(set_id), None,
+        None,
+        None,
+        Some(set_id),
+        None,
         "metric_set_enabled",
         db::config_apply::PLAN_COOLDOWN_MS,
         None,
@@ -1086,7 +1262,12 @@ fn handle_set_enable(
             "set_name": set_name,
         });
         let cmd_id = db::command_queue::enqueue(
-            conn, CommandKind::Control, &req.to_string(), None, None, None,
+            conn,
+            CommandKind::Control,
+            &req.to_string(),
+            None,
+            None,
+            None,
         )?;
         println!("queued command_id={cmd_id}");
     } else {
@@ -1096,11 +1277,7 @@ fn handle_set_enable(
     Ok(ExitCode::Ok)
 }
 
-fn handle_set_disable(
-    conn: &Connection,
-    _cli: &Cli,
-    set_name: &str,
-) -> Result<ExitCode> {
+fn handle_set_disable(conn: &Connection, _cli: &Cli, set_name: &str) -> Result<ExitCode> {
     let now = now_us();
     conn.execute(
         "UPDATE metric_set SET enabled = 0, updated_ts = ?1 WHERE name = ?2",
@@ -1121,7 +1298,10 @@ fn handle_set_disable(
     db::config_apply::schedule(
         conn,
         ApplyScope::MetricSet,
-        None, None, Some(set_id), None,
+        None,
+        None,
+        Some(set_id),
+        None,
         "metric_set_disabled",
         db::config_apply::PLAN_COOLDOWN_MS,
         None,
@@ -1144,17 +1324,23 @@ fn handle_set_list(conn: &Connection, plc: Option<&str>) -> Result<ExitCode> {
 
     let mut stmt = conn.prepare(query)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-    let rows = stmt.query_map(rusqlite::params_from_iter(param_refs.iter().copied()), |row| {
-        let plc: String = row.get(0)?;
-        let name: String = row.get(1)?;
-        let enabled: bool = row.get::<_, i64>(2)? != 0;
-        let total: i64 = row.get(3)?;
-        let healthy: i64 = row.get(4)?;
-        let bad: i64 = row.get(5)?;
-        Ok((plc, name, enabled, total, healthy, bad))
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(param_refs.iter().copied()),
+        |row| {
+            let plc: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let enabled: bool = row.get::<_, i64>(2)? != 0;
+            let total: i64 = row.get(3)?;
+            let healthy: i64 = row.get(4)?;
+            let bad: i64 = row.get(5)?;
+            Ok((plc, name, enabled, total, healthy, bad))
+        },
+    )?;
 
-    println!("{:<20} {:<30} {:<8} {:<6} {:<8} {:<4}", "PLC", "Set", "Enabled", "Total", "Healthy", "Bad");
+    println!(
+        "{:<20} {:<30} {:<8} {:<6} {:<8} {:<4}",
+        "PLC", "Set", "Enabled", "Total", "Healthy", "Bad"
+    );
     for row in rows {
         let (plc, name, enabled, total, healthy, bad) = row?;
         println!("{plc:<20} {name:<30} {enabled:<8} {total:<6} {healthy:<8} {bad:<4}");
@@ -1164,19 +1350,21 @@ fn handle_set_list(conn: &Connection, plc: Option<&str>) -> Result<ExitCode> {
 }
 
 fn handle_set_show(conn: &Connection, set_name: &str) -> Result<ExitCode> {
-    let set_info = conn.query_row(
-        "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
+    let set_info = conn
+        .query_row(
+            "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
          FROM metric_set ms WHERE ms.name = ?1",
-        rusqlite::params![set_name],
-        |row| {
-            let id: i64 = row.get(0)?;
-            let plc_id: i64 = row.get(1)?;
-            let name: String = row.get(2)?;
-            let enabled: bool = row.get::<_, i64>(3)? != 0;
-            let desc: Option<String> = row.get(4)?;
-            Ok((id, plc_id, name, enabled, desc))
-        },
-    ).map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
+            rusqlite::params![set_name],
+            |row| {
+                let id: i64 = row.get(0)?;
+                let plc_id: i64 = row.get(1)?;
+                let name: String = row.get(2)?;
+                let enabled: bool = row.get::<_, i64>(3)? != 0;
+                let desc: Option<String> = row.get(4)?;
+                Ok((id, plc_id, name, enabled, desc))
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
 
     let (_id, _plc_id, _name, enabled, _desc) = &set_info;
 
@@ -1188,7 +1376,7 @@ fn handle_set_show(conn: &Connection, set_name: &str) -> Result<ExitCode> {
         "SELECT t.id, t.name, t.address, t.data_type, t.bad, t.bad_class
          FROM v_metric_set_member vmsm
          JOIN tag t ON t.id = vmsm.tag_id
-         WHERE vmsm.metric_set = ?1"
+         WHERE vmsm.metric_set = ?1",
     )?;
     let members = stmt.query_map(rusqlite::params![set_name], |row| {
         let id: i64 = row.get(0)?;
@@ -1225,11 +1413,13 @@ fn handle_collection_start(
     dataset: &str,
     sets: &[String],
 ) -> Result<ExitCode> {
-    let plc_id: i64 = conn.query_row(
-        "SELECT id FROM plc WHERE name = ?1",
-        rusqlite::params![plc],
-        |row| row.get(0),
-    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+    let plc_id: i64 = conn
+        .query_row(
+            "SELECT id FROM plc WHERE name = ?1",
+            rusqlite::params![plc],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
 
     // Check no active dataset for this PLC
     let active: i64 = conn.query_row(
@@ -1251,22 +1441,25 @@ fn handle_collection_start(
         "sets": sets,
     });
     let cmd_id = db::command_queue::enqueue(
-        conn, CommandKind::Control, &req.to_string(), Some(plc_id), None, None,
+        conn,
+        CommandKind::Control,
+        &req.to_string(),
+        Some(plc_id),
+        None,
+        None,
     )?;
     println!("queued command_id={cmd_id}");
     Ok(ExitCode::Ok)
 }
 
-fn handle_collection_stop(
-    conn: &Connection,
-    _cli: &Cli,
-    plc: &str,
-) -> Result<ExitCode> {
-    let plc_id: i64 = conn.query_row(
-        "SELECT id FROM plc WHERE name = ?1",
-        rusqlite::params![plc],
-        |row| row.get(0),
-    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+fn handle_collection_stop(conn: &Connection, _cli: &Cli, plc: &str) -> Result<ExitCode> {
+    let plc_id: i64 = conn
+        .query_row(
+            "SELECT id FROM plc WHERE name = ?1",
+            rusqlite::params![plc],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
 
     let req = serde_json::json!({
         "action": "collection_stop",
@@ -1274,7 +1467,12 @@ fn handle_collection_stop(
         "plc": plc,
     });
     let cmd_id = db::command_queue::enqueue(
-        conn, CommandKind::Control, &req.to_string(), Some(plc_id), None, None,
+        conn,
+        CommandKind::Control,
+        &req.to_string(),
+        Some(plc_id),
+        None,
+        None,
     )?;
     println!("queued command_id={cmd_id}");
     Ok(ExitCode::Ok)
@@ -1292,11 +1490,13 @@ fn handle_history_clean(
     before: Option<&str>,
     batch_size: u64,
 ) -> Result<ExitCode> {
-    let plc_id: i64 = conn.query_row(
-        "SELECT id FROM plc WHERE name = ?1",
-        rusqlite::params![plc],
-        |row| row.get(0),
-    ).map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+    let plc_id: i64 = conn
+        .query_row(
+            "SELECT id FROM plc WHERE name = ?1",
+            rusqlite::params![plc],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
 
     // Check no active dataset
     let active: i64 = conn.query_row(
@@ -1313,10 +1513,9 @@ fn handle_history_clean(
         (Some(ts), _) => ts,
         (_, Some(iso)) => {
             // Parse ISO 8601 to epoch microseconds
-            let dt = chrono::NaiveDateTime::parse_from_str(
-                &iso.replace('T', " "),
-                "%Y-%m-%d %H:%M:%S",
-            ).map_err(|e| anyhow::anyhow!("invalid datetime '{iso}': {e}"))?;
+            let dt =
+                chrono::NaiveDateTime::parse_from_str(&iso.replace('T', " "), "%Y-%m-%d %H:%M:%S")
+                    .map_err(|e| anyhow::anyhow!("invalid datetime '{iso}': {e}"))?;
             dt.and_utc().timestamp_micros()
         }
         (None, None) => {
@@ -1332,23 +1531,26 @@ fn handle_history_clean(
         "batch_size": batch_size,
     });
     let cmd_id = db::command_queue::enqueue(
-        conn, CommandKind::Admin, &req.to_string(), Some(plc_id), None, None,
+        conn,
+        CommandKind::Admin,
+        &req.to_string(),
+        Some(plc_id),
+        None,
+        None,
     )?;
     println!("queued command_id={cmd_id}");
     Ok(ExitCode::Ok)
 }
 
-fn handle_history_delete_dataset(
-    conn: &Connection,
-    _cli: &Cli,
-    dataset: &str,
-) -> Result<ExitCode> {
+fn handle_history_delete_dataset(conn: &Connection, _cli: &Cli, dataset: &str) -> Result<ExitCode> {
     // Check dataset exists and is stopped
-    let state: String = conn.query_row(
-        "SELECT state FROM dataset WHERE name = ?1",
-        rusqlite::params![dataset],
-        |row| row.get(0),
-    ).map_err(|_| anyhow::anyhow!("dataset '{dataset}' not found"))?;
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM dataset WHERE name = ?1",
+            rusqlite::params![dataset],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("dataset '{dataset}' not found"))?;
 
     if state == "active" {
         eprintln!("error: dataset '{dataset}' is active. Stop collection first.");
@@ -1359,9 +1561,8 @@ fn handle_history_delete_dataset(
         "action": "delete_dataset",
         "dataset": dataset,
     });
-    let cmd_id = db::command_queue::enqueue(
-        conn, CommandKind::Admin, &req.to_string(), None, None, None,
-    )?;
+    let cmd_id =
+        db::command_queue::enqueue(conn, CommandKind::Admin, &req.to_string(), None, None, None)?;
     println!("queued command_id={cmd_id}");
     Ok(ExitCode::Ok)
 }
@@ -1412,14 +1613,17 @@ mod tests {
         conn.execute(
             "INSERT INTO plc (name, host) VALUES ('test-plc', '127.0.0.1')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         handle_set_create(&conn, "test-plc", "my_set", None).unwrap();
-        let id: i64 = conn.query_row(
-            "SELECT id FROM metric_set WHERE name = 'my_set'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM metric_set WHERE name = 'my_set'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(id > 0);
     }
 
@@ -1437,27 +1641,32 @@ mod tests {
         conn.execute(
             "INSERT INTO plc (name, host) VALUES ('plc1', '127.0.0.1')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Need poll_group for the FK
         conn.execute(
             "INSERT INTO poll_group (name, period_ms) VALUES ('g1', 1000)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         for n in ["t1", "t2", "t3"] {
             conn.execute(
                 "INSERT INTO tag (plc_id, name, address, data_type, poll_group_id,
                                   db_num, byte_offset, byte_size, created_ts, updated_ts)
                  VALUES (1, ?1, 'DB1.DBW0', 'i16', 1, 1, 0, 2, 1000000, 1000000)",
                 rusqlite::params![n],
-            ).unwrap();
+            )
+            .unwrap();
         }
         handle_set_create(&conn, "plc1", "my_set", None).unwrap();
         handle_set_add_tag(&conn, "my_set", Some("t1,t2,t3"), None, None).unwrap();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM metric_set_tag WHERE metric_set_id = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metric_set_tag WHERE metric_set_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 3);
     }
 
@@ -1467,29 +1676,35 @@ mod tests {
         conn.execute(
             "INSERT INTO plc (name, host) VALUES ('plc1', '127.0.0.1')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO poll_group (name, period_ms) VALUES ('g1', 1000)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         for n in ["alpha", "beta"] {
             conn.execute(
                 "INSERT INTO tag (plc_id, name, address, data_type, poll_group_id,
                                   db_num, byte_offset, byte_size, created_ts, updated_ts)
                  VALUES (1, ?1, 'DB1.DBW0', 'i16', 1, 1, 0, 2, 1000000, 1000000)",
                 rusqlite::params![n],
-            ).unwrap();
+            )
+            .unwrap();
         }
         handle_set_create(&conn, "plc1", "s2", None).unwrap();
 
-        let path = std::env::temp_dir().join(format!("s7trace_set_tags_{}.txt", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("s7trace_set_tags_{}.txt", std::process::id()));
         std::fs::write(&path, "# comment line\nalpha\n\nbeta\n").unwrap();
         handle_set_add_tag(&conn, "s2", None, None, Some(path.to_str().unwrap())).unwrap();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM metric_set_tag WHERE metric_set_id = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metric_set_tag WHERE metric_set_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 2);
     }
 
@@ -1499,24 +1714,25 @@ mod tests {
         conn.execute(
             "INSERT INTO plc (name, host) VALUES ('p1', '127.0.0.1')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Default is 'unknown'
-        let s: String = conn.query_row(
-            "SELECT connectivity FROM plc WHERE name = 'p1'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let s: String = conn
+            .query_row(
+                "SELECT connectivity FROM plc WHERE name = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(s, "unknown");
         // Flip to offline (simulates failed write_samples)
-        conn.execute(
-            "UPDATE plc SET connectivity = 'offline' WHERE id = 1",
-            [],
-        ).unwrap();
-        let s: String = conn.query_row(
-            "SELECT connectivity FROM plc WHERE id = 1",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        conn.execute("UPDATE plc SET connectivity = 'offline' WHERE id = 1", [])
+            .unwrap();
+        let s: String = conn
+            .query_row("SELECT connectivity FROM plc WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(s, "offline");
     }
 }

@@ -1,5 +1,4 @@
 /// Core types shared across s7trace modules.
-
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -376,13 +375,18 @@ impl S7Address {
     ///   DB1.DBD240       — dword at byte 240
     pub fn parse(s: &str) -> Result<S7Address, String> {
         // Try bit-with-dot form first: DB<n>.DBX<num>.<bit>
-        let re_bit_dot = regex::Regex::new(
-            r"^DB(\d+)\.DBX(\d+)\.(\d+)$",
-        ).expect("valid S7 address regex");
+        let re_bit_dot =
+            regex::Regex::new(r"^DB(\d+)\.DBX(\d+)\.(\d+)$").expect("valid S7 address regex");
         if let Some(caps) = re_bit_dot.captures(s) {
-            let db_num: u16 = caps[1].parse().map_err(|e| format!("invalid DB number: {e}"))?;
-            let byte: usize = caps[2].parse().map_err(|e| format!("invalid byte offset: {e}"))?;
-            let bit: u8 = caps[3].parse().map_err(|e| format!("invalid bit offset: {e}"))?;
+            let db_num: u16 = caps[1]
+                .parse()
+                .map_err(|e| format!("invalid DB number: {e}"))?;
+            let byte: usize = caps[2]
+                .parse()
+                .map_err(|e| format!("invalid byte offset: {e}"))?;
+            let bit: u8 = caps[3]
+                .parse()
+                .map_err(|e| format!("invalid bit offset: {e}"))?;
             if bit > 7 {
                 return Err(format!("bit index must be 0..7, got {bit}"));
             }
@@ -393,21 +397,36 @@ impl S7Address {
             });
         }
         // Then try the simple form: DB<n>.<DB{W|D|B|X})<num>
-        let re_simple = regex::Regex::new(
-            r"^DB(\d+)\.(DB[WDBX])(\d+)$",
-        ).expect("valid S7 address regex");
+        let re_simple =
+            regex::Regex::new(r"^DB(\d+)\.(DB[WDBX])(\d+)$").expect("valid S7 address regex");
         let caps = re_simple.captures(s).ok_or_else(|| {
             format!("invalid address format: {s} (expected DB<n>.DBW<n>, DB<n>.DBX<n>.<bit>, etc.)")
         })?;
 
-        let db_num: u16 = caps[1].parse().map_err(|e| format!("invalid DB number: {e}"))?;
-        let offset: usize = caps[3].parse().map_err(|e| format!("invalid offset: {e}"))?;
+        let db_num: u16 = caps[1]
+            .parse()
+            .map_err(|e| format!("invalid DB number: {e}"))?;
+        let offset: usize = caps[3]
+            .parse()
+            .map_err(|e| format!("invalid offset: {e}"))?;
         let area = &caps[2];
 
         match area {
-            "DBW" => Ok(S7Address { db_num, byte_offset: offset, bit_offset: None }),
-            "DBD" => Ok(S7Address { db_num, byte_offset: offset, bit_offset: None }),
-            "DBB" => Ok(S7Address { db_num, byte_offset: offset, bit_offset: None }),
+            "DBW" => Ok(S7Address {
+                db_num,
+                byte_offset: offset,
+                bit_offset: None,
+            }),
+            "DBD" => Ok(S7Address {
+                db_num,
+                byte_offset: offset,
+                bit_offset: None,
+            }),
+            "DBB" => Ok(S7Address {
+                db_num,
+                byte_offset: offset,
+                bit_offset: None,
+            }),
             "DBX" => Ok(S7Address {
                 db_num,
                 byte_offset: offset / 8,
@@ -540,7 +559,6 @@ impl fmt::Display for PlcError {
 // Read items and results
 // ---------------------------------------------------------------------------
 
-
 impl std::error::Error for PlcError {}
 #[derive(Debug, Clone)]
 pub struct ReadItem {
@@ -592,6 +610,16 @@ pub struct PollCycleInfo {
 // Read plan
 // ---------------------------------------------------------------------------
 
+/// Whether a span is a contiguous block read or a multi-variable read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanKind {
+    /// Single contiguous block read via `read_db(db, start, len)`.
+    BlockRead,
+    /// Multi-variable read via `read_multi(items)`.
+    /// Each item is decoded independently from its own data buffer.
+    MultiRead,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReadSpan {
     pub db_num: u16,
@@ -599,6 +627,11 @@ pub struct ReadSpan {
     pub byte_len: usize,
     pub tag_ids: Vec<i64>,
     pub poll_group_id: i64,
+    /// What kind of read this span requires.
+    pub kind: SpanKind,
+    /// Per-tag offsets for MultiRead spans (offset into the multi-read item).
+    /// For BlockRead spans, each tag's offset is `tag.byte_offset - span.byte_offset`.
+    pub multi_items: Vec<ReadItem>,
 }
 
 #[derive(Debug, Clone)]

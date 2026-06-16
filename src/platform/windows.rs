@@ -24,26 +24,24 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::OnceLock;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DrawTextW, EndPaint, InvalidateRect, PAINTSTRUCT, DT_LEFT, DT_NOPREFIX,
+    BeginPaint, DrawTextW, EndPaint, InvalidateRect, DT_LEFT, DT_NOPREFIX, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, GetSystemMetrics, LoadIconW, PostQuitMessage, RegisterClassExW,
-    SetTimer, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    HMENU, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN, SM_CYSCREEN,
-    SW_HIDE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_PAINT, WM_RBUTTONUP, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED,
-    WS_SYSMENU, WS_VISIBLE,
+    GetMessageW, GetSystemMetrics, LoadIconW, PostQuitMessage, RegisterClassExW, SetTimer,
+    SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HMENU, IDI_APPLICATION,
+    MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
+    WM_USER, WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
 
 const WM_TRAYICON: u32 = WM_USER + 1;
@@ -68,8 +66,18 @@ fn app_started() -> Instant {
     *APP_STARTED.get_or_init(Instant::now)
 }
 static CLASS_NAME: &[u16] = &[
-    b's' as u16, b'7' as u16, b't' as u16, b'r' as u16, b'a' as u16, b'c' as u16, b'e' as u16,
-    b'C' as u16, b't' as u16, b'r' as u16, b'l' as u16, 0,
+    b's' as u16,
+    b'7' as u16,
+    b't' as u16,
+    b'r' as u16,
+    b'a' as u16,
+    b'c' as u16,
+    b'e' as u16,
+    b'C' as u16,
+    b't' as u16,
+    b'r' as u16,
+    b'l' as u16,
+    0,
 ];
 
 struct AppState {
@@ -84,6 +92,8 @@ struct AppState {
     cached_status: Mutex<StatusSnapshot>,
     /// Flag set when the user picked Exit so the run loop returns.
     exit_requested: AtomicBool,
+    /// Index of the selected row (-1 = nothing selected).
+    selected_row: Mutex<isize>,
 }
 
 #[derive(Default, Clone)]
@@ -94,17 +104,22 @@ struct StatusSnapshot {
     command_queue_pending: i64,
     command_queue_running: i64,
     config_apply_pending: i64,
-    plc_rows: Vec<PlcRow>,
+    rows: Vec<MetricSetRow>,
     last_events: Vec<String>,
     last_command_result: Option<String>,
 }
 
+/// A row in the dashboard table — one per (PLC, metric-set) pair.
+/// PLCs with no metric sets get one row with metric_set_name = None.
 #[derive(Clone)]
-struct PlcRow {
-    name: String,
-    connectivity: String,
-    last_ok_ts: Option<i64>,
-    last_error: Option<String>,
+struct MetricSetRow {
+    plc_name: String,
+    plc_connectivity: String,
+    metric_set_name: Option<String>, // None = PLC has no metric sets
+    dataset_name: Option<String>,    // active dataset, if any
+    tags_active: i64,
+    tags_bad: i64,
+    has_active_poller: bool,
 }
 
 /// Run the control window. Blocks until the user exits the server.
@@ -145,6 +160,25 @@ pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
         let y = (screen_h - win_h) / 2;
 
         let title = win_string("s7trace server");
+
+        // Allocate AppState and store in global BEFORE CreateWindowExW,
+        // since WM_CREATE/WM_PAINT fire synchronously during CreateWindowExW
+        // and need access to state_from_ptr().
+        let state = Box::new(AppState {
+            db,
+            hwnd: std::ptr::null_mut(), // filled in after window creation
+            hwnd_button_start: std::ptr::null_mut(),
+            hwnd_button_stop: std::ptr::null_mut(),
+            hwnd_button_min: std::ptr::null_mut(),
+            hwnd_button_exit: std::ptr::null_mut(),
+            hmenu_tray: std::ptr::null_mut(),
+            cached_status: Mutex::new(StatusSnapshot::default()),
+            exit_requested: AtomicBool::new(false),
+            selected_row: Mutex::new(-1),
+        });
+        let state_ptr = Box::into_raw(state) as isize;
+        APP_STATE.store(state_ptr, Ordering::SeqCst);
+
         let hwnd = CreateWindowExW(
             0,
             CLASS_NAME.as_ptr(),
@@ -160,30 +194,16 @@ pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
             std::ptr::null(),
         );
         if hwnd.is_null() {
+            APP_STATE.store(0, Ordering::SeqCst);
+            let _ = Box::from_raw(state_ptr as *mut AppState);
             anyhow::bail!("CreateWindowExW failed");
         }
+        // Update the real hwnd in the state (WM_CREATE handler uses the
+        // function parameter hwnd directly, but other code reads from
+        // the AppState field).
+        state_from_ptr().hwnd = hwnd;
 
-        // Create child buttons. Use WM_CREATE in wndproc instead — easier.
-        // We'll lazy-create them on first paint via WM_CREATE.
-        let state = Box::new(AppState {
-            db,
-            hwnd,
-            hwnd_button_start: std::ptr::null_mut(),
-            hwnd_button_stop: std::ptr::null_mut(),
-            hwnd_button_min: std::ptr::null_mut(),
-            hwnd_button_exit: std::ptr::null_mut(),
-            hmenu_tray: std::ptr::null_mut(),
-            cached_status: Mutex::new(StatusSnapshot::default()),
-            exit_requested: AtomicBool::new(false),
-        });
-        let state_ptr = Box::into_raw(state) as isize;
         SetWindowTextW(hwnd, title.as_ptr());
-
-        // Stash state pointer in window user data via WM_NCCREATE alternative:
-        // we set lparam at create time. But CreateWindowExW above uses null
-        // lparam. Instead, write to window extra bytes — but easier: store
-        // in a static and recover in wndproc. We'll use a TLS-style global.
-        APP_STATE.store(state_ptr, Ordering::SeqCst);
         ShowWindow(hwnd, SW_SHOW);
 
         // Pump messages until WM_QUIT
@@ -229,12 +249,7 @@ fn win_string(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-unsafe extern "system" fn wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
             let st = state_from_ptr();
@@ -306,11 +321,31 @@ unsafe extern "system" fn wndproc(
             );
             // Tray menu
             st.hmenu_tray = CreatePopupMenu();
-            AppendMenuW(st.hmenu_tray, MF_STRING, IDM_OPEN as usize, text("Open window").as_ptr());
-            AppendMenuW(st.hmenu_tray, MF_STRING, IDM_START as usize, text("Start collection").as_ptr());
-            AppendMenuW(st.hmenu_tray, MF_STRING, IDM_STOP as usize, text("Stop collection").as_ptr());
+            AppendMenuW(
+                st.hmenu_tray,
+                MF_STRING,
+                IDM_OPEN as usize,
+                text("Open window").as_ptr(),
+            );
+            AppendMenuW(
+                st.hmenu_tray,
+                MF_STRING,
+                IDM_START as usize,
+                text("Start collection").as_ptr(),
+            );
+            AppendMenuW(
+                st.hmenu_tray,
+                MF_STRING,
+                IDM_STOP as usize,
+                text("Stop collection").as_ptr(),
+            );
             AppendMenuW(st.hmenu_tray, MF_SEPARATOR, 0, std::ptr::null());
-            AppendMenuW(st.hmenu_tray, MF_STRING, IDM_EXIT as usize, text("Exit server").as_ptr());
+            AppendMenuW(
+                st.hmenu_tray,
+                MF_STRING,
+                IDM_EXIT as usize,
+                text("Exit server").as_ptr(),
+            );
             // Tray icon
             let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
             nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -335,13 +370,30 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
-        WM_PAINT => {
-            paint(hwnd);
+        WM_LBUTTONDOWN => {
+            // Extract cursor Y coordinate from lparam (low word = x, high word = y)
+            let y = ((lparam >> 16) & 0xFFFF) as i32;
+            // If Y is negative, treat as signed i16
+            let y_signed = if y > 32767 { y - 65536 } else { y };
+            let st = state_from_ptr();
+            let snap = st.cached_status.lock();
+            let row_top = 56;
+            let row_height = 15;
+            let rel = y_signed - row_top;
+            let idx = if rel >= 0 && rel < snap.rows.len() as i32 * row_height {
+                (rel / row_height) as isize
+            } else {
+                -1_isize
+            };
+            drop(snap);
+            *st.selected_row.lock() = idx;
+            unsafe {
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
             0
         }
-        _WM_SIZE => {
-            // Re-layout buttons on resize (not needed for fixed-size window)
-            InvalidateRect(hwnd, std::ptr::null(), 1);
+        WM_PAINT => {
+            paint(hwnd);
             0
         }
         WM_TRAYICON => {
@@ -367,7 +419,11 @@ unsafe extern "system" fn wndproc(
             PostQuitMessage(0);
             0
         }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        _ => {
+            // Default: handle resize and pass through
+            InvalidateRect(hwnd, std::ptr::null(), 1);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
     }
 }
 
@@ -376,27 +432,27 @@ fn handle_command(hwnd: HWND, id: u16) {
     let db = st.db.clone();
     let status = st.cached_status.lock();
     unsafe {
-    match id {
-        IDB_START | IDM_START => {
-            drop(status);
-            submit_start(&db);
+        match id {
+            IDB_START | IDM_START => {
+                drop(status);
+                submit_start(&db);
+            }
+            IDB_STOP | IDM_STOP => {
+                drop(status);
+                submit_stop(&db);
+            }
+            IDB_MINIMIZE => {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            IDB_EXIT | IDM_EXIT => {
+                drop(status);
+                submit_exit(&db);
+                // Server will process `server_exit` and stop. We then post WM_QUIT
+                // from the message loop once exit_requested flips.
+                st.exit_requested.store(true, Ordering::SeqCst);
+            }
+            _ => {}
         }
-        IDB_STOP | IDM_STOP => {
-            drop(status);
-            submit_stop(&db);
-        }
-        IDB_MINIMIZE => {
-            ShowWindow(hwnd, SW_HIDE);
-        }
-        IDB_EXIT | IDM_EXIT => {
-            drop(status);
-            submit_exit(&db);
-            // Server will process `server_exit` and stop. We then post WM_QUIT
-            // from the message loop once exit_requested flips.
-            st.exit_requested.store(true, Ordering::SeqCst);
-        }
-        _ => {}
-    }
     }
 }
 
@@ -406,10 +462,10 @@ fn show_tray_menu(hwnd: HWND) {
         let pt: POINT = std::mem::zeroed();
         // Use cursor pos for popup placement
         let _ = pt; // Win32 GetCursorPos is in another feature; skip
-        // We still call TrackPopupMenu — but without cursor pos it pops at 0,0.
-        // For brevity, use the constants we have. The user can right-click the icon
-        // to get the menu; placement accuracy is a known limitation.
-        // Real impl: import user32::GetCursorPos.
+                    // We still call TrackPopupMenu — but without cursor pos it pops at 0,0.
+                    // For brevity, use the constants we have. The user can right-click the icon
+                    // to get the menu; placement accuracy is a known limitation.
+                    // Real impl: import user32::GetCursorPos.
         windows_sys::Win32::UI::WindowsAndMessaging::TrackPopupMenu(
             st.hmenu_tray,
             0,
@@ -435,16 +491,30 @@ fn read_status(db: &Arc<Mutex<Connection>>) -> StatusSnapshot {
     let conn = db.lock();
 
     let plc_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM plc WHERE enabled = 1", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM plc WHERE enabled = 1", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
     let active_dataset_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM dataset WHERE state = 'active'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM dataset WHERE state = 'active'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let command_queue_pending: i64 = conn
-        .query_row("SELECT COUNT(*) FROM command_request WHERE state = 'pending'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM command_request WHERE state = 'pending'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let command_queue_running: i64 = conn
-        .query_row("SELECT COUNT(*) FROM command_request WHERE state = 'running'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM command_request WHERE state = 'running'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let config_apply_pending: i64 = conn
         .query_row(
@@ -454,23 +524,104 @@ fn read_status(db: &Arc<Mutex<Connection>>) -> StatusSnapshot {
         )
         .unwrap_or(0);
 
-    let mut plc_rows: Vec<PlcRow> = Vec::new();
-    let mut stmt = match conn.prepare(
-        "SELECT name, connectivity, last_ok_ts, last_error FROM plc ORDER BY id",
-    ) {
-        Ok(s) => s,
-        Err(_) => return StatusSnapshot::default(),
-    };
-    if let Ok(rows) = stmt.query_map([], |r| {
-        Ok(PlcRow {
-            name: r.get(0)?,
-            connectivity: r.get(1)?,
-            last_ok_ts: r.get(2)?,
-            last_error: r.get(3)?,
+    // Build enriched per-PLC metric set rows
+    let mut rows: Vec<MetricSetRow> = Vec::new();
+
+    // 1. Get all enabled PLCs
+    let plc_ids: Vec<(i64, String, String)> = {
+        let mut stmt = match conn
+            .prepare("SELECT id, name, connectivity FROM plc WHERE enabled = 1 ORDER BY id")
+        {
+            Ok(s) => s,
+            Err(_) => return StatusSnapshot::default(),
+        };
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })
-    }) {
-        for r in rows.flatten() {
-            plc_rows.push(r);
+        .ok()
+        .map(|it| it.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+
+    for (plc_id, plc_name, plc_connectivity) in &plc_ids {
+        // 2. Get active dataset name for this PLC
+        let dataset_name: Option<String> = conn
+            .query_row(
+                "SELECT name FROM dataset WHERE plc_id = ?1 AND state = 'active' LIMIT 1",
+                rusqlite::params![plc_id],
+                |r| r.get(0),
+            )
+            .ok();
+
+        // 3. Get metric sets for this PLC
+        let metric_sets: Vec<(String, bool, i64, i64)> = {
+            let mut stmt = match conn.prepare(
+                "SELECT ms.name, ms.enabled,
+                    (SELECT COUNT(*) FROM metric_set_tag mst
+                     JOIN tag t ON t.id = mst.tag_id
+                     WHERE mst.metric_set_id = ms.id AND t.bad = 0 AND t.enabled = 1) as tags_active,
+                    (SELECT COUNT(*) FROM metric_set_tag mst
+                     JOIN tag t ON t.id = mst.tag_id
+                     WHERE mst.metric_set_id = ms.id AND t.bad = 1) as tags_bad
+                 FROM metric_set ms
+                 WHERE ms.plc_id = ?1
+                 ORDER BY ms.id",
+            ) {
+                Ok(s) => s,
+                Err(_) => {
+                    // PLC has no metric sets — add a single fallback row
+                    rows.push(MetricSetRow {
+                        plc_name: plc_name.clone(),
+                        plc_connectivity: plc_connectivity.clone(),
+                        metric_set_name: None,
+                        dataset_name: dataset_name.clone(),
+                        tags_active: 0,
+                        tags_bad: 0,
+                        has_active_poller: dataset_name.is_some(),
+                    });
+                    continue;
+                }
+            };
+            stmt.query_map(rusqlite::params![plc_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, bool>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .ok()
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        };
+
+        if metric_sets.is_empty() {
+            // PLC has no metric sets — add a single fallback row
+            rows.push(MetricSetRow {
+                plc_name: plc_name.clone(),
+                plc_connectivity: plc_connectivity.clone(),
+                metric_set_name: None,
+                dataset_name: dataset_name.clone(),
+                tags_active: 0,
+                tags_bad: 0,
+                has_active_poller: dataset_name.is_some(),
+            });
+        } else {
+            for (ms_name, _ms_enabled, tags_active, tags_bad) in &metric_sets {
+                rows.push(MetricSetRow {
+                    plc_name: plc_name.clone(),
+                    plc_connectivity: plc_connectivity.clone(),
+                    metric_set_name: Some(ms_name.clone()),
+                    dataset_name: dataset_name.clone(),
+                    tags_active: *tags_active,
+                    tags_bad: *tags_bad,
+                    has_active_poller: dataset_name.is_some(),
+                });
+            }
         }
     }
 
@@ -480,13 +631,13 @@ fn read_status(db: &Arc<Mutex<Connection>>) -> StatusSnapshot {
         "SELECT ts, kind, COALESCE(details_json, '') FROM event_marker
          ORDER BY id DESC LIMIT 5",
     ) {
-        if let Ok(rows) = stmt.query_map([], |r| {
+        if let Ok(ev_rows) = stmt.query_map([], |r| {
             let ts: i64 = r.get(0)?;
             let kind: String = r.get(1)?;
             let details: String = r.get(2)?;
             Ok(format_event(ts, &kind, &details))
         }) {
-            for r in rows.flatten() {
+            for r in ev_rows.flatten() {
                 last_events.push(r);
             }
         }
@@ -511,7 +662,7 @@ fn read_status(db: &Arc<Mutex<Connection>>) -> StatusSnapshot {
         command_queue_pending,
         command_queue_running,
         config_apply_pending,
-        plc_rows,
+        rows,
         last_events,
         last_command_result,
     }
@@ -524,14 +675,20 @@ fn format_event(ts: i64, kind: &str, details: &str) -> String {
         Some(d) => d.format("%H:%M:%S").to_string(),
         None => "??:??:??".to_string(),
     };
-    let det = if details.is_empty() { String::new() } else { format!(" {details}") };
+    let det = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" {details}")
+    };
     format!("{timestr}  {kind}{det}")
 }
 
 fn paint(hwnd: HWND) {
     let st = state_from_ptr();
     let snap = st.cached_status.lock().clone();
-    drop(st);
+    let sel = *st.selected_row.lock();
+    // st borrow ends here; values are owned clones
+    let _ = st;
 
     unsafe {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -547,12 +704,19 @@ fn paint(hwnd: HWND) {
 
         // Top status line
         let header = win_string(&format!(
-            "Status: {}\nUptime: {}\nDB: WAL OK",
-            if snap.server_running { "RUNNING" } else { "IDLE" },
+            "s7trace                       Status: {}  Uptime {}",
+            if snap.server_running {
+                "RUNNING"
+            } else {
+                "IDLE"
+            },
             uptime_str,
         ));
         let mut header_rect = windows_sys::Win32::Foundation::RECT {
-            left: 10, top: 10, right: 620, bottom: 80,
+            left: 10,
+            top: 8,
+            right: 620,
+            bottom: 30,
         };
         DrawTextW(
             hdc,
@@ -564,15 +728,14 @@ fn paint(hwnd: HWND) {
 
         // Counts line
         let counts = win_string(&format!(
-            "PLCs: {}  Active datasets: {}  Queue: pending={} running={}  config-apply pending: {}",
-            snap.plc_count,
-            snap.active_dataset_count,
-            snap.command_queue_pending,
-            snap.command_queue_running,
-            snap.config_apply_pending,
+            "Queue: pending={} running={}  config-apply pending={}",
+            snap.command_queue_pending, snap.command_queue_running, snap.config_apply_pending,
         ));
         let mut counts_rect = windows_sys::Win32::Foundation::RECT {
-            left: 10, top: 90, right: 620, bottom: 110,
+            left: 10,
+            top: 34,
+            right: 620,
+            bottom: 50,
         };
         DrawTextW(
             hdc,
@@ -582,38 +745,72 @@ fn paint(hwnd: HWND) {
             DT_LEFT | DT_NOPREFIX,
         );
 
-        // PLC table
-        let mut plc_text = String::from("PLC                       State       Last OK          Last Error\n");
-        plc_text.push_str("--------------------------------------------------------------\n");
-        for row in &snap.plc_rows {
-            let last_ok = row
-                .last_ok_ts
-                .map(|t| {
-                    let s = t / 1_000_000;
-                    chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0)
-                        .map(|d| d.format("%H:%M:%S").to_string())
-                        .unwrap_or_else(|| "-".to_string())
-                })
-                .unwrap_or_else(|| "-".to_string());
-            let last_err = row.last_error.clone().unwrap_or_default();
-            plc_text.push_str(&format!(
-                "{:<25} {:<11} {:<16} {}\n",
-                row.name, row.connectivity, last_ok, last_err
+        // Dashboard table header
+        let mut table_text =
+            String::from("PLC            Task (metric set)     Dataset            State    Tags\n");
+        table_text
+            .push_str("----------------------------------------------------------------------\n");
+
+        // Row heights for click hit-testing (y starting at 56)
+        let row_top = 56;
+        let row_height = 15;
+        let table_bottom = row_top + snap.rows.len() as i32 * row_height;
+
+        for (i, row) in snap.rows.iter().enumerate() {
+            // Compute state string
+            let state = row_state(row);
+            let tags_str = format!("{}/{}", row.tags_active, row.tags_bad);
+            let ds_str = row.dataset_name.as_deref().unwrap_or("---");
+            let set_str = row.metric_set_name.as_deref().unwrap_or("---");
+
+            // Selection marker
+            let prefix = if sel == i as isize { "> " } else { "  " };
+            table_text.push_str(&format!(
+                "{}{:<13} {:<20} {:<18} {:<7} {}\n",
+                prefix, row.plc_name, set_str, ds_str, state, tags_str
             ));
         }
-        let mut plc_rect = windows_sys::Win32::Foundation::RECT {
-            left: 10, top: 130, right: 620, bottom: 260,
+
+        let mut table_rect = windows_sys::Win32::Foundation::RECT {
+            left: 10,
+            top: row_top,
+            right: 620,
+            bottom: table_bottom + 4,
         };
-        let plc_w = win_string(&plc_text);
+        let table_w = win_string(&table_text);
         DrawTextW(
             hdc,
-            plc_w.as_ptr(),
+            table_w.as_ptr(),
             -1,
-            &mut plc_rect,
+            &mut table_rect,
             DT_LEFT | DT_NOPREFIX,
         );
 
-        // Last events
+        // Selection info line
+        let info_text = if sel >= 0 && (sel as usize) < snap.rows.len() {
+            let r = &snap.rows[sel as usize];
+            let set_str = r.metric_set_name.as_deref().unwrap_or("(no sets)");
+            format!("Selected: {} / {}", r.plc_name, set_str)
+        } else {
+            String::from("Click a row to select")
+        };
+        let info_y = table_bottom + 6;
+        let mut info_rect = windows_sys::Win32::Foundation::RECT {
+            left: 10,
+            top: info_y,
+            right: 620,
+            bottom: info_y + 18,
+        };
+        let info_w = win_string(&info_text);
+        DrawTextW(
+            hdc,
+            info_w.as_ptr(),
+            -1,
+            &mut info_rect,
+            DT_LEFT | DT_NOPREFIX,
+        );
+
+        // Last command result
         let mut ev_text = String::from("Last events:\n");
         for e in &snap.last_events {
             ev_text.push_str(&format!("  {e}\n"));
@@ -621,8 +818,12 @@ fn paint(hwnd: HWND) {
         if let Some(r) = &snap.last_command_result {
             ev_text.push_str(&format!("  [last cmd] {r}\n"));
         }
+        let ev_y = info_y + 20;
         let mut ev_rect = windows_sys::Win32::Foundation::RECT {
-            left: 10, top: 280, right: 620, bottom: 400,
+            left: 10,
+            top: ev_y,
+            right: 620,
+            bottom: ev_y + 120,
         };
         let ev_w = win_string(&ev_text);
         DrawTextW(hdc, ev_w.as_ptr(), -1, &mut ev_rect, DT_LEFT | DT_NOPREFIX);
@@ -631,31 +832,135 @@ fn paint(hwnd: HWND) {
     }
 }
 
+/// Compute a short state string for a dashboard row.
+fn row_state(row: &MetricSetRow) -> String {
+    if row.plc_connectivity == "offline" || row.plc_connectivity == "disconnected" {
+        return "DISCONN".to_string();
+    }
+    if row.has_active_poller {
+        return format!("{} RUN", "\u{25CF}"); // filled circle
+    }
+    if row.metric_set_name.is_some() {
+        return format!("{} off", "\u{25CB}"); // empty circle
+    }
+    // No metric sets for this PLC
+    format!("{} idle", "\u{25CB}")
+}
+
 // ---------------------------------------------------------------------------
 // Command submission helpers
 // ---------------------------------------------------------------------------
 
 fn submit_start(db: &Arc<Mutex<Connection>>) {
     let conn = db.lock();
-    // Find first PLC with no active dataset
-    let plc: Option<(i64, String)> = conn
-        .query_row(
-            "SELECT p.id, p.name FROM plc p
-             WHERE p.enabled = 1
-               AND NOT EXISTS (SELECT 1 FROM dataset d WHERE d.plc_id = p.id AND d.state = 'active')
-             ORDER BY p.id LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok();
-    let Some((plc_id, plc_name)) = plc else {
-        log::warn!("control window: no PLC available to start collection");
-        return;
+
+    // Try to read selection from AppState (may not be set in tests)
+    let selection: Option<(String, Option<String>)> = {
+        let ptr = APP_STATE.load(Ordering::SeqCst);
+        if ptr != 0 {
+            unsafe {
+                let st = &mut *(ptr as *mut AppState);
+                let sel = *st.selected_row.lock();
+                let rows = st.cached_status.lock().rows.clone();
+                if sel >= 0 && (sel as usize) < rows.len() {
+                    Some((
+                        rows[sel as usize].plc_name.clone(),
+                        rows[sel as usize].metric_set_name.clone(),
+                    ))
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        }
     };
+
+    // Determine which PLC + metric set pair to use
+    let (plc_id, plc_name, set_name): (i64, String, Option<String>) =
+        if let Some((ref pname, ref msname)) = selection {
+            let pid: i64 = match conn.query_row(
+                "SELECT id FROM plc WHERE name = ?1",
+                rusqlite::params![pname],
+                |row| row.get(0),
+            ) {
+                Ok(id) => id,
+                Err(_) => {
+                    log::warn!("control window: selected PLC '{}' not found", pname);
+                    return;
+                }
+            };
+            (pid, pname.clone(), msname.clone())
+        } else {
+            // Fallback: first enabled PLC with enabled metric sets, no active dataset
+            let fallback: Option<(i64, String, String)> = conn
+                .query_row(
+                    "SELECT p.id, p.name, ms.name FROM plc p
+                     JOIN metric_set ms ON ms.plc_id = p.id
+                     WHERE p.enabled = 1 AND ms.enabled = 1
+                       AND NOT EXISTS (SELECT 1 FROM dataset d
+                                       WHERE d.plc_id = p.id AND d.state = 'active')
+                     ORDER BY p.id, ms.id LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            match fallback {
+                Some((pid, pname, msname)) => (pid, pname, Some(msname)),
+                None => {
+                    // Try any enabled PLC with no active dataset (even without sets)
+                    let any_plc: Option<(i64, String)> = conn
+                        .query_row(
+                            "SELECT p.id, p.name FROM plc p
+                             WHERE p.enabled = 1
+                               AND NOT EXISTS (SELECT 1 FROM dataset d
+                                               WHERE d.plc_id = p.id AND d.state = 'active')
+                             ORDER BY p.id LIMIT 1",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .ok();
+                    match any_plc {
+                        Some((pid, pname)) => (pid, pname, None),
+                        None => {
+                            log::warn!("control window: no PLC available to start collection");
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+    // Check no active dataset for this PLC
+    let active: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dataset WHERE plc_id = ?1 AND state = 'active'",
+            rusqlite::params![plc_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if active > 0 {
+        log::warn!(
+            "control window: PLC '{}' already has an active dataset",
+            plc_name
+        );
+        return;
+    }
+
+    // Auto-name the dataset
+    let now = chrono::Utc::now();
+    let ts = now.format("%Y_%m_%d_%H%M").to_string();
+    let set_part = set_name.as_deref().unwrap_or(&plc_name);
+    let dataset_name = format!("{}_{}", set_part, ts);
+
+    let sets: Vec<String> = set_name.clone().into_iter().collect();
+
     let request = serde_json::json!({
+        "action": "collection_start",
         "plc_id": plc_id,
         "plc": plc_name,
-        "dataset": format!("{plc_name}_window"),
+        "dataset": dataset_name,
+        "sets": sets,
     });
     match command_queue::enqueue(
         &conn,
@@ -672,18 +977,67 @@ fn submit_start(db: &Arc<Mutex<Connection>>) {
 
 fn submit_stop(db: &Arc<Mutex<Connection>>) {
     let conn = db.lock();
-    let plc: Option<(i64, String)> = conn
-        .query_row(
+
+    // Try to read selection from AppState (may not be set in tests)
+    let sel_plc_name: Option<String> = {
+        let ptr = APP_STATE.load(Ordering::SeqCst);
+        if ptr != 0 {
+            unsafe {
+                let st = &mut *(ptr as *mut AppState);
+                let sel = *st.selected_row.lock();
+                let rows = st.cached_status.lock().rows.clone();
+                if sel >= 0 && (sel as usize) < rows.len() {
+                    Some(rows[sel as usize].plc_name.clone())
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    // Determine which PLC to stop
+    let (plc_id, plc_name): (i64, String) = if let Some(ref pname) = sel_plc_name {
+        match conn.query_row(
+            "SELECT id FROM plc WHERE name = ?1",
+            rusqlite::params![pname],
+            |row| row.get(0),
+        ) {
+            Ok(pid) => (pid, pname.clone()),
+            Err(_) => {
+                log::warn!("control window: selected PLC '{}' not found", pname);
+                // Fallback to first active dataset
+                conn.query_row(
+                    "SELECT plc_id, name FROM dataset WHERE state = 'active' ORDER BY id LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or_else(|_| {
+                    log::info!("control window: no active dataset to stop");
+                    return (0, String::new());
+                })
+            }
+        }
+    } else {
+        // Fallback: first active dataset
+        conn.query_row(
             "SELECT plc_id, name FROM dataset WHERE state = 'active' ORDER BY id LIMIT 1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .ok();
-    let Some((plc_id, plc_name)) = plc else {
-        log::info!("control window: no active dataset to stop");
-        return;
+        .unwrap_or_else(|_| {
+            log::info!("control window: no active dataset to stop");
+            return (0, String::new());
+        })
     };
+
+    if plc_id == 0 {
+        return;
+    }
+
     let request = serde_json::json!({
+        "action": "collection_stop",
         "plc_id": plc_id,
         "plc": plc_name,
     });
@@ -746,7 +1100,7 @@ mod tests {
         let db = temp_db();
         let snap = read_status(&db);
         assert_eq!(snap.plc_count, 0);
-        assert!(snap.plc_rows.is_empty());
+        assert!(snap.rows.is_empty());
         assert_eq!(snap.command_queue_pending, 0);
     }
 
@@ -760,14 +1114,18 @@ mod tests {
                  ('plc2', '127.0.0.1:103', 'offline');
              INSERT INTO dataset (plc_id, name, state, started_ts, created_ts, updated_ts)
                  VALUES (1, 'ds1', 'active', 1000000, 1000000, 1000000);",
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
         let snap = read_status(&db);
         assert_eq!(snap.plc_count, 2);
         assert_eq!(snap.active_dataset_count, 1);
-        assert_eq!(snap.plc_rows.len(), 2);
-        assert_eq!(snap.plc_rows[0].connectivity, "online");
-        assert_eq!(snap.plc_rows[1].connectivity, "offline");
+        // PLCs without metric sets get one fallback row each
+        assert_eq!(snap.rows.len(), 2);
+        assert_eq!(snap.rows[0].plc_connectivity, "online");
+        assert_eq!(snap.rows[1].plc_connectivity, "offline");
+        assert!(snap.rows[0].dataset_name.is_some());
+        assert_eq!(snap.rows[0].dataset_name.as_deref(), Some("ds1"));
     }
 
     #[test]

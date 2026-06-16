@@ -10,7 +10,6 @@
 ///                                          +---> command_result
 /// Poller --send--> sample-writer --batch--> SQLite
 /// ```
-
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use rusqlite::Connection;
@@ -20,14 +19,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::api;
 use crate::db;
 use crate::engine::plan::build_plan;
-use crate::engine::poller::{PollerHandle, PollResult, spawn_poller};
+use crate::engine::poller::{spawn_poller, OverrunMode, PollResult, PollerHandle};
 use crate::engine::snapshot::Snapshot;
 use crate::plc::client::PlcClient;
 use crate::plc::create_plc_client;
 use crate::types::*;
-use crate::api;
 
 /// Batch of samples from one poll cycle, sent through the channel.
 pub type SampleBatch = PollResult;
@@ -52,6 +51,7 @@ fn apply_worker(
     pollers: PollerRegistry,
     pdu_cache: PduCache,
     sample_tx: Sender<SampleBatch>,
+    overrun_mode: OverrunMode,
 ) {
     info!("apply-worker started");
 
@@ -69,7 +69,10 @@ fn apply_worker(
         };
 
         if let Some(row) = due {
-            info!("apply-worker: executing apply id={} reason={:?}", row.id, row.reason);
+            info!(
+                "apply-worker: executing apply id={} reason={:?}",
+                row.id, row.reason
+            );
             let conn = db.lock();
             use crate::types::ApplyScope;
             let mut affected: Vec<(i64, i64)> = Vec::new(); // (plc_id, pg_id)
@@ -82,11 +85,13 @@ fn apply_worker(
                             rusqlite::params![tag_id],
                         );
                         // Determine affected (plc, pg) for a plan rebuild
-                        let plc_pg: Option<(i64, i64)> = conn.query_row(
-                            "SELECT plc_id, COALESCE(poll_group_id, 0) FROM tag WHERE id = ?1",
-                            rusqlite::params![tag_id],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
-                        ).ok();
+                        let plc_pg: Option<(i64, i64)> = conn
+                            .query_row(
+                                "SELECT plc_id, COALESCE(poll_group_id, 0) FROM tag WHERE id = ?1",
+                                rusqlite::params![tag_id],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )
+                            .ok();
                         if let Some(pp) = plc_pg {
                             affected.push(pp);
                         }
@@ -100,13 +105,18 @@ fn apply_worker(
                             rusqlite::params![plc_id],
                         );
                         // Rebuild all poll groups for this PLC
-                        let pgs: Vec<i64> = conn.prepare(
-                            "SELECT DISTINCT COALESCE(poll_group_id, 0)
-                             FROM tag WHERE plc_id = ?1 AND enabled = 1 AND bad = 0"
-                        ).ok().and_then(|mut s| {
-                            s.query_map(rusqlite::params![plc_id], |r| r.get::<_, i64>(0))
-                                .ok().map(|it| it.filter_map(|x| x.ok()).collect())
-                        }).unwrap_or_default();
+                        let pgs: Vec<i64> = conn
+                            .prepare(
+                                "SELECT DISTINCT COALESCE(poll_group_id, 0)
+                             FROM tag WHERE plc_id = ?1 AND enabled = 1 AND bad = 0",
+                            )
+                            .ok()
+                            .and_then(|mut s| {
+                                s.query_map(rusqlite::params![plc_id], |r| r.get::<_, i64>(0))
+                                    .ok()
+                                    .map(|it| it.filter_map(|x| x.ok()).collect())
+                            })
+                            .unwrap_or_default();
                         for pg in pgs {
                             affected.push((plc_id, pg));
                         }
@@ -135,16 +145,23 @@ fn apply_worker(
                         );
                         // Rebuild all poll groups for this PLC that are
                         // affected by this metric set.
-                        let pgs: Vec<i64> = conn.prepare(
-                            "SELECT DISTINCT COALESCE(t.poll_group_id, 0)
+                        let pgs: Vec<i64> = conn
+                            .prepare(
+                                "SELECT DISTINCT COALESCE(t.poll_group_id, 0)
                              FROM tag t
                              JOIN metric_set_tag mst ON mst.tag_id = t.id
                              WHERE mst.metric_set_id = ?1 AND t.plc_id = ?2
-                               AND t.enabled = 1 AND t.bad = 0"
-                        ).ok().and_then(|mut s| {
-                            s.query_map(rusqlite::params![row.metric_set_id, plc_id], |r| r.get::<_, i64>(0))
-                                .ok().map(|it| it.filter_map(|x| x.ok()).collect())
-                        }).unwrap_or_default();
+                               AND t.enabled = 1 AND t.bad = 0",
+                            )
+                            .ok()
+                            .and_then(|mut s| {
+                                s.query_map(rusqlite::params![row.metric_set_id, plc_id], |r| {
+                                    r.get::<_, i64>(0)
+                                })
+                                .ok()
+                                .map(|it| it.filter_map(|x| x.ok()).collect())
+                            })
+                            .unwrap_or_default();
                         for pg in pgs {
                             affected.push((plc_id, pg));
                         }
@@ -156,11 +173,14 @@ fn apply_worker(
             // Rebuild running pollers for affected (plc, pg) pairs.
             // Only do this if there is an active dataset (collection running).
             for (plc_id, pg_id) in &affected {
-                let has_active_dataset: bool = conn.query_row(
-                    "SELECT COUNT(*) FROM dataset WHERE plc_id = ?1 AND state = 'active'",
-                    rusqlite::params![plc_id],
-                    |r| r.get::<_, i64>(0),
-                ).unwrap_or(0) > 0;
+                let has_active_dataset: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM dataset WHERE plc_id = ?1 AND state = 'active'",
+                        rusqlite::params![plc_id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
                 if !has_active_dataset {
                     continue;
                 }
@@ -170,7 +190,10 @@ fn apply_worker(
                     let mut reg = pollers.lock();
                     if let Some(handle) = reg.remove(&(*plc_id, *pg_id)) {
                         handle.stop();
-                        info!("apply-worker: stopped poller for PLC {} group {}", plc_id, pg_id);
+                        info!(
+                            "apply-worker: stopped poller for PLC {} group {}",
+                            plc_id, pg_id
+                        );
                     }
                 }
 
@@ -185,17 +208,30 @@ fn apply_worker(
                 };
 
                 // Spawn a fresh poller with the updated plan
-                let period_ms: u64 = conn.query_row(
-                    "SELECT period_ms FROM poll_group WHERE id = ?1",
-                    rusqlite::params![pg_id],
-                    |r| r.get(0),
-                ).unwrap_or(1000);
+                let period_ms: u64 = conn
+                    .query_row(
+                        "SELECT period_ms FROM poll_group WHERE id = ?1",
+                        rusqlite::params![pg_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(1000);
 
                 if let Err(e) = spawn_one_poller(
-                    &plcs, &pollers, &pdu_cache, &sample_tx, &conn,
-                    *plc_id, &plc_name, *pg_id, period_ms,
+                    &plcs,
+                    &pollers,
+                    &pdu_cache,
+                    &sample_tx,
+                    &conn,
+                    *plc_id,
+                    &plc_name,
+                    *pg_id,
+                    period_ms,
+                    overrun_mode,
                 ) {
-                    error!("apply-worker: spawn_one_poller failed for PLC {} group {}: {}", plc_id, pg_id, e);
+                    error!(
+                        "apply-worker: spawn_one_poller failed for PLC {} group {}: {}",
+                        plc_id, pg_id, e
+                    );
                 }
             }
 
@@ -225,6 +261,7 @@ fn spawn_one_poller(
     plc_name: &str,
     pg_id: i64,
     period_ms: u64,
+    overrun_mode: OverrunMode,
 ) -> Result<(), anyhow::Error> {
     // Build plan
     let tags = load_active_tags(conn, plc_id, pg_id)?;
@@ -239,8 +276,9 @@ fn spawn_one_poller(
     // Get client
     let client = {
         let reg = plcs.lock();
-        reg.get(&plc_id).cloned()
-        .ok_or_else(|| anyhow::anyhow!("PLC {plc_id} not in registry"))?
+        reg.get(&plc_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("PLC {plc_id} not in registry"))?
     };
 
     // Spawn
@@ -252,16 +290,24 @@ fn spawn_one_poller(
         tags,
         client,
         sample_tx.clone(),
+        overrun_mode,
     );
 
     // Store
     pollers.lock().insert((plc_id, pg_id), handle);
-    info!("poller started for PLC {} group {} (period={}ms)", plc_name, pg_id, period_ms);
+    info!(
+        "poller started for PLC {} group {} (period={}ms)",
+        plc_name, pg_id, period_ms
+    );
     Ok(())
 }
 
 /// Load enabled, non-bad tags for a PLC + poll group from enabled metric sets.
-fn load_active_tags(conn: &Connection, plc_id: i64, pg_id: i64) -> Result<Vec<TagRow>, anyhow::Error> {
+fn load_active_tags(
+    conn: &Connection,
+    plc_id: i64,
+    pg_id: i64,
+) -> Result<Vec<TagRow>, anyhow::Error> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT t.id, t.plc_id, t.name, t.address,
                 t.db_num, t.byte_offset, t.bit_offset,
@@ -279,41 +325,53 @@ fn load_active_tags(conn: &Connection, plc_id: i64, pg_id: i64) -> Result<Vec<Ta
          ORDER BY t.db_num, t.byte_offset",
     )?;
 
-    let tags: Vec<TagRow> = stmt.query_map(rusqlite::params![plc_id, pg_id], |row| {
-        let data_type_str: String = row.get(8)?;
-        let store_mode_str: String = row.get(10)?;
-        let storage_hook_str: String = row.get(11)?;
-        let bad_class_str: Option<String> = row.get(15)?;
+    let tags: Vec<TagRow> = stmt
+        .query_map(rusqlite::params![plc_id, pg_id], |row| {
+            let data_type_str: String = row.get(8)?;
+            let store_mode_str: String = row.get(10)?;
+            let storage_hook_str: String = row.get(11)?;
+            let bad_class_str: Option<String> = row.get(15)?;
 
-        Ok(TagRow {
-            id: row.get(0)?,
-            plc_id: row.get(1)?,
-            name: row.get(2)?,
-            address: row.get(3)?,
-            db_num: row.get(4)?,
-            byte_offset: row.get(5)?,
-            bit_offset: row.get(6)?,
-            byte_size: row.get(7)?,
-            data_type: data_type_str.parse::<DataType>()
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    8, rusqlite::types::Type::Text, std::io::Error::new(std::io::ErrorKind::InvalidData, e).into(),
-                ))?,
-            poll_group_id: row.get(9)?,
-            store_mode: store_mode_str.parse::<StoreMode>()
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    10, rusqlite::types::Type::Text, std::io::Error::new(std::io::ErrorKind::InvalidData, e).into(),
-                ))?,
-            storage_hook: storage_hook_str.parse::<StorageHook>()
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    11, rusqlite::types::Type::Text, std::io::Error::new(std::io::ErrorKind::InvalidData, e).into(),
-                ))?,
-            hook_params_json: row.get(12)?,
-            enabled: row.get(13)?,
-            bad: row.get(14)?,
-            bad_class: bad_class_str.map(|s| s.parse::<BadClass>().ok()).flatten(),
-            bad_detail: row.get(16)?,
-        })
-    })?.filter_map(|r| r.ok()).collect();
+            Ok(TagRow {
+                id: row.get(0)?,
+                plc_id: row.get(1)?,
+                name: row.get(2)?,
+                address: row.get(3)?,
+                db_num: row.get(4)?,
+                byte_offset: row.get(5)?,
+                bit_offset: row.get(6)?,
+                byte_size: row.get(7)?,
+                data_type: data_type_str.parse::<DataType>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e).into(),
+                    )
+                })?,
+                poll_group_id: row.get(9)?,
+                store_mode: store_mode_str.parse::<StoreMode>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e).into(),
+                    )
+                })?,
+                storage_hook: storage_hook_str.parse::<StorageHook>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Text,
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e).into(),
+                    )
+                })?,
+                hook_params_json: row.get(12)?,
+                enabled: row.get(13)?,
+                bad: row.get(14)?,
+                bad_class: bad_class_str.map(|s| s.parse::<BadClass>().ok()).flatten(),
+                bad_detail: row.get(16)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(tags)
 }
@@ -329,6 +387,7 @@ fn execute_command(
     cmd_id: i64,
     kind: CommandKind,
     request_json: &str,
+    overrun_mode: OverrunMode,
 ) -> Result<(bool, String), anyhow::Error> {
     use CommandKind::*;
 
@@ -341,20 +400,28 @@ fn execute_command(
                 "delete_dataset" => {
                     let dataset = req["dataset"].as_str().unwrap_or("");
                     // Refuse if dataset is still active (retention.md D009)
-                    let state: Option<String> = conn.query_row(
-                        "SELECT state FROM dataset WHERE name = ?1",
-                        rusqlite::params![dataset],
-                        |r| r.get(0),
-                    ).ok();
+                    let state: Option<String> = conn
+                        .query_row(
+                            "SELECT state FROM dataset WHERE name = ?1",
+                            rusqlite::params![dataset],
+                            |r| r.get(0),
+                        )
+                        .ok();
                     if let Some(s) = state {
                         if s == "active" {
-                            return Ok((false, format!("dataset '{dataset}' is active; stop it first")));
+                            return Ok((
+                                false,
+                                format!("dataset '{dataset}' is active; stop it first"),
+                            ));
                         }
                     } else {
                         return Ok((false, format!("dataset '{dataset}' not found")));
                     }
                     // ON DELETE CASCADE handles dependent rows.
-                    let n = conn.execute("DELETE FROM dataset WHERE name = ?1", rusqlite::params![dataset])?;
+                    let n = conn.execute(
+                        "DELETE FROM dataset WHERE name = ?1",
+                        rusqlite::params![dataset],
+                    )?;
                     Ok((true, format!("dataset '{dataset}' deleted rows={n}")))
                 }
                 "history_clean" => {
@@ -369,12 +436,30 @@ fn execute_command(
                     let cutoff = cutoff.unwrap();
 
                     // Refuse if any active dataset for this PLC (retention.md)
-                    let active: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM dataset WHERE plc_id = ?1 AND state = 'active'",
-                        rusqlite::params![plc_id], |r| r.get(0),
-                    ).unwrap_or(0);
+                    let active: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM dataset WHERE plc_id = ?1 AND state = 'active'",
+                            rusqlite::params![plc_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
                     if active > 0 {
-                        return Ok((false, format!("PLC has {active} active dataset(s); stop collection first")));
+                        return Ok((
+                            false,
+                            format!("PLC has {active} active dataset(s); stop collection first"),
+                        ));
+                    }
+
+                    // Refuse if any poller is still running for this PLC
+                    {
+                        let reg = pollers.lock();
+                        let has_poller = reg.keys().any(|(pid, _)| *pid == plc_id);
+                        if has_poller {
+                            return Ok((
+                                false,
+                                format!("PLC {plc_id} has running pollers; stop collection first"),
+                            ));
+                        }
                     }
 
                     let mut total_deleted: i64 = 0;
@@ -391,7 +476,9 @@ fn execute_command(
                              )",
                             rusqlite::params![cutoff, plc_id, batch_size],
                         )?;
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         total_deleted += n as i64;
                     }
                     // 2. sample_rollup
@@ -405,7 +492,9 @@ fn execute_command(
                              )",
                             rusqlite::params![cutoff, plc_id, batch_size],
                         )?;
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         total_deleted += n as i64;
                     }
                     // 3. event_marker
@@ -419,7 +508,9 @@ fn execute_command(
                              )",
                             rusqlite::params![cutoff, plc_id, batch_size],
                         )?;
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         total_deleted += n as i64;
                     }
                     // 4. plc_time_sample
@@ -433,7 +524,9 @@ fn execute_command(
                              )",
                             rusqlite::params![cutoff, plc_id, batch_size],
                         )?;
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         total_deleted += n as i64;
                     }
                     // 5. raw_probe
@@ -447,7 +540,9 @@ fn execute_command(
                              )",
                             rusqlite::params![cutoff, plc_id, batch_size],
                         )?;
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         total_deleted += n as i64;
                     }
                     // 6. orphaned poll_cycle (no remaining samples/events/time referencing them)
@@ -464,7 +559,9 @@ fn execute_command(
                              )",
                             rusqlite::params![cutoff, plc_id, batch_size],
                         )?;
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         total_deleted += n as i64;
                     }
                     // 7. inactive read_span no longer referenced by sample
@@ -479,75 +576,162 @@ fn execute_command(
                              )",
                             rusqlite::params![plc_id, batch_size],
                         )?;
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         total_deleted += n as i64;
                     }
 
-                    Ok((true, format!("history_clean plc={plc_id} cutoff={cutoff} deleted={total_deleted}")))
+                    Ok((
+                        true,
+                        format!(
+                            "history_clean plc={plc_id} cutoff={cutoff} deleted={total_deleted}"
+                        ),
+                    ))
                 }
-                other => Ok((false, format!("unknown admin action '{other}'")))
+                other => Ok((false, format!("unknown admin action '{other}'"))),
             }
         }
         PlcRead => {
+            let action = req["action"].as_str().unwrap_or("read");
             let plc_name = req["plc"].as_str().unwrap_or("");
-            let address = req["address"].as_str().unwrap_or("");
-            let data_type = req["data_type"].as_str().unwrap_or("");
-
-            let dt: DataType = data_type.parse()
-                .map_err(|e: String| anyhow::anyhow!("invalid data type: {e}"))?;
-            let addr = S7Address::parse(address)
-                .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
 
             // Get plc_id from name
-            let plc_id: i64 = conn.query_row(
-                "SELECT id FROM plc WHERE name = ?1",
-                rusqlite::params![plc_name],
-                |row| row.get(0),
-            ).map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?;
+            let plc_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM plc WHERE name = ?1",
+                    rusqlite::params![plc_name],
+                    |row| row.get(0),
+                )
+                .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?;
 
             // Get client from registry
             let client_arc = {
                 let reg = plcs.lock();
-                reg.get(&plc_id).cloned()
+                reg.get(&plc_id)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("PLC {plc_id} client not registered"))?
             };
-
             let mut client = client_arc.lock();
-            let data = client.read_db(addr.db_num, addr.byte_offset, dt.byte_size())?;
 
-            // Decode
-            let (vi, vf) = crate::engine::storage::decode_value(&data, dt, None);
+            match action {
+                "read_raw" => {
+                    let db: u16 = req["db"]
+                        .as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("missing db"))?
+                        as u16;
+                    let start: usize = req["start"]
+                        .as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("missing start"))?
+                        as usize;
+                    let len: usize = req["len"]
+                        .as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("missing len"))?
+                        as usize;
+                    let format_str = req["format"].as_str().unwrap_or("hex");
 
-            // Update snapshot (negative tag_id = ephemeral one-off read)
-            snapshot.update(
-                -cmd_id, plc_id, "", address, dt, vi, vf, now_us(),
-            );
+                    let data = client.read_db(db, start, len)?;
+                    let ts = now_us();
 
-            let json_result = serde_json::json!({
-                "command_id": cmd_id,
-                "ok": true,
-                "value_i": vi,
-                "value_f": vf,
-                "ts_us": now_us(),
-            });
+                    // Format the output
+                    let json_result = match format_str {
+                        "hex" | "raw" => {
+                            let hex_str: String = data.iter().map(|b| format!("{b:02x}")).collect();
+                            serde_json::json!({
+                                "command_id": cmd_id,
+                                "ok": true,
+                                "plc": plc_name,
+                                "db": db,
+                                "start": start,
+                                "len": len,
+                                "ts_us": ts,
+                                "bytes_hex": hex_str,
+                                "format": format_str,
+                            })
+                        }
+                        "dec" => {
+                            let dec_vals: Vec<String> =
+                                data.iter().map(|b| format!("{b}")).collect();
+                            serde_json::json!({
+                                "command_id": cmd_id,
+                                "ok": true,
+                                "plc": plc_name,
+                                "db": db,
+                                "start": start,
+                                "len": len,
+                                "ts_us": ts,
+                                "bytes_raw": data,
+                                "bytes_dec": dec_vals,
+                                "format": format_str,
+                            })
+                        }
+                        _ => {
+                            serde_json::json!({
+                                "command_id": cmd_id,
+                                "ok": true,
+                                "plc": plc_name,
+                                "db": db,
+                                "start": start,
+                                "len": len,
+                                "ts_us": ts,
+                                "bytes_raw": data,
+                                "format": "json",
+                            })
+                        }
+                    };
 
-            // Save raw probe if requested
-            if req.get("save_probe").and_then(|v| v.as_bool()).unwrap_or(false) {
-                let ds_id: Option<i64> = conn.query_row(
-                    "SELECT id FROM dataset WHERE plc_id = ?1 AND state = 'active' LIMIT 1",
-                    rusqlite::params![plc_id], |row| row.get(0),
-                ).ok();
-                conn.execute(
-                    "INSERT INTO raw_probe (plc_id, db_num, byte_offset, byte_len, data, dataset_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        plc_id, addr.db_num, addr.byte_offset, dt.byte_size() as i64,
-                        data, ds_id,
-                    ],
-                )?;
+                    // Save raw probe if requested
+                    if req
+                        .get("save_probe")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        let ds_id: Option<i64> = conn.query_row(
+                            "SELECT id FROM dataset WHERE plc_id = ?1 AND state = 'active' LIMIT 1",
+                            rusqlite::params![plc_id], |row| row.get(0),
+                        ).ok();
+                        let now = ts;
+                        conn.execute(
+                            "INSERT INTO raw_probe (dataset_id, plc_id, db_num, byte_offset, byte_len, ts, bytes)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            rusqlite::params![
+                                ds_id, plc_id, db, start, len as i64, now, data,
+                            ],
+                        )?;
+                    }
+
+                    Ok((true, json_result.to_string()))
+                }
+                _ => {
+                    // Default typed one-off read (action = "read" or unspecified)
+                    let address = req["address"].as_str().unwrap_or("");
+                    let data_type = req["data_type"].as_str().unwrap_or("");
+
+                    let dt: DataType = data_type
+                        .parse()
+                        .map_err(|e: String| anyhow::anyhow!("invalid data type: {e}"))?;
+                    let addr = S7Address::parse(address)
+                        .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+
+                    let data = client.read_db(addr.db_num, addr.byte_offset, dt.byte_size())?;
+
+                    // Decode
+                    let (vi, vf) = crate::engine::storage::decode_value(&data, dt, None);
+
+                    // Update snapshot (negative tag_id = ephemeral one-off read)
+                    snapshot.update(-cmd_id, plc_id, "", address, dt, vi, vf, now_us());
+
+                    let json_result = serde_json::json!({
+                        "command_id": cmd_id,
+                        "ok": true,
+                        "value_i": vi,
+                        "value_f": vf,
+                        "ts_us": now_us(),
+                    });
+
+                    Ok((true, json_result.to_string()))
+                }
             }
-
-            Ok((true, json_result.to_string()))
         }
         Control => {
             let action = req["action"].as_str().unwrap_or("");
@@ -556,13 +740,17 @@ fn execute_command(
                     // Full remote tag add: PLC + name + address + dt + ... — server
                     // does INSERT into tag + metric_set_tag, validates via PLC
                     // client, schedules apply. Returns tag_id, ok, value.
-                    let plc_name = req["plc"].as_str()
+                    let plc_name = req["plc"]
+                        .as_str()
                         .ok_or_else(|| anyhow::anyhow!("missing plc"))?;
-                    let name = req["name"].as_str()
+                    let name = req["name"]
+                        .as_str()
                         .ok_or_else(|| anyhow::anyhow!("missing name"))?;
-                    let address_str = req["address"].as_str()
+                    let address_str = req["address"]
+                        .as_str()
                         .ok_or_else(|| anyhow::anyhow!("missing address"))?;
-                    let data_type_str = req["data_type"].as_str()
+                    let data_type_str = req["data_type"]
+                        .as_str()
                         .ok_or_else(|| anyhow::anyhow!("missing data_type"))?;
                     let poll_group = req["poll_group"].as_str().unwrap_or("slow");
                     let store_mode = req["store_mode"].as_str().unwrap_or("on_change");
@@ -570,40 +758,64 @@ fn execute_command(
                     let value_role = req["value_role"].as_str().unwrap_or("state");
                     let metric_set = req["metric_set"].as_str();
 
-                    let dt: DataType = data_type_str.parse()
+                    let dt: DataType = data_type_str
+                        .parse()
                         .map_err(|e: String| anyhow::anyhow!("invalid data_type: {e}"))?;
-                    let _sm: StoreMode = store_mode.parse()
-                        .map_err(|_e: String| anyhow::anyhow!("invalid store_mode: {store_mode}"))?;
-                    let _sh: StorageHook = storage_hook.parse()
-                        .map_err(|_e: String| anyhow::anyhow!("invalid storage_hook: {storage_hook}"))?;
+                    let _sm: StoreMode = store_mode.parse().map_err(|_e: String| {
+                        anyhow::anyhow!("invalid store_mode: {store_mode}")
+                    })?;
+                    let _sh: StorageHook = storage_hook.parse().map_err(|_e: String| {
+                        anyhow::anyhow!("invalid storage_hook: {storage_hook}")
+                    })?;
                     let addr = S7Address::parse(address_str)
                         .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
 
                     let inserted = db::validation::insert_tag(
-                        conn, plc_name, name, &addr, dt, poll_group, store_mode,
-                        storage_hook, value_role, metric_set,
+                        conn,
+                        plc_name,
+                        name,
+                        &addr,
+                        dt,
+                        poll_group,
+                        store_mode,
+                        storage_hook,
+                        value_role,
+                        metric_set,
                     )?;
                     let tag_id = inserted.tag_id;
 
                     // Validation
                     let client_arc = {
                         let reg = plcs.lock();
-                        reg.get(&inserted.plc_id).cloned()
-                            .ok_or_else(|| anyhow::anyhow!("PLC client not available for {}", inserted.plc_id))?
+                        reg.get(&inserted.plc_id).cloned().ok_or_else(|| {
+                            anyhow::anyhow!("PLC client not available for {}", inserted.plc_id)
+                        })?
                     };
                     let result = db::validation::validate_tag(conn, &client_arc, tag_id)?;
 
                     if result.ok {
                         snapshot.update(
-                            tag_id, inserted.plc_id, name, address_str, dt,
-                            result.value_i, result.value_f, result.ts_us,
+                            tag_id,
+                            inserted.plc_id,
+                            name,
+                            address_str,
+                            dt,
+                            result.value_i,
+                            result.value_f,
+                            result.ts_us,
                         );
                     }
 
                     let _ = db::config_apply::schedule(
-                        conn, ApplyScope::Tag, Some(inserted.plc_id), None, None, Some(tag_id),
+                        conn,
+                        ApplyScope::Tag,
+                        Some(inserted.plc_id),
+                        None,
+                        None,
+                        Some(tag_id),
                         &format!("tag_add_full id={tag_id}"),
-                        db::config_apply::PLAN_COOLDOWN_MS, None,
+                        db::config_apply::PLAN_COOLDOWN_MS,
+                        None,
                     );
 
                     let val_str = if let Some(v) = result.value_i {
@@ -619,51 +831,78 @@ fn execute_command(
                     };
 
                     if result.ok {
-                        Ok((true, format!("{val_str} apply_state=pending tag_id={tag_id}")))
+                        Ok((
+                            true,
+                            format!("{val_str} apply_state=pending tag_id={tag_id}"),
+                        ))
                     } else {
-                        let bc = result.bad_class.as_ref().map(|b| b.to_string()).unwrap_or_default();
+                        let bc = result
+                            .bad_class
+                            .as_ref()
+                            .map(|b| b.to_string())
+                            .unwrap_or_default();
                         let det = result.detail.as_deref().unwrap_or("");
-                        Ok((false, format!("bad bad_class={bc} detail=\"{det}\" tag_id={tag_id}")))
+                        Ok((
+                            false,
+                            format!("bad bad_class={bc} detail=\"{det}\" tag_id={tag_id}"),
+                        ))
                     }
                 }
                 "tag_add" => {
-                    let plc_id = req["plc_id"].as_i64()
+                    let plc_id = req["plc_id"]
+                        .as_i64()
                         .ok_or_else(|| anyhow::anyhow!("missing plc_id"))?;
-                    let tag_id = req["tag_id"].as_i64()
+                    let tag_id = req["tag_id"]
+                        .as_i64()
                         .ok_or_else(|| anyhow::anyhow!("missing tag_id"))?;
 
                     // Read tag metadata (only name+address+dt needed for snapshot)
                     let (name, address, data_type_str): (String, String, String) = conn.query_row(
                         "SELECT name, address, data_type FROM tag WHERE id = ?1",
                         rusqlite::params![tag_id],
-                        |row| Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        )),
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
                     )?;
                     let dt: DataType = data_type_str.parse().unwrap_or(DataType::I16);
 
                     let client_arc = {
                         let reg = plcs.lock();
-                        reg.get(&plc_id).cloned()
-                            .ok_or_else(|| anyhow::anyhow!("PLC client not available for {plc_id}"))?
+                        reg.get(&plc_id).cloned().ok_or_else(|| {
+                            anyhow::anyhow!("PLC client not available for {plc_id}")
+                        })?
                     };
 
                     let result = db::validation::validate_tag(conn, &client_arc, tag_id)?;
 
                     if result.ok {
                         snapshot.update(
-                            tag_id, plc_id, &name, &address, dt,
-                            result.value_i, result.value_f, result.ts_us,
+                            tag_id,
+                            plc_id,
+                            &name,
+                            &address,
+                            dt,
+                            result.value_i,
+                            result.value_f,
+                            result.ts_us,
                         );
                     }
 
                     // Schedule config apply
                     let _ = db::config_apply::schedule(
-                        conn, ApplyScope::Tag, Some(plc_id), None, None, Some(tag_id),
+                        conn,
+                        ApplyScope::Tag,
+                        Some(plc_id),
+                        None,
+                        None,
+                        Some(tag_id),
                         &format!("tag_add id={tag_id}"),
-                        db::config_apply::PLAN_COOLDOWN_MS, None,
+                        db::config_apply::PLAN_COOLDOWN_MS,
+                        None,
                     );
 
                     if result.ok {
@@ -678,24 +917,48 @@ fn execute_command(
                         } else {
                             "value=null".into()
                         };
-                        Ok((true, format!("{val_str} apply_state=pending tag_id={tag_id}")))
+                        Ok((
+                            true,
+                            format!("{val_str} apply_state=pending tag_id={tag_id}"),
+                        ))
                     } else {
-                        let bc = result.bad_class.as_ref().map(|b| b.to_string()).unwrap_or_default();
+                        let bc = result
+                            .bad_class
+                            .as_ref()
+                            .map(|b| b.to_string())
+                            .unwrap_or_default();
                         let det = result.detail.as_deref().unwrap_or("");
-                        Ok((false, format!("bad bad_class={bc} detail=\"{det}\" tag_id={tag_id}")))
+                        Ok((
+                            false,
+                            format!("bad bad_class={bc} detail=\"{det}\" tag_id={tag_id}"),
+                        ))
                     }
                 }
 
                 "tag_disable" => {
                     if let Some(tag_id) = req["tag_id"].as_i64() {
+                        let plc_id: Option<i64> = conn
+                            .query_row(
+                                "SELECT plc_id FROM tag WHERE id = ?1",
+                                rusqlite::params![tag_id],
+                                |row| row.get(0),
+                            )
+                            .ok();
                         conn.execute(
                             "UPDATE tag SET enabled = 0 WHERE id = ?1",
                             rusqlite::params![tag_id],
                         )?;
                         let reason = format!("tag_disable id={tag_id}");
                         let _ = db::config_apply::schedule(
-                            conn, ApplyScope::Tag, Some(tag_id), None, None, None,
-                            &reason, db::config_apply::PLAN_COOLDOWN_MS, None,
+                            conn,
+                            ApplyScope::Tag,
+                            plc_id,
+                            None,
+                            None,
+                            Some(tag_id),
+                            &reason,
+                            db::config_apply::PLAN_COOLDOWN_MS,
+                            None,
                         );
                         Ok((true, format!("tag {tag_id} disabled, apply scheduled")))
                     } else {
@@ -704,25 +967,29 @@ fn execute_command(
                 }
 
                 "tag_revalidate" => {
-                    let tag_id = req["tag_id"].as_i64()
+                    let tag_id = req["tag_id"]
+                        .as_i64()
                         .ok_or_else(|| anyhow::anyhow!("missing tag_id"))?;
 
                     let (plc_id, name, address, data_type_str): (i64, String, String, String) =
                         conn.query_row(
                             "SELECT plc_id, name, address, data_type FROM tag WHERE id = ?1",
                             rusqlite::params![tag_id],
-                            |row| Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                            )),
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, String>(3)?,
+                                ))
+                            },
                         )?;
                     let dt: DataType = data_type_str.parse().unwrap_or(DataType::I16);
 
                     let client_arc = {
                         let reg = plcs.lock();
-                        reg.get(&plc_id).cloned()
+                        reg.get(&plc_id)
+                            .cloned()
                             .ok_or_else(|| anyhow::anyhow!("PLC client not available"))?
                     };
 
@@ -730,19 +997,34 @@ fn execute_command(
 
                     if result.ok {
                         snapshot.update(
-                            tag_id, plc_id, &name, &address, dt,
-                            result.value_i, result.value_f, result.ts_us,
+                            tag_id,
+                            plc_id,
+                            &name,
+                            &address,
+                            dt,
+                            result.value_i,
+                            result.value_f,
+                            result.ts_us,
                         );
                     }
 
                     let _ = db::config_apply::schedule(
-                        conn, ApplyScope::Tag, Some(plc_id), None, None, Some(tag_id),
+                        conn,
+                        ApplyScope::Tag,
+                        Some(plc_id),
+                        None,
+                        None,
+                        Some(tag_id),
                         &format!("tag_revalidate id={tag_id}"),
-                        db::config_apply::PLAN_COOLDOWN_MS, None,
+                        db::config_apply::PLAN_COOLDOWN_MS,
+                        None,
                     );
 
                     if result.ok {
-                        Ok((true, format!("tag {tag_id} revalidated OK value={:?}", result.value_i)))
+                        Ok((
+                            true,
+                            format!("tag {tag_id} revalidated OK value={:?}", result.value_i),
+                        ))
                     } else {
                         let det = result.detail.as_deref().unwrap_or("");
                         Ok((false, format!("revalidate failed: {det}")))
@@ -750,19 +1032,25 @@ fn execute_command(
                 }
 
                 "collection_start" => {
-                    let plc_id = req["plc_id"].as_i64()
+                    let plc_id = req["plc_id"]
+                        .as_i64()
                         .ok_or_else(|| anyhow::anyhow!("missing plc_id"))?;
                     let plc_name = req["plc"].as_str().unwrap_or("?");
-                    let dataset = req["dataset"].as_str()
+                    let dataset = req["dataset"]
+                        .as_str()
                         .ok_or_else(|| anyhow::anyhow!("missing dataset"))?;
 
                     // Check no active dataset
                     let active: i64 = conn.query_row(
                         "SELECT COUNT(*) FROM dataset WHERE plc_id = ?1 AND state = 'active'",
-                        rusqlite::params![plc_id], |row| row.get(0),
+                        rusqlite::params![plc_id],
+                        |row| row.get(0),
                     )?;
                     if active > 0 {
-                        return Ok((false, format!("PLC {plc_name} already has an active dataset")));
+                        return Ok((
+                            false,
+                            format!("PLC {plc_name} already has an active dataset"),
+                        ));
                     }
 
                     // Create dataset
@@ -776,52 +1064,150 @@ fn execute_command(
                         "collection_start: inserted dataset id=? plc_id={} name='{}' rows_affected={}",
                         plc_id, dataset, n
                     );
+                    // Get dataset id
+                    let dataset_id = conn.last_insert_rowid();
 
-                    // Find poll groups for this PLC
+                    // Parse requested metric set names
+                    let set_names: Vec<String> = req["sets"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    if !set_names.is_empty() {
+                        info!(
+                            "collection_start {}: binding {} metric set(s)",
+                            dataset,
+                            set_names.len()
+                        );
+                        for set_name in &set_names {
+                            // Find or create the metric set for this PLC
+                            let ms_id: i64 = match conn.query_row(
+                                "SELECT id FROM metric_set WHERE plc_id = ?1 AND name = ?2",
+                                rusqlite::params![plc_id, set_name],
+                                |row| row.get(0),
+                            ) {
+                                Ok(id) => {
+                                    // Ensure it's enabled
+                                    conn.execute(
+                                        "UPDATE metric_set SET enabled = 1, updated_ts = ?1 WHERE id = ?2",
+                                        rusqlite::params![now, id],
+                                    )?;
+                                    id
+                                }
+                                Err(_) => {
+                                    // Auto-create the set
+                                    conn.execute(
+                                        "INSERT INTO metric_set (plc_id, name, enabled, created_ts, updated_ts)
+                                         VALUES (?1, ?2, 1, ?3, ?3)",
+                                        rusqlite::params![plc_id, set_name, now],
+                                    )?;
+                                    conn.last_insert_rowid()
+                                }
+                            };
+                            // Bind the set to the dataset
+                            conn.execute(
+                                "INSERT OR IGNORE INTO dataset_metric_set (dataset_id, metric_set_id, plc_id, created_ts)
+                                 VALUES (?1, ?2, ?3, ?4)",
+                                rusqlite::params![dataset_id, ms_id, plc_id, now],
+                            )?;
+                        }
+                    }
+
+                    // Build set_id filter for the poll group query
+                    let set_filter_clause: String = if set_names.is_empty() {
+                        // No sets specified: use all enabled metric sets for this PLC
+                        "ms.enabled = 1".to_string()
+                    } else {
+                        // Use only the requested sets (which we just enabled above)
+                        let placeholders: Vec<String> = set_names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| format!("?{}", i + 2)) // ?2, ?3, ...
+                            .collect();
+                        format!("ms.name IN ({})", placeholders.join(","))
+                    };
+
+                    // Find poll groups for this PLC from the selected metric sets
+                    let pg_query = format!(
+                        "SELECT DISTINCT pg.id, pg.name, pg.period_ms
+                         FROM poll_group pg
+                         JOIN tag t ON t.poll_group_id = pg.id
+                         JOIN metric_set_tag mst ON mst.tag_id = t.id
+                         JOIN metric_set ms ON ms.id = mst.metric_set_id
+                         WHERE t.plc_id = ?1
+                           AND t.enabled = 1
+                           AND t.bad = 0
+                           AND {set_filter_clause}
+                         ORDER BY pg.id"
+                    );
                     let pg_rows: Vec<(i64, String, u64)> = {
-                        let mut stmt = conn.prepare(
-                            "SELECT DISTINCT pg.id, pg.name, pg.period_ms
-                             FROM poll_group pg
-                             JOIN tag t ON t.poll_group_id = pg.id
-                             JOIN metric_set_tag mst ON mst.tag_id = t.id
-                             JOIN metric_set ms ON ms.id = mst.metric_set_id
-                             WHERE t.plc_id = ?1
-                               AND t.enabled = 1
-                               AND t.bad = 0
-                               AND ms.enabled = 1
-                             ORDER BY pg.id",
+                        let mut stmt = conn.prepare(&pg_query)?;
+                        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(plc_id)];
+                        for name in &set_names {
+                            params.push(Box::new(name.clone()));
+                        }
+                        let param_refs: Vec<&dyn rusqlite::ToSql> =
+                            params.iter().map(|b| b.as_ref()).collect();
+                        let rows = stmt.query_map(
+                            rusqlite::params_from_iter(param_refs.iter().copied()),
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )?;
-                        let rows = stmt.query_map(rusqlite::params![plc_id], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                        })?;
                         rows.filter_map(|r| r.ok()).collect()
                     };
 
-                    info!("found {} active poll groups for PLC {}", pg_rows.len(), plc_name);
+                    info!(
+                        "found {} active poll groups for PLC {} (from {} metric set(s))",
+                        pg_rows.len(),
+                        plc_name,
+                        if set_names.is_empty() {
+                            "all enabled".to_string()
+                        } else {
+                            set_names.len().to_string()
+                        },
+                    );
 
                     if pg_rows.is_empty() {
-                        warn!("collection_start {dataset}: no active poll groups for PLC {plc_name}");
+                        warn!(
+                            "collection_start {dataset}: no active poll groups for PLC {plc_name}"
+                        );
                     }
 
                     for (pg_id, _pg_name, period_ms) in &pg_rows {
                         spawn_one_poller(
-                            plcs, pollers, pdu_cache, sample_tx, conn,
-                            plc_id, plc_name, *pg_id, *period_ms,
+                            plcs,
+                            pollers,
+                            pdu_cache,
+                            sample_tx,
+                            conn,
+                            plc_id,
+                            plc_name,
+                            *pg_id,
+                            *period_ms,
+                            overrun_mode,
                         )?;
                     }
 
-                    Ok((true, format!("collection started dataset={dataset} plc={plc_name}")))
+                    Ok((
+                        true,
+                        format!("collection started dataset={dataset} plc={plc_name}"),
+                    ))
                 }
 
                 "collection_stop" => {
-                    let plc_id = req["plc_id"].as_i64()
+                    let plc_id = req["plc_id"]
+                        .as_i64()
                         .ok_or_else(|| anyhow::anyhow!("missing plc_id"))?;
                     let plc_name = req["plc"].as_str().unwrap_or("?");
 
                     // Stop all pollers for this PLC
                     {
                         let mut reg = pollers.lock();
-                        let keys: Vec<(i64, i64)> = reg.keys()
+                        let keys: Vec<(i64, i64)> = reg
+                            .keys()
                             .filter(|(pid, _)| *pid == plc_id)
                             .copied()
                             .collect();
@@ -842,13 +1228,14 @@ fn execute_command(
                     Ok((true, format!("collection stopped for PLC {plc_name}")))
                 }
 
-                other => Ok((false, format!("unknown control action '{other}'")))
+                other => Ok((false, format!("unknown control action '{other}'"))),
             }
         }
 
-        Query => {
-            Ok((false, "server cannot execute SQL queries, use CLI directly".into()))
-        }
+        Query => Ok((
+            false,
+            "server cannot execute SQL queries, use CLI directly".into(),
+        )),
     }
 }
 
@@ -862,6 +1249,7 @@ fn command_worker(
     pollers: PollerRegistry,
     pdu_cache: PduCache,
     sample_tx: Sender<SampleBatch>,
+    overrun_mode: OverrunMode,
 ) {
     info!("cmd-worker started");
 
@@ -884,13 +1272,24 @@ fn command_worker(
             }
         };
 
-        debug!("cmd-worker: claimed command id={} kind={:?}", cmd.id, cmd.kind);
+        debug!(
+            "cmd-worker: claimed command id={} kind={:?}",
+            cmd.id, cmd.kind
+        );
 
         let result = {
             let conn = db.lock();
             execute_command(
-                &conn, &plcs, &pollers, &pdu_cache, &snapshot, &sample_tx,
-                cmd.id, cmd.kind, &cmd.request_json,
+                &conn,
+                &plcs,
+                &pollers,
+                &pdu_cache,
+                &snapshot,
+                &sample_tx,
+                cmd.id,
+                cmd.kind,
+                &cmd.request_json,
+                overrun_mode,
             )
         };
 
@@ -975,8 +1374,16 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
              target_ms, actual_ms, ok, error, dataset_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
-            ci.plc_id, ci.poll_group_id, ci.seq as i64, ci.started_ts, ci.finished_ts,
-            ci.target_ms as i64, ci.actual_ms, ci.ok as i32, ci.error, dataset_id,
+            ci.plc_id,
+            ci.poll_group_id,
+            ci.seq as i64,
+            ci.started_ts,
+            ci.finished_ts,
+            ci.target_ms as i64,
+            ci.actual_ms,
+            ci.ok as i32,
+            ci.error,
+            dataset_id,
         ],
     )?;
     let cycle_id = conn.last_insert_rowid();
@@ -993,8 +1400,11 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
                 (plc_id, poll_group_id, db_num, byte_offset, byte_len, active)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
-                ci.plc_id, ci.poll_group_id,
-                s.db_num as i64, s.byte_offset as i64, s.byte_len as i64,
+                ci.plc_id,
+                ci.poll_group_id,
+                s.db_num as i64,
+                s.byte_offset as i64,
+                s.byte_len as i64,
                 1i32,
             ],
         )?;
@@ -1028,10 +1438,23 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
         for r in &batch.rollups {
             let p = &r.payload;
             stmt.execute(rusqlite::params![
-                dataset_id, r.tag_id, ci.plc_id, ci.poll_group_id,
-                p.window_start_ts, p.window_end_ts, p.sample_count,
-                p.first_vi, p.last_vi, p.min_vi, p.max_vi, p.delta_vi,
-                p.first_vf, p.last_vf, p.min_vf, p.max_vf, p.delta_vf,
+                dataset_id,
+                r.tag_id,
+                ci.plc_id,
+                ci.poll_group_id,
+                p.window_start_ts,
+                p.window_end_ts,
+                p.sample_count,
+                p.first_vi,
+                p.last_vi,
+                p.min_vi,
+                p.max_vi,
+                p.delta_vi,
+                p.first_vf,
+                p.last_vf,
+                p.min_vf,
+                p.max_vf,
+                p.delta_vf,
             ])?;
         }
     }
@@ -1050,13 +1473,19 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
                 "duration_ms": iv.duration_ms,
             });
             stmt.execute(rusqlite::params![
-                dataset_id, ci.plc_id, cycle_id,
-                iv.end_ts, iv.tag_id, iv.state, details.to_string(),
+                dataset_id,
+                ci.plc_id,
+                cycle_id,
+                iv.end_ts,
+                iv.tag_id,
+                iv.state,
+                details.to_string(),
             ])?;
         }
     }
 
     // Mark localized bad tags (architecture.md: tag.bad = 1 with class+detail)
+    // Then schedule a config apply so the plan is rebuilt without them.
     if !batch.bad_tags.is_empty() {
         for b in &batch.bad_tags {
             conn.execute(
@@ -1064,6 +1493,24 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
                  WHERE id = ?4",
                 rusqlite::params![b.bad_class.to_string(), b.detail, ci.finished_ts, b.tag_id],
             )?;
+            // Schedule plan rebuild for this tag's PLC + poll group
+            let _ = crate::db::config_apply::schedule(
+                conn,
+                ApplyScope::Tag,
+                Some(ci.plc_id),
+                None,
+                None,
+                Some(b.tag_id),
+                &format!("bad_tag id={}", b.tag_id),
+                crate::db::config_apply::PLAN_COOLDOWN_MS,
+                Some(
+                    &serde_json::json!({
+                        "bad_class": b.bad_class.to_string(),
+                        "detail": b.detail,
+                    })
+                    .to_string(),
+                ),
+            );
         }
     }
 
@@ -1076,8 +1523,15 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
         )?;
         for em in &batch.event_markers {
             stmt.execute(rusqlite::params![
-                dataset_id, ci.plc_id, cycle_id,
-                em.ts, em.kind, em.severity, em.tag_id, em.value_i, em.details_json,
+                dataset_id,
+                ci.plc_id,
+                cycle_id,
+                em.ts,
+                em.kind,
+                em.severity,
+                em.tag_id,
+                em.value_i,
+                em.details_json,
             ])?;
         }
     }
@@ -1099,8 +1553,15 @@ fn sample_writer(
     db: Arc<Mutex<Connection>>,
     rx: Receiver<SampleBatch>,
     running: Arc<AtomicBool>,
+    snapshot: Arc<Snapshot>,
 ) {
     info!("sample-writer started");
+
+    // Cache tag metadata so we can update the in-memory snapshot without
+    // hitting SQLite on every poll cycle. Populated lazily from the DB.
+    // Map: tag_id -> (plc_id, name, address, data_type)
+    use std::collections::HashMap;
+    let mut tag_cache: HashMap<i64, (i64, String, String, DataType)> = HashMap::new();
 
     while running.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(500)) {
@@ -1109,6 +1570,10 @@ fn sample_writer(
                 if let Err(e) = write_samples(&conn, &batch) {
                     error!("sample-writer: write error: {e}");
                 }
+                // Update snapshot from every successful poll cycle, regardless
+                // of whether the samples were stored (the snapshot is the live
+                // view for status/API reads — per architecture.md D002).
+                update_snapshot_from_batch(&snapshot, &conn, &mut tag_cache, &batch);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1123,9 +1588,53 @@ fn sample_writer(
         if let Err(e) = write_samples(&conn, &batch) {
             error!("sample-writer: drain write error: {e}");
         }
+        update_snapshot_from_batch(&snapshot, &conn, &mut tag_cache, &batch);
     }
 
     info!("sample-writer stopped");
+}
+
+/// Update the in-memory snapshot with tag values from a poll batch.
+/// Populates the tag metadata cache lazily from the database.
+fn update_snapshot_from_batch(
+    snapshot: &Arc<Snapshot>,
+    conn: &Connection,
+    tag_cache: &mut HashMap<i64, (i64, String, String, DataType)>,
+    batch: &SampleBatch,
+) {
+    let plc_id = batch.plc_id;
+    for sample in &batch.samples {
+        // Lazy-load tag metadata into cache
+        if !tag_cache.contains_key(&sample.tag_id) {
+            if let Ok((name, address, dt_str)) = conn.query_row(
+                "SELECT name, address, data_type FROM tag WHERE id = ?1",
+                rusqlite::params![sample.tag_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            ) {
+                if let Ok(dt) = dt_str.parse::<DataType>() {
+                    tag_cache.insert(sample.tag_id, (plc_id, name, address, dt));
+                }
+            }
+        }
+        if let Some((plc_id, name, address, dt)) = tag_cache.get(&sample.tag_id).cloned() {
+            snapshot.update(
+                sample.tag_id,
+                plc_id,
+                &name,
+                &address,
+                dt,
+                sample.vi,
+                sample.vf,
+                sample.ts,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,6 +1648,8 @@ pub struct ServerConfig {
     pub http_bind: Option<String>,
     /// If true, open the platform-native control window (Windows only).
     pub control_window: bool,
+    /// Overrun behavior: SkipMissedTicks (default) or Strict.
+    pub overrun_mode: OverrunMode,
 }
 
 /// The main s7trace server. Orchestrates all workers and pollers.
@@ -1151,6 +1662,7 @@ pub struct Server {
     pdu_cache: PduCache,
     http_bind: Option<String>,
     control_window: bool,
+    overrun_mode: OverrunMode,
 }
 
 impl Server {
@@ -1171,6 +1683,7 @@ impl Server {
             pdu_cache: Arc::new(Mutex::new(HashMap::new())),
             http_bind: config.http_bind,
             control_window: config.control_window,
+            overrun_mode: config.overrun_mode,
         })
     }
 
@@ -1179,16 +1692,27 @@ impl Server {
     /// safe default (240) if the PLC is not reachable at startup.
     fn init_plc_clients(&self) -> Result<(), anyhow::Error> {
         let conn = self.db.lock();
-        let mut stmt = conn.prepare("SELECT id, name, host, COALESCE(rack, 0), COALESCE(slot, 0) FROM plc ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, host, COALESCE(rack, 0), COALESCE(slot, 0) FROM plc ORDER BY id",
+        )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?;
 
         let mut reg = self.plcs.lock();
         let mut pdu = self.pdu_cache.lock();
         for row in rows {
             let (plc_id, plc_name, host, rack, slot): (i64, String, String, i64, i64) = row?;
-            info!("initializing PLC '{}' (id={}) at {} (rack={}, slot={})", plc_name, plc_id, host, rack, slot);
+            info!(
+                "initializing PLC '{}' (id={}) at {} (rack={}, slot={})",
+                plc_name, plc_id, host, rack, slot
+            );
             let client = create_plc_client(&plc_name, &host, rack as u16, slot as u16);
 
             // Try to connect and discover PDU length. Failure is non-fatal
@@ -1204,7 +1728,10 @@ impl Server {
                         Err(e) => warn!("PLC {}: pdu_len() failed: {} (using 240)", plc_name, e),
                     }
                 } else {
-                    warn!("PLC {}: connect failed at startup; will retry in poller", plc_name);
+                    warn!(
+                        "PLC {}: connect failed at startup; will retry in poller",
+                        plc_name
+                    );
                     pdu.insert(plc_id, 240);
                 }
             }
@@ -1222,15 +1749,76 @@ impl Server {
         // Init PLC clients
         self.init_plc_clients()?;
 
+        // Startup revalidation of bad tags (per architecture.md:195)
+        {
+            let conn = self.db.lock();
+            let bad_tags: Vec<(i64, i64)> = conn
+                .prepare("SELECT id, plc_id FROM tag WHERE bad = 1")
+                .ok()
+                .and_then(|mut s| {
+                    s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                        .ok()
+                        .map(|it| it.filter_map(|x| x.ok()).collect())
+                })
+                .unwrap_or_default();
+            if !bad_tags.is_empty() {
+                info!("startup: revalidating {} bad tag(s)", bad_tags.len());
+                let reg = self.plcs.lock();
+                for (tag_id, plc_id) in &bad_tags {
+                    if let Some(client_arc) = reg.get(plc_id) {
+                        match db::validation::validate_tag(&conn, client_arc, *tag_id) {
+                            Ok(result) => {
+                                if result.ok {
+                                    info!(
+                                        "startup: tag {} revalidated OK, clearing bad flag",
+                                        tag_id
+                                    );
+                                    let _ = db::config_apply::schedule(
+                                        &conn,
+                                        ApplyScope::Tag,
+                                        Some(*plc_id),
+                                        None,
+                                        None,
+                                        Some(*tag_id),
+                                        &format!("startup_revalidate tag_id={tag_id}"),
+                                        db::config_apply::PLAN_COOLDOWN_MS,
+                                        None,
+                                    );
+                                } else {
+                                    info!(
+                                        "startup: tag {} still bad (class={:?} detail={:?})",
+                                        tag_id, result.bad_class, result.detail
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("startup: validate tag {} failed: {e}", tag_id);
+                            }
+                        }
+                    } else {
+                        warn!(
+                            "startup: no PLC client for plc_id={} tag_id={}, skipping revalidation",
+                            plc_id, tag_id
+                        );
+                    }
+                }
+                drop(reg);
+            } else {
+                info!("startup: no bad tags to revalidate");
+            }
+            drop(conn);
+        }
+
         // Channel for poller samples
         let (sample_tx, sample_rx) = mpsc::channel::<SampleBatch>();
 
-        // Start sample writer thread
+        // Start sample writer thread (with snapshot for live value updates)
         let db_writer = self.db.clone();
         let running_writer = self.running.clone();
+        let snapshot_writer = self.snapshot.clone();
         std::thread::Builder::new()
             .name("sample-writer".into())
-            .spawn(move || sample_writer(db_writer, sample_rx, running_writer))?;
+            .spawn(move || sample_writer(db_writer, sample_rx, running_writer, snapshot_writer))?;
 
         // Start command worker thread (with shared registries)
         let db_cmd = self.db.clone();
@@ -1240,10 +1828,20 @@ impl Server {
         let pollers_cmd = self.pollers.clone();
         let pdu_cache_cmd = self.pdu_cache.clone();
         let sample_tx_cmd = sample_tx.clone();
+        let overrun_cmd = self.overrun_mode;
         std::thread::Builder::new()
             .name("cmd-worker".into())
             .spawn(move || {
-                command_worker(db_cmd, running_cmd, snapshot_cmd, plcs_cmd, pollers_cmd, pdu_cache_cmd, sample_tx_cmd);
+                command_worker(
+                    db_cmd,
+                    running_cmd,
+                    snapshot_cmd,
+                    plcs_cmd,
+                    pollers_cmd,
+                    pdu_cache_cmd,
+                    sample_tx_cmd,
+                    overrun_cmd,
+                );
             })?;
 
         // Start config apply worker thread (now with registries for plan rebuild)
@@ -1253,10 +1851,19 @@ impl Server {
         let pollers_apply = self.pollers.clone();
         let pdu_cache_apply = self.pdu_cache.clone();
         let sample_tx_apply = sample_tx.clone();
+        let overrun_apply = self.overrun_mode;
         std::thread::Builder::new()
             .name("apply-worker".into())
             .spawn(move || {
-                apply_worker(db_apply, running_apply, plcs_apply, pollers_apply, pdu_cache_apply, sample_tx_apply);
+                apply_worker(
+                    db_apply,
+                    running_apply,
+                    plcs_apply,
+                    pollers_apply,
+                    pdu_cache_apply,
+                    sample_tx_apply,
+                    overrun_apply,
+                );
             })?;
 
         // Optionally start HTTP API
@@ -1298,16 +1905,28 @@ impl Server {
             if tick % 6 == 0 {
                 let conn = self.db.lock();
                 let tag_count: i64 = conn
-                    .query_row("SELECT COUNT(*) FROM tag WHERE enabled = 1 AND bad = 0", [], |r| r.get(0))
+                    .query_row(
+                        "SELECT COUNT(*) FROM tag WHERE enabled = 1 AND bad = 0",
+                        [],
+                        |r| r.get(0),
+                    )
                     .unwrap_or(0);
                 let bad_count: i64 = conn
                     .query_row("SELECT COUNT(*) FROM tag WHERE bad = 1", [], |r| r.get(0))
                     .unwrap_or(0);
                 let queue_count: i64 = conn
-                    .query_row("SELECT COUNT(*) FROM command_request WHERE state = 'pending'", [], |r| r.get(0))
+                    .query_row(
+                        "SELECT COUNT(*) FROM command_request WHERE state = 'pending'",
+                        [],
+                        |r| r.get(0),
+                    )
                     .unwrap_or(0);
                 let active_ds: i64 = conn
-                    .query_row("SELECT COUNT(*) FROM dataset WHERE state = 'active'", [], |r| r.get(0))
+                    .query_row(
+                        "SELECT COUNT(*) FROM dataset WHERE state = 'active'",
+                        [],
+                        |r| r.get(0),
+                    )
                     .unwrap_or(0);
                 let poller_count = self.pollers.lock().len();
                 drop(conn);

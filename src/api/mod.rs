@@ -16,6 +16,7 @@
 //! keep dependencies minimal and avoid pulling in TLS / async runtime.
 
 use crate::db::command_queue::{self, CommandKind};
+use crate::types::now_us;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -33,7 +34,10 @@ pub fn serve(db: Arc<Mutex<Connection>>, bind_addr: String) -> std::io::Result<(
 
 /// Like `serve`, but takes a pre-bound TcpListener (useful for tests
 /// that want to discover the bound port without a race).
-pub fn serve_with_listener(listener: TcpListener, db: Arc<Mutex<Connection>>) -> std::io::Result<()> {
+pub fn serve_with_listener(
+    listener: TcpListener,
+    db: Arc<Mutex<Connection>>,
+) -> std::io::Result<()> {
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
@@ -114,7 +118,15 @@ fn handle_conn(mut stream: TcpStream, db: Arc<Mutex<Connection>>) -> std::io::Re
     stream.write_all(&payload)?;
     stream.flush()?;
 
-    log::debug!("http {} {} {} -> {} ({}b) peer={:?}", method, target, "", resp.status, payload.len(), peer);
+    log::debug!(
+        "http {} {} {} -> {} ({}b) peer={:?}",
+        method,
+        target,
+        "",
+        resp.status,
+        payload.len(),
+        peer
+    );
     Ok(())
 }
 
@@ -227,7 +239,10 @@ fn route(
 // ---------------------------------------------------------------------------
 
 fn qparam<'a>(query: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    query.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
+    query
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.as_str())
 }
 
 fn param_owned<'a>(query: &'a [(String, String)], key: &str) -> Option<String> {
@@ -265,17 +280,119 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
     let conn = db.lock();
 
     let plcs: Vec<serde_json::Value> = conn
-        .prepare("SELECT name, host, enabled, last_ok_ts, last_error, connectivity FROM plc")
+        .prepare("SELECT id, name, host, enabled, last_ok_ts, last_error, connectivity FROM plc")
         .ok()
         .and_then(|mut s| {
             s.query_map([], |r| {
+                let plc_id: i64 = r.get(0)?;
+                let plc_name: String = r.get(1)?;
+
+                // Per-PLC: poll groups with latest cycle stats
+                let poll_groups: Vec<serde_json::Value> = conn
+                    .prepare(
+                        "SELECT pg.name, pg.period_ms,
+                            COALESCE(latest.actual_ms, 0),
+                            COALESCE(latest.overrun_count, 0)
+                         FROM poll_group pg
+                         JOIN tag t ON t.poll_group_id = pg.id
+                         LEFT JOIN (
+                            SELECT pc.poll_group_id,
+                                AVG(pc.actual_ms) as actual_ms,
+                                COUNT(CASE WHEN pc.actual_ms > pc.target_ms THEN 1 END) as overrun_count
+                            FROM poll_cycle pc
+                            WHERE pc.plc_id = ?1
+                              AND pc.finished_ts > ?2
+                            GROUP BY pc.poll_group_id
+                         ) latest ON latest.poll_group_id = pg.id
+                         WHERE t.plc_id = ?1 AND t.enabled = 1
+                         GROUP BY pg.id
+                         ORDER BY pg.id",
+                    )
+                    .ok()
+                    .and_then(|mut stmt| {
+                        let cutoff = now_us() - 3_600_000_000; // last hour
+                        stmt.query_map(rusqlite::params![plc_id, cutoff], |row| {
+                            Ok(serde_json::json!({
+                                "name": row.get::<_, String>(0)?,
+                                "target_ms": row.get::<_, i64>(1)?,
+                                "actual_ms": row.get::<_, f64>(2)?,
+                                "overrun_count": row.get::<_, i64>(3)?,
+                            }))
+                        })
+                        .ok()
+                        .map(|it| it.filter_map(|x| x.ok()).collect())
+                    })
+                    .unwrap_or_default();
+
+                // Per-PLC: metric sets with tag counts
+                let metric_sets: Vec<serde_json::Value> = conn
+                    .prepare(
+                        "SELECT ms.name, ms.enabled,
+                            (SELECT COUNT(*) FROM metric_set_tag mst
+                             JOIN tag t ON t.id = mst.tag_id
+                             WHERE mst.metric_set_id = ms.id) as tags_total,
+                            (SELECT COUNT(*) FROM metric_set_tag mst
+                             JOIN tag t ON t.id = mst.tag_id
+                             WHERE mst.metric_set_id = ms.id AND t.enabled = 1 AND t.bad = 0) as tags_active,
+                            (SELECT COUNT(*) FROM metric_set_tag mst
+                             JOIN tag t ON t.id = mst.tag_id
+                             WHERE mst.metric_set_id = ms.id AND t.bad = 1) as tags_bad
+                         FROM metric_set ms
+                         WHERE ms.plc_id = ?1
+                         ORDER BY ms.id",
+                    )
+                    .ok()
+                    .and_then(|mut stmt| {
+                        stmt.query_map(rusqlite::params![plc_id], |row| {
+                            Ok(serde_json::json!({
+                                "name": row.get::<_, String>(0)?,
+                                "enabled": row.get::<_, i64>(1)? != 0,
+                                "tags_total": row.get::<_, i64>(2)?,
+                                "tags_active": row.get::<_, i64>(3)?,
+                                "tags_bad": row.get::<_, i64>(4)?,
+                            }))
+                        })
+                        .ok()
+                        .map(|it| it.filter_map(|x| x.ok()).collect())
+                    })
+                    .unwrap_or_default();
+
+                // Per-PLC: bad tags
+                let bad_tags: Vec<serde_json::Value> = conn
+                    .prepare(
+                        "SELECT t.id, t.name, t.address, t.bad_class, t.bad_detail, t.last_error_ts
+                         FROM tag t
+                         WHERE t.plc_id = ?1 AND t.bad = 1
+                         ORDER BY t.id",
+                    )
+                    .ok()
+                    .and_then(|mut stmt| {
+                        stmt.query_map(rusqlite::params![plc_id], |row| {
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, i64>(0)?,
+                                "name": row.get::<_, String>(1)?,
+                                "address": row.get::<_, String>(2)?,
+                                "bad_class": row.get::<_, Option<String>>(3)?,
+                                "bad_detail": row.get::<_, Option<String>>(4)?,
+                                "last_error_ts": row.get::<_, Option<i64>>(5)?,
+                            }))
+                        })
+                        .ok()
+                        .map(|it| it.filter_map(|x| x.ok()).collect())
+                    })
+                    .unwrap_or_default();
+
                 Ok(serde_json::json!({
-                    "name": r.get::<_, String>(0)?,
-                    "host": r.get::<_, String>(1)?,
-                    "enabled": r.get::<_, i64>(2)? != 0,
-                    "last_ok_ts": r.get::<_, Option<i64>>(3)?,
-                    "last_error": r.get::<_, Option<String>>(4)?,
-                    "connectivity": r.get::<_, String>(5)?,
+                    "name": plc_name,
+                    "host": r.get::<_, String>(2)?,
+                    "enabled": r.get::<_, i64>(3)? != 0,
+                    "connected": r.get::<_, String>(6)? == "online",
+                    "last_ok_ts": r.get::<_, Option<i64>>(4)?,
+                    "last_error": r.get::<_, Option<String>>(5)?,
+                    "connectivity": r.get::<_, String>(6)?,
+                    "poll_groups": poll_groups,
+                    "metric_sets": metric_sets,
+                    "bad_tags": bad_tags,
                 }))
             })
             .ok()
@@ -283,7 +400,7 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
         })
         .unwrap_or_default();
 
-    let bad_tags: i64 = conn
+    let bad_tags_total: i64 = conn
         .query_row("SELECT COUNT(*) FROM tag WHERE bad = 1", [], |r| r.get(0))
         .unwrap_or(0);
     let active_tags: i64 = conn
@@ -314,7 +431,7 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
     Response::json(serde_json::json!({
         "service": "s7trace",
         "plcs": plcs,
-        "tags": { "active": active_tags, "bad": bad_tags },
+        "tags": { "active": active_tags, "bad": bad_tags_total },
         "command_queue": { "pending": pending_count, "running": running_count },
         "config_apply": { "pending": config_apply_pending },
     }))
@@ -396,16 +513,20 @@ fn handle_sample(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Res
     let tag_id: Option<i64> = if let Ok(id) = tag.parse::<i64>() {
         Some(id)
     } else {
-        conn.query_row("SELECT id FROM tag WHERE name = ?1", rusqlite::params![tag], |r| r.get(0)).ok()
+        conn.query_row(
+            "SELECT id FROM tag WHERE name = ?1",
+            rusqlite::params![tag],
+            |r| r.get(0),
+        )
+        .ok()
     };
     let tag_id = match tag_id {
         Some(i) => i,
         None => return Response::err(404, "tag not found"),
     };
 
-    let mut sql = String::from(
-        "SELECT ts, vi, vf, span_id, '' AS reason FROM sample WHERE tag_id = ?1",
-    );
+    let mut sql =
+        String::from("SELECT ts, vi, vf, span_id, '' AS reason FROM sample WHERE tag_id = ?1");
     if since_ts.is_some() {
         sql.push_str(" AND ts >= ?");
     }
@@ -468,7 +589,12 @@ fn handle_rollup(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Res
     let tag_id: Option<i64> = if let Ok(id) = tag.parse::<i64>() {
         Some(id)
     } else {
-        conn.query_row("SELECT id FROM tag WHERE name = ?1", rusqlite::params![tag], |r| r.get(0)).ok()
+        conn.query_row(
+            "SELECT id FROM tag WHERE name = ?1",
+            rusqlite::params![tag],
+            |r| r.get(0),
+        )
+        .ok()
     };
     let tag_id = match tag_id {
         Some(i) => i,
@@ -628,23 +754,21 @@ fn handle_command_get(db: &Arc<Mutex<Connection>>, id: i64) -> Response {
     let cmd = command_queue::get_request(&conn, id).ok().flatten();
     let res = command_queue::get_result(&conn, id).ok().flatten();
     match cmd {
-        Some(c) => {
-            Response::json(serde_json::json!({
-                "command": {
-                    "id": c.id,
-                    "kind": format!("{:?}", c.kind),
-                    "state": format!("{:?}", c.state),
-                    "plc_id": c.plc_id,
-                    "request_json": c.request_json,
-                    "created_ts": c.created_ts,
-                },
-                "result": res.map(|r| serde_json::json!({
-                    "ok": r.ok,
-                    "result_json": r.result_json,
-                    "error": r.error,
-                })),
-            }))
-        }
+        Some(c) => Response::json(serde_json::json!({
+            "command": {
+                "id": c.id,
+                "kind": format!("{:?}", c.kind),
+                "state": format!("{:?}", c.state),
+                "plc_id": c.plc_id,
+                "request_json": c.request_json,
+                "created_ts": c.created_ts,
+            },
+            "result": res.map(|r| serde_json::json!({
+                "ok": r.ok,
+                "result_json": r.result_json,
+                "error": r.error,
+            })),
+        })),
         None => Response::err(404, "command not found"),
     }
 }
@@ -677,7 +801,8 @@ fn handle_command_post(db: &Arc<Mutex<Connection>>, body: &[u8]) -> Response {
             status: 201,
             body: serde_json::to_string_pretty(&serde_json::json!({
                 "id": id, "kind": format!("{:?}", kind), "state": "pending",
-            })).unwrap_or_default(),
+            }))
+            .unwrap_or_default(),
             content_type: "application/json".into(),
         },
         Err(e) => Response::err(500, &format!("enqueue: {e}")),
@@ -726,16 +851,15 @@ mod tests {
              INSERT INTO tag (plc_id, name, address, data_type, poll_group_id,
                               db_num, byte_offset, byte_size, created_ts, updated_ts)
              VALUES (1, 'tagA', 'DB1.DBW0', 'i16', 1, 1, 0, 2, 1000000, 1000000);",
-        ).expect("seed");
+        )
+        .expect("seed");
         Arc::new(Mutex::new(conn))
     }
 
     fn http_get(addr: &str, path: &str) -> String {
         let mut s = TcpStream::connect(addr).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(2))).ok();
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        );
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         s.write_all(req.as_bytes()).expect("write");
         let mut buf = String::new();
         s.read_to_string(&mut buf).expect("read");
@@ -778,7 +902,8 @@ mod tests {
             }
         });
         // Wait for the listener to come up.
-        rx.recv_timeout(Duration::from_secs(2)).expect("server failed to start")
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("server failed to start")
     }
 
     #[test]
@@ -819,7 +944,10 @@ mod tests {
         assert!(resp.contains("201 Created"), "post: {resp}");
         // Extract id
         let id_start = resp.find("\"id\":").expect("id field") + 5;
-        let id_end = resp[id_start..].find(',').map(|i| id_start + i).unwrap_or(resp.len());
+        let id_end = resp[id_start..]
+            .find(',')
+            .map(|i| id_start + i)
+            .unwrap_or(resp.len());
         let id: i64 = resp[id_start..id_end].trim().parse().expect("parse id");
 
         // GET /v1/command/{id}

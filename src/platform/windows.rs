@@ -27,11 +27,12 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-    DrawTextW, EndPaint, FillRect, GetSysColorBrush, InvalidateRect, SelectObject, SetBkMode,
-    DT_LEFT, DT_NOPREFIX, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
+    GetSysColorBrush, GetTextMetricsW, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
+    DT_LEFT, DT_NOPREFIX, FW_NORMAL, PAINTSTRUCT, SRCCOPY, TEXTMETRICW,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -39,7 +40,7 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetMessageW, GetSystemMetrics, LoadIconW, PostQuitMessage, RegisterClassExW,
+    GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, LoadIconW, PostQuitMessage, RegisterClassExW,
     SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
     CS_HREDRAW, CS_VREDRAW, HMENU, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN,
     SM_CYSCREEN, SW_HIDE, SW_SHOW, TPM_RIGHTBUTTON, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
@@ -90,6 +91,11 @@ struct AppState {
     hwnd_button_min: HWND,
     hwnd_button_exit: HWND,
     hmenu_tray: HMENU,
+    font_header: isize, // Segoe UI 11pt
+    font_body: isize,   // Consolas 10pt
+    font_small: isize,  // Segoe UI 9pt
+    /// Measured line height of font_body (Consolas), set in WM_CREATE.
+    body_line_h: i32,
     /// Cached status rendered on the next paint. Updated by the timer.
     cached_status: Mutex<StatusSnapshot>,
     /// Flag set when the user picked Exit so the run loop returns.
@@ -156,8 +162,8 @@ pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
         // Center the window
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let win_w = 640;
-        let win_h = 480;
+        let win_w = 620;
+        let win_h = 380;
         let x = (screen_w - win_w) / 2;
         let y = (screen_h - win_h) / 2;
 
@@ -174,6 +180,10 @@ pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
             hwnd_button_min: std::ptr::null_mut(),
             hwnd_button_exit: std::ptr::null_mut(),
             hmenu_tray: std::ptr::null_mut(),
+            font_header: 0,
+            font_body: 0,
+            font_small: 0,
+            body_line_h: 16,
             cached_status: Mutex::new(StatusSnapshot::default()),
             exit_requested: AtomicBool::new(false),
             selected_row: Mutex::new(-1),
@@ -258,17 +268,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Buttons
             let hinstance = GetModuleHandleW(std::ptr::null());
             let text = |s: &str| win_string(s);
-            let bw = 140;
-            let bh = 28;
-            let pad = 8;
-            let base_y = 420;
+            let bw = 80;
+            let bh = 26;
+            let pad = 6;
+            let mut crect: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut crect);
+            let base_y = crect.bottom - bh - 10;
             let total_w = bw * 4 + pad * 3;
-            let win_w = 640;
-            let start_x = (win_w - total_w) / 2;
+            let start_x = (crect.right - total_w) / 2;
             st.hwnd_button_start = CreateWindowExW(
                 0,
                 text("BUTTON").as_ptr(),
-                text("Start Collection").as_ptr(),
+                text("Start").as_ptr(),
                 WS_VISIBLE | WS_OVERLAPPED | WS_CAPTION,
                 start_x,
                 base_y,
@@ -282,7 +293,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             st.hwnd_button_stop = CreateWindowExW(
                 0,
                 text("BUTTON").as_ptr(),
-                text("Stop Collection").as_ptr(),
+                text("Stop").as_ptr(),
                 WS_VISIBLE | WS_OVERLAPPED,
                 start_x + (bw + pad),
                 base_y,
@@ -296,7 +307,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             st.hwnd_button_min = CreateWindowExW(
                 0,
                 text("BUTTON").as_ptr(),
-                text("Minimize to Tray").as_ptr(),
+                text("Tray").as_ptr(),
                 WS_VISIBLE | WS_OVERLAPPED,
                 start_x + (bw + pad) * 2,
                 base_y,
@@ -310,7 +321,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             st.hwnd_button_exit = CreateWindowExW(
                 0,
                 text("BUTTON").as_ptr(),
-                text("Exit Server").as_ptr(),
+                text("Exit").as_ptr(),
                 WS_VISIBLE | WS_OVERLAPPED,
                 start_x + (bw + pad) * 3,
                 base_y,
@@ -364,6 +375,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
             // Refresh timer (1s)
             SetTimer(hwnd, IDT_REFRESH, 1000, None);
+
+            // Create fonts
+            let segoe = text("Segoe UI");
+            let consolas = text("Consolas");
+            st.font_header = CreateFontW(
+                -16, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 5, 0, segoe.as_ptr(),
+            ) as isize;
+            st.font_body = CreateFontW(
+                -14, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 5, 0x31, consolas.as_ptr(),
+            ) as isize;
+            st.font_small = CreateFontW(
+                -12, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 5, 0, segoe.as_ptr(),
+            ) as isize;
+
+            // Measure real line height of font_body
+            let body_dc = GetDC(hwnd);
+            if !body_dc.is_null() {
+                let old_font = SelectObject(body_dc, st.font_body as _);
+                let mut tm: TEXTMETRICW = std::mem::zeroed();
+                if GetTextMetricsW(body_dc, &mut tm) != 0 {
+                    let h = (tm.tmHeight + tm.tmExternalLeading) as i32;
+                    st.body_line_h = if h > 0 { h } else { 16 };
+                }
+                SelectObject(body_dc, old_font);
+                ReleaseDC(hwnd, body_dc);
+            }
             0
         }
         WM_TIMER => {
@@ -379,8 +416,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let y_signed = if y > 32767 { y - 65536 } else { y };
             let st = state_from_ptr();
             let snap = st.cached_status.lock();
-            let row_top = 56;
-            let row_height = 15;
+            let row_top = 50 + 2 * st.body_line_h; // first data row Y
+            let row_height = st.body_line_h;
             let rel = y_signed - row_top;
             let idx = if rel >= 0 && rel < snap.rows.len() as i32 * row_height {
                 (rel / row_height) as isize
@@ -424,6 +461,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         WM_DESTROY => {
+            let st = state_from_ptr();
+            if st.font_header != 0 {
+                DeleteObject(st.font_header as _);
+            }
+            if st.font_body != 0 {
+                DeleteObject(st.font_body as _);
+            }
+            if st.font_small != 0 {
+                DeleteObject(st.font_small as _);
+            }
             PostQuitMessage(0);
             0
         }
@@ -708,19 +755,13 @@ fn paint(hwnd: HWND) {
         }
 
         // Double-buffer: draw to memory DC, then BitBlt to screen.
-        // This eliminates flicker from repeated GDI text drawing.
         let mem_dc = CreateCompatibleDC(hdc);
         let bmp = CreateCompatibleBitmap(hdc, cx, cy);
         let old_bmp = SelectObject(mem_dc, bmp);
 
         // Fill background with button face color
         let bg_brush = GetSysColorBrush(15); // COLOR_BTNFACE
-        let mut bg_rect = windows_sys::Win32::Foundation::RECT {
-            left: 0,
-            top: 0,
-            right: cx,
-            bottom: cy,
-        };
+        let mut bg_rect = RECT { left: 0, top: 0, right: cx, bottom: cy };
         FillRect(mem_dc, &mut bg_rect, bg_brush);
 
         // Transparent background for all text
@@ -734,60 +775,40 @@ fn paint(hwnd: HWND) {
             uptime.as_secs() % 60,
         );
 
-        // Top status line
+        // -- Line 1: title with status dot --
+        SelectObject(mem_dc, st.font_header as _);
         let header = win_string(&format!(
-            "s7trace  PLCs:{}  Datasets:{}  Status: {}  Uptime {}",
-            snap.plc_count,
-            snap.active_dataset_count,
-            if snap.server_running {
-                "RUNNING"
-            } else {
-                "IDLE"
-            },
+            "s7trace  {}  {} · {}",
+            if snap.server_running { "\u{25CF}" } else { "\u{25CB}" },
+            if snap.server_running { "running" } else { "idle" },
             uptime_str,
         ));
-        let mut header_rect = windows_sys::Win32::Foundation::RECT {
-            left: 10,
-            top: 8,
-            right: 620,
-            bottom: 30,
-        };
-        DrawTextW(
-            mem_dc,
-            header.as_ptr(),
-            -1,
-            &mut header_rect,
-            DT_LEFT | DT_NOPREFIX,
-        );
+        let mut hr = RECT { left: 10, top: 8, right: cx, bottom: 28 };
+        DrawTextW(mem_dc, header.as_ptr(), -1, &mut hr, DT_LEFT | DT_NOPREFIX);
 
-        // Counts line
-        let counts = win_string(&format!(
-            "Queue: pending={} running={}  config-apply pending={}",
-            snap.command_queue_pending, snap.command_queue_running, snap.config_apply_pending,
+        // -- Line 2: stats --
+        SelectObject(mem_dc, st.font_small as _);
+        let stats = win_string(&format!(
+            "plc {}  datasets {}  queue {}·{}  cfg {}",
+            snap.plc_count,
+            snap.active_dataset_count,
+            snap.command_queue_pending,
+            snap.command_queue_running,
+            snap.config_apply_pending,
         ));
-        let mut counts_rect = windows_sys::Win32::Foundation::RECT {
-            left: 10,
-            top: 34,
-            right: 620,
-            bottom: 50,
-        };
-        DrawTextW(
-            mem_dc,
-            counts.as_ptr(),
-            -1,
-            &mut counts_rect,
-            DT_LEFT | DT_NOPREFIX,
-        );
+        let mut sr = RECT { left: 10, top: 28, right: cx, bottom: 44 };
+        DrawTextW(mem_dc, stats.as_ptr(), -1, &mut sr, DT_LEFT | DT_NOPREFIX);
 
-        // Dashboard table
+        // -- Divider --
+        let mut div = RECT { left: 10, top: 46, right: cx - 10, bottom: 47 };
+        FillRect(mem_dc, &mut div, GetSysColorBrush(14)); // COLOR_GRAYTEXT
+
+        // -- Table --
+        let body_lh = st.body_line_h;
+        SelectObject(mem_dc, st.font_body as _);
         let mut table_text =
-            String::from("PLC            Task (metric set)     Dataset            State    Tags\n");
-        table_text
-            .push_str("----------------------------------------------------------------------\n");
-
-        let row_top = 56;
-        let row_height = 15;
-        let table_bottom = row_top + snap.rows.len() as i32 * row_height;
+            String::from("PLC             TASK                   DATASET            ST     TAGS\n");
+        table_text.push_str("─────────────────────────────────────────────────────────────────────\n");
 
         for (i, row) in snap.rows.iter().enumerate() {
             let state = row_state(row);
@@ -796,73 +817,45 @@ fn paint(hwnd: HWND) {
             let set_str = row.metric_set_name.as_deref().unwrap_or("---");
             let prefix = if sel == i as isize { "> " } else { "  " };
             table_text.push_str(&format!(
-                "{}{:<13} {:<20} {:<18} {:<7} {}\n",
-                prefix, row.plc_name, set_str, ds_str, state, tags_str
+                "{}{:<12} {:<20} {:<18} {:<6} {}\n",
+                prefix, row.plc_name, set_str, ds_str, state, tags_str,
             ));
         }
 
-        let mut table_rect = windows_sys::Win32::Foundation::RECT {
-            left: 10,
-            top: row_top,
-            right: 620,
-            bottom: table_bottom + 4,
-        };
-        let table_w = win_string(&table_text);
-        DrawTextW(
-            mem_dc,
-            table_w.as_ptr(),
-            -1,
-            &mut table_rect,
-            DT_LEFT | DT_NOPREFIX,
-        );
+        let table_top = 50;
+        let content_bottom = table_top + (2 + snap.rows.len() as i32) * body_lh;
 
-        // Selection info line
+        let mut tr = RECT { left: 10, top: table_top, right: cx - 10, bottom: cy };
+        let tw = win_string(&table_text);
+        DrawTextW(mem_dc, tw.as_ptr(), -1, &mut tr, DT_LEFT | DT_NOPREFIX);
+
+        // -- Selected info --
+        SelectObject(mem_dc, st.font_small as _);
         let info_text = if sel >= 0 && (sel as usize) < snap.rows.len() {
             let r = &snap.rows[sel as usize];
             let set_str = r.metric_set_name.as_deref().unwrap_or("(no sets)");
-            format!("Selected: {} / {}", r.plc_name, set_str)
+            format!("selected   {} · {}", r.plc_name, set_str)
         } else {
-            String::from("Click a row to select")
+            String::from("click a row to select")
         };
-        let info_y = table_bottom + 6;
-        let mut info_rect = windows_sys::Win32::Foundation::RECT {
-            left: 10,
-            top: info_y,
-            right: 620,
-            bottom: info_y + 18,
-        };
-        let info_w = win_string(&info_text);
-        DrawTextW(
-            mem_dc,
-            info_w.as_ptr(),
-            -1,
-            &mut info_rect,
-            DT_LEFT | DT_NOPREFIX,
-        );
+        let info_y = content_bottom + 4;
+        let iw = win_string(&info_text);
+        let mut ir = RECT { left: 10, top: info_y, right: cx - 10, bottom: info_y + 16 };
+        DrawTextW(mem_dc, iw.as_ptr(), -1, &mut ir, DT_LEFT | DT_NOPREFIX);
 
-        // Last events
-        let mut ev_text = String::from("Last events:\n");
-        for e in &snap.last_events {
+        // -- Events --
+        let ev_y = info_y + 20;
+        SelectObject(mem_dc, st.font_body as _);
+        let mut ev_text = String::from("events\n");
+        for e in snap.last_events.iter().take(5) {
             ev_text.push_str(&format!("  {e}\n"));
         }
         if let Some(r) = &snap.last_command_result {
             ev_text.push_str(&format!("  [last cmd] {r}\n"));
         }
-        let ev_y = info_y + 20;
-        let mut ev_rect = windows_sys::Win32::Foundation::RECT {
-            left: 10,
-            top: ev_y,
-            right: 620,
-            bottom: ev_y + 120,
-        };
-        let ev_w = win_string(&ev_text);
-        DrawTextW(
-            mem_dc,
-            ev_w.as_ptr(),
-            -1,
-            &mut ev_rect,
-            DT_LEFT | DT_NOPREFIX,
-        );
+        let evw = win_string(&ev_text);
+        let mut evr = RECT { left: 10, top: ev_y, right: cx - 10, bottom: ev_y + 120 };
+        DrawTextW(mem_dc, evw.as_ptr(), -1, &mut evr, DT_LEFT | DT_NOPREFIX);
 
         // Blit the memory DC to the screen DC in one shot
         BitBlt(hdc, 0, 0, cx, cy, mem_dc, 0, 0, SRCCOPY);

@@ -19,23 +19,23 @@ Recommended command families:
 
 ```text
 s7trace sql              # read-only SQL, default output json/jsonl/table
-s7trace command list     # inspect queued commands
-s7trace command wait     # wait for queued command completion
-s7trace command result   # print stored command result
-s7trace set create       # create a named activatable metric set
-s7trace set add-tag      # add a tag to a metric set
-s7trace set enable       # include a metric set in future poll plans
-s7trace set disable      # remove a metric set from future poll plans
-s7trace collection start # start writing into a named dataset
-s7trace collection stop  # stop polling before cleanup
-s7trace tag add          # validate one tag, then store success or bad state
-s7trace tag update       # revalidate changed tag
-s7trace tag disable      # remove from future plans without deleting history
+s7trace command-list     # inspect queued commands
+s7trace command-wait     # wait for queued command completion
+s7trace command-result   # print stored command result
+s7trace set-create       # create a named activatable metric set
+s7trace set-add-tag      # add a tag to a metric set
+s7trace set-enable       # include a metric set in future poll plans
+s7trace set-disable      # remove a metric set from future poll plans
+s7trace collection-start # start writing into a named dataset
+s7trace collection-stop  # stop polling before cleanup
+s7trace tag-add          # validate one tag, then store success or bad state
+s7trace tag-update       # revalidate changed tag
+s7trace tag-disable      # remove from future plans without deleting history
 s7trace read             # one-off typed PLC read, not added to polling
 s7trace read-raw         # one-off raw DB byte read for offset diagnostics
 s7trace status           # runtime health, bad tags, current plans
-s7trace history clean    # explicit cleanup by cutoff, requires stopped collection
-s7trace history delete-dataset # delete a stopped dataset
+s7trace history-clean    # explicit cleanup by cutoff, requires stopped collection
+s7trace history-delete-dataset # delete a stopped dataset
 ```
 
 The service remains read-only with respect to PLC memory.
@@ -158,14 +158,14 @@ limit 1000;
 Adding a tag must perform one real read before it becomes active:
 
 ```text
-s7trace tag add --plc line1 --name Motor.Speed --address DB10.DBD240 --type f32
+s7trace tag-add --plc line1 --name Motor.Speed --address DB10.DBD240 --type f32
 success value=31.5 apply_state=pending
 ```
 
 or:
 
 ```text
-s7trace tag add --plc line1 --name Motor.Speed --address DB10.DBD240 --type f32
+s7trace tag-add --plc line1 --name Motor.Speed --address DB10.DBD240 --type f32
 bad bad_class=address_out_of_range detail="S7 read failed: address out of range"
 ```
 

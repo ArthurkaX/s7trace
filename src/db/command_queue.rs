@@ -12,6 +12,19 @@ pub use crate::types::CommandKind;
 pub use crate::types::CommandRequest;
 pub use crate::types::CommandResult;
 
+/// Row returned by `list_pending` — a dedicated struct that does not
+/// carry request_json/plc_id (not displayed by the list command) and
+/// includes finished_ts and error.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CommandListRow {
+    pub id: i64,
+    pub created_ts: TimestampUs,
+    pub finished_ts: Option<TimestampUs>,
+    pub state: CommandState,
+    pub kind: CommandKind,
+    pub error: Option<String>,
+}
+
 /// Default lease duration (30 s).
 pub const DEFAULT_LEASE_MS: i64 = 30_000;
 
@@ -240,12 +253,12 @@ pub fn get_result(conn: &Connection, command_id: i64) -> Result<Option<CommandRe
 }
 
 /// List pending commands.
-pub fn list_pending(conn: &Connection, state_filter: Option<&str>) -> Result<Vec<CommandRequest>> {
+pub fn list_pending(conn: &Connection, state_filter: Option<&str>) -> Result<Vec<CommandListRow>> {
     let query = match state_filter {
-        Some(_) => "SELECT id, created_ts, state, kind, request_json, plc_id
+        Some(_) => "SELECT id, created_ts, finished_ts, state, kind, error
                      FROM command_request WHERE state = ?1
                      ORDER BY id DESC LIMIT 100",
-        None => "SELECT id, created_ts, state, kind, request_json, plc_id
+        None => "SELECT id, created_ts, finished_ts, state, kind, error
                  FROM command_request
                  ORDER BY id DESC LIMIT 100",
     };
@@ -253,15 +266,15 @@ pub fn list_pending(conn: &Connection, state_filter: Option<&str>) -> Result<Vec
     let mut stmt = conn.prepare(query)?;
 
     let row_mapper = |row: &rusqlite::Row| {
-        let state_str: String = row.get(2)?;
-        let kind_str: String = row.get(3)?;
-        Ok(CommandRequest {
+        let state_str: String = row.get(3)?;
+        let kind_str: String = row.get(4)?;
+        Ok(CommandListRow {
             id: row.get(0)?,
             created_ts: row.get(1)?,
+            finished_ts: row.get(2)?,
             state: serde_json::from_str(&format!("\"{state_str}\"")).unwrap_or(CommandState::Pending),
             kind: serde_json::from_str(&format!("\"{kind_str}\"")).unwrap_or(CommandKind::Query),
-            request_json: row.get(4)?,
-            plc_id: row.get(5)?,
+            error: row.get(5)?,
         })
     };
 

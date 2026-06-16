@@ -1277,24 +1277,31 @@ fn command_worker(
             cmd.id, cmd.kind
         );
 
+        // Execute under catch_unwind so a panic in one command (decode bug,
+        // backend assertion, etc.) is converted to a failed command instead of
+        // silently killing the worker thread and freezing the queue. (Bug B-7)
+        // parking_lot mutexes don't poison, so the db lock stays usable after
+        // an unwind; AssertUnwindSafe is sound here.
         let result = {
             let conn = db.lock();
-            execute_command(
-                &conn,
-                &plcs,
-                &pollers,
-                &pdu_cache,
-                &snapshot,
-                &sample_tx,
-                cmd.id,
-                cmd.kind,
-                &cmd.request_json,
-                overrun_mode,
-            )
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_command(
+                    &conn,
+                    &plcs,
+                    &pollers,
+                    &pdu_cache,
+                    &snapshot,
+                    &sample_tx,
+                    cmd.id,
+                    cmd.kind,
+                    &cmd.request_json,
+                    overrun_mode,
+                )
+            }))
         };
 
         match result {
-            Ok((ok, msg)) => {
+            Ok(Ok((ok, msg))) => {
                 if ok {
                     let conn = db.lock();
                     if let Err(e) = db::command_queue::finish_ok(&conn, cmd.id, &msg) {
@@ -1307,10 +1314,26 @@ fn command_worker(
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("cmd-worker: command id={} execution error: {e}", cmd.id);
                 let conn = db.lock();
                 if let Err(e2) = db::command_queue::finish_bad(&conn, cmd.id, &e.to_string()) {
+                    error!("cmd-worker: finish_bad id={} failed: {e2}", cmd.id);
+                }
+            }
+            Err(panic) => {
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<non-string panic payload>".to_string()
+                };
+                error!("cmd-worker: command id={} PANICKED: {msg}", cmd.id);
+                let conn = db.lock();
+                if let Err(e2) =
+                    db::command_queue::finish_bad(&conn, cmd.id, &format!("panic: {msg}"))
+                {
                     error!("cmd-worker: finish_bad id={} failed: {e2}", cmd.id);
                 }
             }
@@ -1967,7 +1990,34 @@ impl Server {
 /// Start the server with explicit configuration (used when the CLI passes
 /// extra options such as `--http-bind`).
 pub fn run_server_with_config(config: ServerConfig) -> Result<(), anyhow::Error> {
+    install_panic_logger();
     let mut server = Server::new(config)?;
     server.run()?;
     Ok(())
+}
+
+/// Install a panic hook that logs the thread name, source location, and message
+/// of any panic before the default hook runs. Without this, a panic in a
+/// background thread (poller, cmd-worker, sample-writer, apply-worker) just
+/// kills that thread silently — from the outside the process appears to "stop
+/// doing work" with nothing in the log. (Bug B-7)
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        error!("PANIC in thread '{name}' at {location}: {msg}");
+        default_hook(info);
+    }));
 }

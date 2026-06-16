@@ -6,10 +6,14 @@ set BIN=target\release\s7trace.exe
 del %DB% 2>nul
 
 echo === 1. Init PLC2 ===
-%BIN% --db %DB% admin-sql "INSERT INTO plc (id, name, host, rack, slot) VALUES (1, 'PLC2', '192.168.0.51', 0, 2)"
+%BIN% --db %DB% plc-add --name PLC2 --host 192.168.0.51 --rack 0 --slot 2
 if %errorlevel% neq 0 exit /b %errorlevel%
-%BIN% --db %DB% admin-sql "INSERT INTO poll_group (id, name, period_ms) VALUES (1, 'fast', 40)"
-%BIN% --db %DB% admin-sql "INSERT INTO metric_set (plc_id, name, enabled) VALUES (1, 'test', 1)"
+%BIN% --db %DB% poll-group-add --name fast --period-ms 40
+if %errorlevel% neq 0 exit /b %errorlevel%
+%BIN% --db %DB% set-create --plc PLC2 --name test
+if %errorlevel% neq 0 exit /b %errorlevel%
+%BIN% --db %DB% set-enable test
+if %errorlevel% neq 0 exit /b %errorlevel%
 echo OK
 
 echo.

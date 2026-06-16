@@ -60,36 +60,55 @@ pure read-only inspection.
 
 ## CLI Behavior
 
-Default CLI behavior should be synchronous from the caller's point of view:
+Mutating commands are **queued and processed asynchronously** by the server's
+cmd-worker. The CLI inserts a durable command row and returns immediately with
+the assigned id:
 
 ```text
 s7trace read --plc line1 --address DB5999.DBW120 --type i16
+queued command_id=1842
+info: use 's7trace command wait 1842' or 's7trace command result 1842' to get the result
 ```
 
-Internally:
-
-1. Insert a command row.
-2. Wait for the service to process it.
-3. Print the result.
-4. Exit with success or failure code.
-
-The caller sees a simple command. The system still gets durable ordering and a
-traceable result.
-
-For long-running commands, support explicit async mode:
+To get synchronous semantics (block until the result is ready), chain
+`command wait`:
 
 ```text
-s7trace tag add --plc line1 --name Motor.Speed --address DB10.DBD240 --type f32 --async
-queued command_id=1842
+s7trace command wait 1842
 ```
 
-Then:
+`command wait` polls the queue until the command reaches a terminal state, then
+prints the result and exits with success or failure. `command result` fetches
+the result without blocking. `command list [--state <s>] [--format json]` shows
+queued/recent commands with their created/finished timestamps and any error.
+
+This keeps durable ordering and a traceable result while never blocking the CLI
+on a slow or stuck PLC. (A future `--wait` flag could fold the wait into the
+mutating command itself; today it is a separate `command wait` call.)
+
+Inspecting a queued command:
 
 ```text
 s7trace command wait 1842
 s7trace command result 1842 --format json
 s7trace command list --state pending
 ```
+
+### Startup behavior
+
+When the server starts, its cmd-worker immediately begins processing any
+commands already sitting in the queue, in FIFO (creation) order.
+
+This includes control commands like `collection-start` and `collection-stop`.
+
+This is intentional -- the command queue is durable and replays on startup --
+but it has a surprising consequence: a `collection-start` that was queued
+before the server was running will execute the moment the server starts
+(and if a `collection-stop` was queued right after it, the poller may start
+and stop immediately).
+
+If you need a control command applied only after the server is fully up,
+queue it **after** starting the server.
 
 ## Output Contract
 

@@ -75,9 +75,13 @@ pub enum Command {
 
     /// List queued commands.
     CommandList {
-        /// Filter by state.
+        /// Filter by state: pending, running, done, bad, cancelled.
         #[arg(long = "state")]
         state: Option<String>,
+
+        /// Output format: text, json, jsonl.
+        #[arg(long = "format", default_value = "text")]
+        format: String,
     },
 
     /// Wait for a queued command to complete.
@@ -151,7 +155,15 @@ pub enum Command {
     TagUpdate {
         /// Tag ID.
         #[arg(long = "id")]
-        tag_id: i64,
+        tag_id: Option<i64>,
+
+        /// PLC name (alternative to --id).
+        #[arg(long = "plc")]
+        plc: Option<String>,
+
+        /// Tag name (alternative to --id, requires --plc).
+        #[arg(long = "name")]
+        name: Option<String>,
 
         /// New address (if changing).
         #[arg(long = "address")]
@@ -178,14 +190,30 @@ pub enum Command {
     TagDisable {
         /// Tag ID to disable.
         #[arg(long = "id")]
-        tag_id: i64,
+        tag_id: Option<i64>,
+
+        /// PLC name (alternative to --id).
+        #[arg(long = "plc")]
+        plc: Option<String>,
+
+        /// Tag name (alternative to --id, requires --plc).
+        #[arg(long = "name")]
+        name: Option<String>,
     },
 
     /// Revalidate a bad tag.
     TagRevalidate {
         /// Tag ID.
         #[arg(long = "id")]
-        tag_id: i64,
+        tag_id: Option<i64>,
+
+        /// PLC name (alternative to --id).
+        #[arg(long = "plc")]
+        plc: Option<String>,
+
+        /// Tag name (alternative to --id, requires --plc).
+        #[arg(long = "name")]
+        name: Option<String>,
     },
 
     /// One-off typed PLC read, not added to polling.
@@ -205,6 +233,10 @@ pub enum Command {
         /// Output format.
         #[arg(long = "format", default_value = "text")]
         format: String,
+
+        /// Return immediately after queueing instead of waiting for the result.
+        #[arg(long = "no-wait")]
+        no_wait: bool,
     },
 
     /// One-off raw DB byte read for offset diagnostics.
@@ -232,6 +264,10 @@ pub enum Command {
         /// Save as a diagnostic probe.
         #[arg(long = "save-probe")]
         save_probe: bool,
+
+        /// Return immediately after queueing instead of waiting for the result.
+        #[arg(long = "no-wait")]
+        no_wait: bool,
     },
 
     /// Runtime health, bad tags, current plans.
@@ -318,8 +354,12 @@ pub enum Command {
 
     /// Show metric set details.
     SetShow {
+        /// Metric set name (positional).
+        set_name: Option<String>,
+
         /// Metric set name.
-        set_name: String,
+        #[arg(long = "set")]
+        set_flag: Option<String>,
     },
 
     /// Start collecting data into a named dataset.
@@ -335,6 +375,10 @@ pub enum Command {
         /// Metric set(s) to collect.
         #[arg(long = "set")]
         sets: Vec<String>,
+
+        /// Return immediately after queueing instead of waiting for the result.
+        #[arg(long = "no-wait")]
+        no_wait: bool,
     },
 
     /// Stop data collection for a PLC.
@@ -342,6 +386,10 @@ pub enum Command {
         /// PLC name.
         #[arg(long = "plc")]
         plc: String,
+
+        /// Return immediately after queueing instead of waiting for the result.
+        #[arg(long = "no-wait")]
+        no_wait: bool,
     },
 
     /// Clean history by cutoff timestamp.
@@ -375,5 +423,74 @@ pub enum Command {
         /// Skip confirmation prompt.
         #[arg(long = "force")]
         force: bool,
+    },
+
+    /// Create a new PLC.
+    PlcAdd {
+        /// PLC name.
+        #[arg(long)]
+        name: String,
+
+        /// PLC host (IP or hostname).
+        #[arg(long)]
+        host: String,
+
+        /// Rack number.
+        #[arg(long, default_value_t = 0)]
+        rack: i64,
+
+        /// Slot number.
+        #[arg(long, default_value_t = 2)]
+        slot: i64,
+
+        /// Disable the PLC (instead of default enabled).
+        #[arg(long)]
+        disabled: bool,
+    },
+
+    /// Create a new poll group.
+    PollGroupAdd {
+        /// Poll group name.
+        #[arg(long)]
+        name: String,
+
+        /// Poll period in milliseconds.
+        #[arg(long)]
+        period_ms: i64,
+    },
+
+    /// Import tags from a YAML-shaped signal file.
+    TagImport {
+        /// PLC name.
+        #[arg(long)]
+        plc: String,
+
+        /// Path to the signal file.
+        #[arg(long)]
+        file: String,
+
+        /// Metric set name (optional; defaults to 'default').
+        #[arg(long)]
+        set: Option<String>,
+
+        /// Poll group name.
+        #[arg(long = "poll-group", default_value = "slow")]
+        poll_group: String,
+
+        /// Store mode.
+        #[arg(long = "store-mode", default_value = "on_change")]
+        store_mode: String,
+
+        /// Storage hook.
+        #[arg(long = "storage-hook", default_value = "on_change")]
+        storage_hook: String,
+
+        /// Value role.
+        #[arg(long = "value-role", default_value = "state")]
+        value_role: String,
+
+        /// Validate each imported tag by reading from the PLC.
+        #[arg(long)]
+        validate: bool,
     },
 }

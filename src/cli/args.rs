@@ -4,7 +4,36 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "s7trace",
-    about = "Read-only S7 data collection service for Siemens PLCs"
+    version,
+    about = "Read-only data collection service for Siemens S7 PLCs",
+    long_about = "s7trace polls and stores data from Siemens S7 PLCs.\n\n\
+        Run `s7trace server` on a host that has network access to the PLC. Every\n\
+        other subcommand is a client: it submits work to the server's durable\n\
+        command queue and prints the result. Clients reach the server either\n\
+        locally (same machine, shared --db) or over the network with\n\
+        --remote-server. All commands work identically in both modes.",
+    after_help = "QUICKSTART  (bare database -> live collection):\n  \
+        s7trace plc-add --name line1 --host 192.168.0.1:102 --rack 0 --slot 2\n  \
+        s7trace poll-group-add --name fast --period-ms 1000\n  \
+        s7trace tag-import --plc line1 --file signals.yaml --set diag --poll-group fast\n  \
+        s7trace set-enable diag\n  \
+        s7trace collection-start --plc line1 --dataset run1 --set diag\n  \
+        s7trace read --plc line1 --address DB1.DBW0 --type i16\n  \
+        s7trace status --format json\n  \
+        s7trace collection-stop --plc line1\n\
+        \n\
+        COMMAND GROUPS:\n  \
+        config    plc-add  poll-group-add  tag-add  tag-import  tag-update  tag-disable\n  \
+        sets      set-create  set-add-tag  set-remove-tag  set-enable  set-disable  set-list  set-show\n  \
+        collect   collection-start  collection-stop\n  \
+        inspect   status  read  read-raw  sql  command-list  command-result  command-wait\n  \
+        history   history-clean  history-delete-dataset  history-vacuum\n  \
+        admin     server  admin-sql  tag-revalidate\n\
+        \n\
+        REMOTE USE:  prefix any command with `--remote-server http://HOST:8080`\n  \
+        (or set S7TRACE_REMOTE_SERVER). The CLI then needs no direct PLC access.\n\
+        \n\
+        Run `s7trace <command> --help` for the options of a single command."
 )]
 pub struct Cli {
     /// Path to SQLite database.
@@ -16,11 +45,10 @@ pub struct Cli {
     )]
     pub db: String,
 
-    /// If set, all PLC- and command-related operations go through the
-    /// remote server at this URL (e.g. http://10.0.0.1:8080). The local
-    /// --db is still used for read-only SQL queries that can be answered
-    /// from a replica. Use this when the server runs on-site and the CLI
-    /// has no direct PLC access.
+    /// Route every PLC- and command-related operation through the s7trace
+    /// server at this URL (e.g. http://10.0.0.1:8080). All commands work
+    /// identically over the network; the CLI needs no direct PLC access.
+    /// Read-only SQL still uses the local --db (a replica) when available.
     #[arg(long = "remote-server", env = "S7TRACE_REMOTE_SERVER", global = true)]
     pub remote_server: Option<String>,
 

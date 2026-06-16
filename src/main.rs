@@ -173,7 +173,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             tag_id,
             plc,
             name,
-        } => handle_tag_disable(conn, *tag_id, plc.as_deref(), name.as_deref()),
+        } => handle_tag_disable(conn, cli, *tag_id, plc.as_deref(), name.as_deref()),
         Command::TagRevalidate {
             tag_id,
             plc,
@@ -200,7 +200,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             plc,
             name,
             description,
-        } => handle_set_create(conn, plc, name, description.as_deref()),
+        } => handle_set_create(cli, conn, plc, name, description.as_deref()),
         Command::SetAddTag {
             set_name,
             tag,
@@ -245,9 +245,9 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             rack,
             slot,
             disabled,
-        } => handle_plc_add(conn, name, host, *rack, *slot, *disabled),
+        } => handle_plc_add(cli, conn, name, host, *rack, *slot, *disabled),
         Command::PollGroupAdd { name, period_ms } => {
-            handle_poll_group_add(conn, name, *period_ms)
+            handle_poll_group_add(cli, conn, name, *period_ms)
         }
         Command::TagImport {
             plc,
@@ -463,6 +463,33 @@ fn wait_and_print(conn: &Connection, command_id: i64, poll_ms: u64, timeout_ms: 
     Ok(ExitCode::Overload)
 }
 
+/// Forward a `control` command to a remote server, block until it finishes,
+/// and print the result. Shared by the remote branches of CLI handlers.
+fn forward_control(
+    base: &str,
+    req: &serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<ExitCode> {
+    let id = cli::remote::enqueue_command(
+        base,
+        "control",
+        &req.to_string(),
+        Some("cli"),
+        None,
+        timeout,
+    )?;
+    println!("queued command_id={id}");
+    let (state, result, ok, err) =
+        cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+    if ok {
+        println!("success {result}");
+        Ok(ExitCode::Ok)
+    } else {
+        println!("{state}: {result} {err}");
+        Ok(ExitCode::BadInput)
+    }
+}
+
 fn handle_command_wait(
     conn: &Connection,
     command_id: i64,
@@ -671,7 +698,7 @@ fn handle_tag_add(
 
 fn handle_tag_update(
     conn: &Connection,
-    _cli: &Cli,
+    cli: &Cli,
     tag_id_opt: Option<i64>,
     plc: Option<&str>,
     name: Option<&str>,
@@ -681,6 +708,23 @@ fn handle_tag_update(
     store_mode: Option<&str>,
     storage_hook: Option<&str>,
 ) -> Result<ExitCode> {
+    // Remote mode: forward the resolution criteria (id, or plc+name) and the
+    // changed fields; the server resolves the tag and applies the update.
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "tag_update",
+            "tag_id": tag_id_opt,
+            "plc": plc,
+            "name": name,
+            "address": address,
+            "data_type": data_type,
+            "poll_group": poll_group,
+            "store_mode": store_mode,
+            "storage_hook": storage_hook,
+        });
+        return forward_control(base, &req, timeout);
+    }
     let tag_id = match (tag_id_opt, plc, name) {
         (Some(id), _, _) => id,
         (None, Some(plc), Some(name)) => {
@@ -768,7 +812,17 @@ fn handle_tag_update(
     Ok(ExitCode::Ok)
 }
 
-fn handle_tag_disable(conn: &Connection, tag_id_opt: Option<i64>, plc: Option<&str>, name: Option<&str>) -> Result<ExitCode> {
+fn handle_tag_disable(conn: &Connection, cli: &Cli, tag_id_opt: Option<i64>, plc: Option<&str>, name: Option<&str>) -> Result<ExitCode> {
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "tag_disable",
+            "tag_id": tag_id_opt,
+            "plc": plc,
+            "name": name,
+        });
+        return forward_control(base, &req, timeout);
+    }
     let tag_id = match (tag_id_opt, plc, name) {
         (Some(id), _, _) => id,
         (None, Some(plc), Some(name)) => {
@@ -815,7 +869,17 @@ fn handle_tag_disable(conn: &Connection, tag_id_opt: Option<i64>, plc: Option<&s
     Ok(ExitCode::Ok)
 }
 
-fn handle_tag_revalidate(conn: &Connection, _cli: &Cli, tag_id_opt: Option<i64>, plc: Option<&str>, name: Option<&str>) -> Result<ExitCode> {
+fn handle_tag_revalidate(conn: &Connection, cli: &Cli, tag_id_opt: Option<i64>, plc: Option<&str>, name: Option<&str>) -> Result<ExitCode> {
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "tag_revalidate",
+            "tag_id": tag_id_opt,
+            "plc": plc,
+            "name": name,
+        });
+        return forward_control(base, &req, timeout);
+    }
     let tag_id = match (tag_id_opt, plc, name) {
         (Some(id), _, _) => id,
         (None, Some(plc), Some(name)) => {
@@ -1201,11 +1265,41 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 fn handle_set_create(
+    cli: &Cli,
     conn: &Connection,
     plc: &str,
     name: &str,
     description: Option<&str>,
 ) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "set_create",
+            "plc": plc,
+            "name": name,
+            "description": description,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     let plc_id: i64 = conn
         .query_row(
             "SELECT id FROM plc WHERE name = ?1",
@@ -1375,6 +1469,33 @@ fn handle_set_enable(
     set_name: &str,
     async_mode: bool,
 ) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = &_cli.remote_server {
+        let timeout = std::time::Duration::from_millis(_cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "set_enable",
+            "set_name": set_name,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     let now = now_us();
     conn.execute(
         "UPDATE metric_set SET enabled = 1, updated_ts = ?1 WHERE name = ?2",
@@ -1427,6 +1548,33 @@ fn handle_set_enable(
 }
 
 fn handle_set_disable(conn: &Connection, _cli: &Cli, set_name: &str) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = &_cli.remote_server {
+        let timeout = std::time::Duration::from_millis(_cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "set_disable",
+            "set_name": set_name,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     let now = now_us();
     conn.execute(
         "UPDATE metric_set SET enabled = 0, updated_ts = ?1 WHERE name = ?2",
@@ -1564,12 +1712,45 @@ fn handle_set_show(conn: &Connection, set_name_pos: Option<&str>, set_flag: Opti
 
 fn handle_collection_start(
     conn: &Connection,
-    _cli: &Cli,
+    cli: &Cli,
     plc: &str,
     dataset: &str,
     sets: &[String],
     no_wait: bool,
 ) -> Result<ExitCode> {
+    // Remote mode: forward to the server, which resolves plc_id by name,
+    // creates the dataset, and starts pollers on its side. The CLI's local
+    // replica DB has no PLC/tags, so all resolution must happen server-side.
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "collection_start",
+            "plc": plc,
+            "dataset": dataset,
+            "sets": sets,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        if no_wait {
+            return Ok(ExitCode::Ok);
+        }
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+            return Ok(ExitCode::Ok);
+        }
+        println!("{state}: {result} {err}");
+        return Ok(ExitCode::BadInput);
+    }
+
     let plc_id: i64 = conn
         .query_row(
             "SELECT id FROM plc WHERE name = ?1",
@@ -1614,10 +1795,39 @@ fn handle_collection_start(
 
 fn handle_collection_stop(
     conn: &Connection,
-    _cli: &Cli,
+    cli: &Cli,
     plc: &str,
     no_wait: bool,
 ) -> Result<ExitCode> {
+    // Remote mode: forward to the server (resolves plc_id by name).
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "collection_stop",
+            "plc": plc,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        if no_wait {
+            return Ok(ExitCode::Ok);
+        }
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+            return Ok(ExitCode::Ok);
+        }
+        println!("{state}: {result} {err}");
+        return Ok(ExitCode::BadInput);
+    }
+
     let plc_id: i64 = conn
         .query_row(
             "SELECT id FROM plc WHERE name = ?1",
@@ -1760,6 +1970,7 @@ fn handle_history_vacuum(conn: &Connection, force: bool) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 fn handle_plc_add(
+    cli: &Cli,
     conn: &Connection,
     name: &str,
     host: &str,
@@ -1767,6 +1978,37 @@ fn handle_plc_add(
     slot: i64,
     disabled: bool,
 ) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "plc_add",
+            "name": name,
+            "host": host,
+            "rack": rack,
+            "slot": slot,
+            "disabled": disabled,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     if name.trim().is_empty() {
         eprintln!("error: --name cannot be empty");
         return Ok(ExitCode::BadInput);
@@ -1797,7 +2039,40 @@ fn handle_plc_add(
     Ok(ExitCode::Ok)
 }
 
-fn handle_poll_group_add(conn: &Connection, name: &str, period_ms: i64) -> Result<ExitCode> {
+fn handle_poll_group_add(
+    cli: &Cli,
+    conn: &Connection,
+    name: &str,
+    period_ms: i64,
+) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "poll_group_add",
+            "name": name,
+            "period_ms": period_ms,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     if name.trim().is_empty() {
         eprintln!("error: --name cannot be empty");
         return Ok(ExitCode::BadInput);
@@ -1841,10 +2116,40 @@ fn handle_tag_import(
     value_role: &str,
     do_validate: bool,
 ) -> Result<ExitCode> {
-    // tag-import is local-only
-    if cli.remote_server.is_some() {
-        eprintln!("error: tag-import is local-only (not available via remote-server)");
-        return Ok(ExitCode::BadInput);
+    // Remote mode: read file locally, send yaml content to server
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let content = std::fs::read_to_string(file)
+            .map_err(|e| anyhow::anyhow!("reading '{file}': {e}"))?;
+        let req = serde_json::json!({
+            "action": "tag_import",
+            "plc": plc,
+            "yaml": content,
+            "set": set,
+            "poll_group": poll_group,
+            "store_mode": store_mode,
+            "storage_hook": storage_hook,
+            "value_role": value_role,
+            "validate": do_validate,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
     }
 
     // Validate store_mode and storage_hook up front
@@ -2031,6 +2336,12 @@ mod tests {
     #[test]
     fn test_set_create_and_list() {
         let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
         // Need a PLC first
         conn.execute(
             "INSERT INTO plc (name, host) VALUES ('test-plc', '127.0.0.1')",
@@ -2038,7 +2349,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_set_create(&conn, "test-plc", "my_set", None).unwrap();
+        handle_set_create(&cli, &conn, "test-plc", "my_set", None).unwrap();
         let id: i64 = conn
             .query_row(
                 "SELECT id FROM metric_set WHERE name = 'my_set'",
@@ -2052,7 +2363,13 @@ mod tests {
     #[test]
     fn test_tag_disable_unknown() {
         let conn = db::schema::open_memory().unwrap();
-        let result = handle_tag_disable(&conn, Some(999), None, None);
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
+        let result = handle_tag_disable(&conn, &cli, Some(999), None, None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
     }
@@ -2060,6 +2377,12 @@ mod tests {
     #[test]
     fn test_set_add_tag_bulk_csv() {
         let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
         conn.execute(
             "INSERT INTO plc (name, host) VALUES ('plc1', '127.0.0.1')",
             [],
@@ -2080,7 +2403,7 @@ mod tests {
             )
             .unwrap();
         }
-        handle_set_create(&conn, "plc1", "my_set", None).unwrap();
+        handle_set_create(&cli, &conn, "plc1", "my_set", None).unwrap();
         handle_set_add_tag(&conn, "my_set", Some("t1,t2,t3"), None, None).unwrap();
         let n: i64 = conn
             .query_row(
@@ -2095,6 +2418,12 @@ mod tests {
     #[test]
     fn test_set_add_tag_from_file() {
         let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
         conn.execute(
             "INSERT INTO plc (name, host) VALUES ('plc1', '127.0.0.1')",
             [],
@@ -2114,7 +2443,7 @@ mod tests {
             )
             .unwrap();
         }
-        handle_set_create(&conn, "plc1", "s2", None).unwrap();
+        handle_set_create(&cli, &conn, "plc1", "s2", None).unwrap();
 
         let path =
             std::env::temp_dir().join(format!("s7trace_set_tags_{}.txt", std::process::id()));
@@ -2161,9 +2490,15 @@ mod tests {
     #[test]
     fn test_plc_add_and_duplicate() {
         let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
 
         // First add should succeed
-        let r = handle_plc_add(&conn, "myplc", "10.0.0.1", 0, 2, false).unwrap();
+        let r = handle_plc_add(&cli, &conn, "myplc", "10.0.0.1", 0, 2, false).unwrap();
         assert_eq!(r as i32, ExitCode::Ok as i32);
         let id: i64 = conn
             .query_row("SELECT id FROM plc WHERE name = 'myplc'", [], |r| r.get(0))
@@ -2175,15 +2510,21 @@ mod tests {
         assert_eq!(s, "unknown");
 
         // Duplicate name should fail
-        let r = handle_plc_add(&conn, "myplc", "10.0.0.2", 0, 2, false).unwrap();
+        let r = handle_plc_add(&cli, &conn, "myplc", "10.0.0.2", 0, 2, false).unwrap();
         assert_eq!(r as i32, ExitCode::BadInput as i32);
     }
 
     #[test]
     fn test_poll_group_add_and_duplicate() {
         let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
 
-        let r = handle_poll_group_add(&conn, "fast", 40).unwrap();
+        let r = handle_poll_group_add(&cli, &conn, "fast", 40).unwrap();
         assert_eq!(r as i32, ExitCode::Ok as i32);
         let id: i64 = conn
             .query_row(
@@ -2195,7 +2536,7 @@ mod tests {
         assert!(id > 0);
 
         // Duplicate name should fail
-        let r = handle_poll_group_add(&conn, "fast", 100).unwrap();
+        let r = handle_poll_group_add(&cli, &conn, "fast", 100).unwrap();
         assert_eq!(r as i32, ExitCode::BadInput as i32);
     }
 
@@ -2276,7 +2617,7 @@ signals:
     }
 
     #[test]
-    fn test_tag_import_local_only_rejects_remote() {
+    fn test_tag_import_remote_file_not_found() {
         let conn = db::schema::open_memory().unwrap();
         let cli = Cli {
             db: ":memory:".into(),
@@ -2284,10 +2625,11 @@ signals:
             remote_timeout_ms: 30_000,
             command: None,
         };
+        // Remote path reads file first (before connecting to server); file-not-found
+        // should propagate as an error the same way the local path does.
         let r = handle_tag_import(
             &cli, &conn, "x", "/nonexistent", None, "slow", "on_change", "on_change", "state", false,
-        )
-        .unwrap();
-        assert_eq!(r as i32, ExitCode::BadInput as i32);
+        );
+        assert!(r.is_err());
     }
 }

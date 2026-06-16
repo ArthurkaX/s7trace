@@ -376,6 +376,26 @@ fn load_active_tags(
     Ok(tags)
 }
 
+/// Resolve a tag id from a command request: prefer an explicit `tag_id`,
+/// otherwise look it up by (`plc` name, `name`). Remote CLIs cannot resolve
+/// tag ids locally (their replica DB is empty), so they send plc+name instead.
+fn resolve_tag_id(conn: &Connection, req: &serde_json::Value) -> Result<i64, anyhow::Error> {
+    if let Some(id) = req["tag_id"].as_i64() {
+        return Ok(id);
+    }
+    match (req["plc"].as_str(), req["name"].as_str()) {
+        (Some(plc), Some(name)) => conn
+            .query_row(
+                "SELECT t.id FROM tag t JOIN plc p ON p.id = t.plc_id \
+                 WHERE p.name = ?1 AND t.name = ?2",
+                rusqlite::params![plc, name],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| anyhow::anyhow!("tag '{name}' not found on PLC '{plc}'")),
+        _ => Err(anyhow::anyhow!("missing tag_id or (plc, name)")),
+    }
+}
+
 /// Execute a PLC read command.
 fn execute_command(
     conn: &Connection,
@@ -936,7 +956,8 @@ fn execute_command(
                 }
 
                 "tag_disable" => {
-                    if let Some(tag_id) = req["tag_id"].as_i64() {
+                    let tag_id = resolve_tag_id(conn, &req)?;
+                    {
                         let plc_id: Option<i64> = conn
                             .query_row(
                                 "SELECT plc_id FROM tag WHERE id = ?1",
@@ -961,15 +982,71 @@ fn execute_command(
                             None,
                         );
                         Ok((true, format!("tag {tag_id} disabled, apply scheduled")))
-                    } else {
-                        Ok((false, "missing tag_id".into()))
                     }
                 }
 
+                "tag_update" => {
+                    let tag_id = resolve_tag_id(conn, &req)?;
+                    let now = now_us();
+                    if let Some(addr_str) = req["address"].as_str() {
+                        let addr = S7Address::parse(addr_str)
+                            .map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+                        conn.execute(
+                            "UPDATE tag SET address = ?1, db_num = ?2, byte_offset = ?3, updated_ts = ?4, desired_version = desired_version + 1 WHERE id = ?5",
+                            rusqlite::params![addr_str, addr.db_num, addr.byte_offset, now, tag_id],
+                        )?;
+                    }
+                    if let Some(dt) = req["data_type"].as_str() {
+                        let byte_size = dt
+                            .parse::<DataType>()
+                            .map_err(|e: String| anyhow::anyhow!("{e}"))?
+                            .byte_size() as i64;
+                        conn.execute(
+                            "UPDATE tag SET data_type = ?1, byte_size = ?2, updated_ts = ?3, desired_version = desired_version + 1 WHERE id = ?4",
+                            rusqlite::params![dt, byte_size, now, tag_id],
+                        )?;
+                    }
+                    if let Some(pg) = req["poll_group"].as_str() {
+                        let pg_id: i64 = conn
+                            .query_row(
+                                "SELECT id FROM poll_group WHERE name = ?1",
+                                rusqlite::params![pg],
+                                |row| row.get(0),
+                            )
+                            .map_err(|_| anyhow::anyhow!("poll group '{pg}' not found"))?;
+                        conn.execute(
+                            "UPDATE tag SET poll_group_id = ?1, updated_ts = ?2, desired_version = desired_version + 1 WHERE id = ?3",
+                            rusqlite::params![pg_id, now, tag_id],
+                        )?;
+                    }
+                    if let Some(sm) = req["store_mode"].as_str() {
+                        conn.execute(
+                            "UPDATE tag SET store_mode = ?1, updated_ts = ?2, desired_version = desired_version + 1 WHERE id = ?3",
+                            rusqlite::params![sm, now, tag_id],
+                        )?;
+                    }
+                    if let Some(sh) = req["storage_hook"].as_str() {
+                        conn.execute(
+                            "UPDATE tag SET storage_hook = ?1, updated_ts = ?2, desired_version = desired_version + 1 WHERE id = ?3",
+                            rusqlite::params![sh, now, tag_id],
+                        )?;
+                    }
+                    let _ = db::config_apply::schedule(
+                        conn,
+                        ApplyScope::Tag,
+                        None,
+                        None,
+                        None,
+                        Some(tag_id),
+                        "tag_updated",
+                        db::config_apply::PLAN_COOLDOWN_MS,
+                        None,
+                    );
+                    Ok((true, format!("tag_id={tag_id} apply_state=pending")))
+                }
+
                 "tag_revalidate" => {
-                    let tag_id = req["tag_id"]
-                        .as_i64()
-                        .ok_or_else(|| anyhow::anyhow!("missing tag_id"))?;
+                    let tag_id = resolve_tag_id(conn, &req)?;
 
                     let (plc_id, name, address, data_type_str): (i64, String, String, String) =
                         conn.query_row(
@@ -1032,10 +1109,19 @@ fn execute_command(
                 }
 
                 "collection_start" => {
-                    let plc_id = req["plc_id"]
-                        .as_i64()
-                        .ok_or_else(|| anyhow::anyhow!("missing plc_id"))?;
                     let plc_name = req["plc"].as_str().unwrap_or("?");
+                    // Local CLI supplies plc_id; remote CLI cannot (its replica
+                    // DB is empty), so resolve from the PLC name server-side.
+                    let plc_id = match req["plc_id"].as_i64() {
+                        Some(id) => id,
+                        None => conn
+                            .query_row(
+                                "SELECT id FROM plc WHERE name = ?1",
+                                rusqlite::params![plc_name],
+                                |row| row.get(0),
+                            )
+                            .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?,
+                    };
                     let dataset = req["dataset"]
                         .as_str()
                         .ok_or_else(|| anyhow::anyhow!("missing dataset"))?;
@@ -1198,10 +1284,18 @@ fn execute_command(
                 }
 
                 "collection_stop" => {
-                    let plc_id = req["plc_id"]
-                        .as_i64()
-                        .ok_or_else(|| anyhow::anyhow!("missing plc_id"))?;
                     let plc_name = req["plc"].as_str().unwrap_or("?");
+                    // Resolve from name when plc_id is absent (remote CLI).
+                    let plc_id = match req["plc_id"].as_i64() {
+                        Some(id) => id,
+                        None => conn
+                            .query_row(
+                                "SELECT id FROM plc WHERE name = ?1",
+                                rusqlite::params![plc_name],
+                                |row| row.get(0),
+                            )
+                            .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?,
+                    };
 
                     // Stop all pollers for this PLC
                     {
@@ -1226,6 +1320,341 @@ fn execute_command(
                     )?;
 
                     Ok((true, format!("collection stopped for PLC {plc_name}")))
+                }
+
+                "plc_add" => {
+                    let name = req["name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing name"))?;
+                    let host = req["host"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing host"))?;
+                    let rack = req["rack"].as_i64().unwrap_or(0);
+                    let slot = req["slot"].as_i64().unwrap_or(0);
+                    let disabled = req["disabled"].as_bool().unwrap_or(false);
+
+                    if name.trim().is_empty() {
+                        return Ok((false, "name cannot be empty".into()));
+                    }
+
+                    let exists: bool = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM plc WHERE name = ?1",
+                            rusqlite::params![name],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map(|c| c > 0)
+                        .unwrap_or(false);
+                    if exists {
+                        return Ok((false, format!("PLC '{name}' already exists")));
+                    }
+
+                    let enabled = if disabled { 0 } else { 1 };
+                    conn.execute(
+                        "INSERT INTO plc (name, host, rack, slot, enabled)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![name, host, rack, slot, enabled],
+                    )?;
+                    let id = conn.last_insert_rowid();
+
+                    // Register PLC client at runtime (mirrors init_plc_clients)
+                    let client = create_plc_client(name, host, rack as u16, slot as u16);
+                    {
+                        let mut c = client.lock();
+                        if c.connect().is_ok() {
+                            match c.pdu_len() {
+                                Ok(n) => {
+                                    info!("PLC {}: PDU length = {} bytes", name, n);
+                                    pdu_cache.lock().insert(id, n);
+                                }
+                                Err(e) => {
+                                    warn!("PLC {}: pdu_len() failed: {} (using 240)", name, e);
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "PLC {}: connect failed at startup; will retry in poller",
+                                name
+                            );
+                            pdu_cache.lock().insert(id, 240);
+                        }
+                    }
+                    plcs.lock().insert(id, client);
+                    info!("PLC '{}' (id={}) registered at runtime", name, id);
+
+                    Ok((true, format!("success plc_id={id} name={name} host={host}")))
+                }
+
+                "poll_group_add" => {
+                    let name = req["name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing name"))?;
+                    let period_ms = req["period_ms"].as_i64().unwrap_or(0);
+
+                    if name.trim().is_empty() {
+                        return Ok((false, "name cannot be empty".into()));
+                    }
+                    if period_ms < 1 {
+                        return Ok((false, "period_ms must be at least 1".into()));
+                    }
+
+                    let exists: bool = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM poll_group WHERE name = ?1",
+                            rusqlite::params![name],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map(|c| c > 0)
+                        .unwrap_or(false);
+                    if exists {
+                        return Ok((false, format!("poll group '{name}' already exists")));
+                    }
+
+                    conn.execute(
+                        "INSERT INTO poll_group (name, period_ms) VALUES (?1, ?2)",
+                        rusqlite::params![name, period_ms],
+                    )?;
+                    Ok((true, format!("success poll_group={name} period_ms={period_ms}")))
+                }
+
+                "set_create" => {
+                    let plc_name = req["plc"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing plc"))?;
+                    let name = req["name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing name"))?;
+                    let description = req["description"].as_str();
+
+                    let plc_id: i64 = conn
+                        .query_row(
+                            "SELECT id FROM plc WHERE name = ?1",
+                            rusqlite::params![plc_name],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?;
+
+                    let now = now_us();
+                    conn.execute(
+                        "INSERT INTO metric_set (plc_id, name, enabled, description, created_ts, updated_ts)
+                         VALUES (?1, ?2, 0, ?3, ?4, ?4)",
+                        rusqlite::params![plc_id, name, description, now],
+                    )?;
+                    let id = conn.last_insert_rowid();
+                    Ok((true, format!("success set_id={id} name={name} plc={plc_name}")))
+                }
+
+                "set_enable" => {
+                    let set_name = req["set_name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing set_name"))?;
+                    let now = now_us();
+                    conn.execute(
+                        "UPDATE metric_set SET enabled = 1, updated_ts = ?1 WHERE name = ?2",
+                        rusqlite::params![now, set_name],
+                    )?;
+                    if conn.changes() == 0 {
+                        return Ok((false, format!("metric set '{set_name}' not found")));
+                    }
+                    let set_id: i64 = conn.query_row(
+                        "SELECT id FROM metric_set WHERE name = ?1",
+                        rusqlite::params![set_name],
+                        |row| row.get(0),
+                    )?;
+                    let _ = db::config_apply::schedule(
+                        conn,
+                        ApplyScope::MetricSet,
+                        None,
+                        None,
+                        Some(set_id),
+                        None,
+                        "metric_set_enabled",
+                        db::config_apply::PLAN_COOLDOWN_MS,
+                        None,
+                    );
+                    Ok((true, format!("success set={set_name} enabled=1 apply_state=pending")))
+                }
+
+                "set_disable" => {
+                    let set_name = req["set_name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing set_name"))?;
+                    let now = now_us();
+                    conn.execute(
+                        "UPDATE metric_set SET enabled = 0, updated_ts = ?1 WHERE name = ?2",
+                        rusqlite::params![now, set_name],
+                    )?;
+                    if conn.changes() == 0 {
+                        return Ok((false, format!("metric set '{set_name}' not found")));
+                    }
+                    let set_id: i64 = conn.query_row(
+                        "SELECT id FROM metric_set WHERE name = ?1",
+                        rusqlite::params![set_name],
+                        |row| row.get(0),
+                    )?;
+                    let _ = db::config_apply::schedule(
+                        conn,
+                        ApplyScope::MetricSet,
+                        None,
+                        None,
+                        Some(set_id),
+                        None,
+                        "metric_set_disabled",
+                        db::config_apply::PLAN_COOLDOWN_MS,
+                        None,
+                    );
+                    Ok((true, format!("success set={set_name} enabled=0 apply_state=pending")))
+                }
+
+                "tag_import" => {
+                    let plc_name = req["plc"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing plc"))?;
+                    let yaml_content = req["yaml"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing yaml"))?;
+                    let poll_group = req["poll_group"].as_str().unwrap_or("slow");
+                    let store_mode = req["store_mode"].as_str().unwrap_or("on_change");
+                    let storage_hook = req["storage_hook"].as_str().unwrap_or("on_change");
+                    let value_role = req["value_role"].as_str().unwrap_or("state");
+                    let do_validate = req["validate"].as_bool().unwrap_or(false);
+                    let set_arg = req["set"].as_str();
+
+                    // Validate store_mode and storage_hook
+                    let _sm: StoreMode = store_mode
+                        .parse()
+                        .map_err(|e: String| anyhow::anyhow!("invalid store mode: {e}"))?;
+                    let _sh: StorageHook = storage_hook
+                        .parse()
+                        .map_err(|e: String| anyhow::anyhow!("invalid storage hook: {e}"))?;
+
+                    // Resolve PLC
+                    let plc_id: i64 = conn
+                        .query_row(
+                            "SELECT id FROM plc WHERE name = ?1",
+                            rusqlite::params![plc_name],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?;
+
+                    // Parse signals
+                    let signals = crate::cli::import::parse_signals(yaml_content)?;
+
+                    let mut imported: u32 = 0;
+                    let mut imported_tags: Vec<(i64, String)> = Vec::new();
+                    let mut failures: Vec<(String, String)> = Vec::new();
+
+                    for sig in &signals {
+                        let dt = if let Some(ref type_str) = sig.data_type {
+                            match type_str.parse::<DataType>() {
+                                Ok(dt) => dt,
+                                Err(e) => {
+                                    failures.push((
+                                        sig.name.clone(),
+                                        format!("invalid type '{type_str}': {e}"),
+                                    ));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            match crate::cli::import::infer_type(&sig.address) {
+                                Ok(dt) => dt,
+                                Err(e) => {
+                                    failures.push((sig.name.clone(), e.to_string()));
+                                    continue;
+                                }
+                            }
+                        };
+
+                        let addr = match S7Address::parse(&sig.address) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                failures.push((sig.name.clone(), format!("invalid address: {e}")));
+                                continue;
+                            }
+                        };
+
+                        match db::validation::insert_tag(
+                            conn,
+                            plc_name,
+                            &sig.name,
+                            &addr,
+                            dt,
+                            poll_group,
+                            store_mode,
+                            storage_hook,
+                            value_role,
+                            set_arg,
+                        ) {
+                            Ok(inserted) => {
+                                imported += 1;
+                                imported_tags.push((inserted.tag_id, sig.name.clone()));
+                            }
+                            Err(e) => {
+                                failures.push((sig.name.clone(), e.to_string()));
+                            }
+                        }
+                    }
+
+                    // Schedule one PLC-scoped config apply if anything was imported
+                    if imported > 0 {
+                        let _ = db::config_apply::schedule(
+                            conn,
+                            ApplyScope::Plc,
+                            Some(plc_id),
+                            None,
+                            None,
+                            None,
+                            "tag_import",
+                            db::config_apply::PLAN_COOLDOWN_MS,
+                            None,
+                        );
+                    }
+
+                    // Optionally validate each imported tag synchronously
+                    if do_validate && !imported_tags.is_empty() {
+                        let client_opt = plcs.lock().get(&plc_id).cloned();
+                        if let Some(client_arc) = client_opt {
+                            for (tag_id, tag_name) in &imported_tags {
+                                match db::validation::validate_tag(conn, &client_arc, *tag_id) {
+                                    Ok(result) => {
+                                        if result.ok {
+                                            info!(
+                                                "tag_import validate ok {tag_name} tag_id={tag_id}"
+                                            );
+                                        } else {
+                                            let bc = result
+                                                .bad_class
+                                                .as_ref()
+                                                .map(|b| b.to_string())
+                                                .unwrap_or_default();
+                                            warn!(
+                                                "tag_import validate bad {tag_name} tag_id={tag_id} bad_class={bc}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "tag_import validate error {tag_name} tag_id={tag_id}: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "tag_import: PLC client not available for {plc_name}, skipping validate"
+                            );
+                        }
+                    }
+
+                    let set_name = set_arg.unwrap_or("default");
+                    Ok((
+                        true,
+                        format!(
+                            "imported={imported} failed={} set={set_name}",
+                            failures.len()
+                        ),
+                    ))
                 }
 
                 other => Ok((false, format!("unknown control action '{other}'"))),

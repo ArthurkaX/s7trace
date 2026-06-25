@@ -13,7 +13,8 @@
 //!
 //! The HTTP surface is an internal transport for the `s7trace` CLI. Operators
 //! must use `s7trace` commands instead of calling these endpoints directly.
-//! SQL access is especially restricted to `s7trace sql` / `s7trace admin-sql`;
+//! SQL access is especially restricted to `s7trace -r URL sql` for remote
+//! reads or `s7trace --local-db sql/admin-sql` for local database work;
 //! direct `/sql` calls are a private CLI transport detail.
 //!
 //! Implementation is a tiny self-contained HTTP/1.1 server with a
@@ -244,7 +245,7 @@ fn route(
                 "GET /v1/set/{name}",
             ],
             "operator_interface": "Use s7trace CLI commands only; HTTP is transport, not a public API.",
-            "sql_policy": "Use s7trace sql for remote read-only SQL. admin-sql is local server-host maintenance only. Direct HTTP SQL/curl is forbidden.",
+            "sql_policy": "Use s7trace -r URL sql for remote read-only SQL. Use --local-db for intentional local SQLite access. admin-sql is local server-host maintenance only. Direct HTTP SQL/curl is forbidden.",
         })),
         ("GET", _) => Response::err(404, "not found"),
         ("POST", _) => Response::err(404, "not found"),

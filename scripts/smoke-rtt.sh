@@ -51,10 +51,10 @@ echo "==> Step 0. Cleanup"
 rm -f "$DB" "$DB-wal" "$DB-shm"
 
 echo "==> Step 1. Create PLC row"
-"$BIN" --db "$DB" admin-sql \
+"$BIN" --db "$DB" --local-db admin-sql \
   "INSERT INTO plc (name, host, rack, slot, enabled) VALUES
    ('$PLC_NAME', '$PLC_HOST', $RACK, $SLOT, 1);"
-"$BIN" --db "$DB" admin-sql \
+"$BIN" --db "$DB" --local-db admin-sql \
   "INSERT INTO poll_group (name, period_ms, enabled) VALUES
    ('fast', 100, 1),
    ('medium', 250, 1),
@@ -62,19 +62,19 @@ echo "==> Step 1. Create PLC row"
 
 echo "==> Step 2. Add 5 tags (each does a sync PLC read; expect bad=0)"
 # group fast (100ms)
-"$BIN" --db "$DB" tag-add --plc $PLC_NAME --name cfg.TRS1.Conv_Speed_mm_s \
+"$BIN" --db "$DB" --local-db tag-add --plc $PLC_NAME --name cfg.TRS1.Conv_Speed_mm_s \
     --address DB5999.DBW22 --type i16 --poll-group fast --storage-hook on_change || true
-"$BIN" --db "$DB" tag-add --plc $PLC_NAME --name DB5997.Section_Run \
+"$BIN" --db "$DB" --local-db tag-add --plc $PLC_NAME --name DB5997.Section_Run \
     --address DB5997.DBX10.1 --type bool --poll-group fast --storage-hook on_change || true
-"$BIN" --db "$DB" tag-add --plc $PLC_NAME --name DB5997.Entries_Used \
+"$BIN" --db "$DB" --local-db tag-add --plc $PLC_NAME --name DB5997.Entries_Used \
     --address DB5997.DBW0 --type i16 --poll-group fast --storage-hook on_change || true
-"$BIN" --db "$DB" tag-add --plc $PLC_NAME --name TRS5.Statistical.Missing \
+"$BIN" --db "$DB" --local-db tag-add --plc $PLC_NAME --name TRS5.Statistical.Missing \
     --address DB5999.DBW3486 --type i16 --poll-group fast --storage-hook on_change || true
-"$BIN" --db "$DB" tag-add --plc $PLC_NAME --name RTT_ISD_ID_1.LIC \
+"$BIN" --db "$DB" --local-db tag-add --plc $PLC_NAME --name RTT_ISD_ID_1.LIC \
     --address DB5999.DBD2196 --type i32 --poll-group fast --storage-hook on_change || true
 
 echo "==> Step 3. Show tag list with bad/status"
-"$BIN" --db "$DB" sql \
+"$BIN" --db "$DB" --local-db sql \
   "SELECT id, name, address, data_type, bad, COALESCE(bad_class,'') AS bc, last_value_i, last_value_f FROM tag ORDER BY id;"
 
 echo "==> Step 4. One-shot `read` (requires server, but we'll skip if not running)"
@@ -88,21 +88,21 @@ SERVER_PID=$!
 sleep 5
 
 echo "  poll_cycle summary:"
-"$BIN" --db "$DB" sql \
+"$BIN" --db "$DB" --local-db sql \
   "SELECT plc_id, COUNT(*) AS cycles, MIN(ts) AS first_ts, MAX(ts) AS last_ts, SUM(ok) AS ok_cycles
    FROM poll_cycle GROUP BY plc_id;"
 
 echo "  sample summary (per tag):"
-"$BIN" --db "$DB" sql \
+"$BIN" --db "$DB" --local-db sql \
   "SELECT t.name, COUNT(s.id) AS samples, MIN(s.ts) AS first_ts, MAX(s.ts) AS last_ts
    FROM tag t LEFT JOIN sample s ON s.tag_id = t.id GROUP BY t.id ORDER BY t.id;"
 
 echo "  read_span summary:"
-"$BIN" --db "$DB" sql \
+"$BIN" --db "$DB" --local-db sql \
   "SELECT plc_id, COUNT(*) AS spans, SUM(ok) AS ok_spans FROM read_span GROUP BY plc_id;"
 
 echo "  PLC state:"
-"$BIN" --db "$DB" sql \
+"$BIN" --db "$DB" --local-db sql \
   "SELECT name, connectivity, last_ok_ts, COALESCE(last_error,'') AS err FROM plc;"
 
 echo "==> Step 6. Stop server"

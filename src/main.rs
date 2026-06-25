@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use rusqlite::Connection;
 
 mod api;
@@ -34,7 +34,13 @@ fn run_main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        None | Some(Command::Server { dry_run: false, .. }) => {
+        None => {
+            eprintln!("error: no command specified. Use `s7trace server` explicitly, or choose a client target with `-r URL` or `--local-db`.");
+            Cli::command().print_help()?;
+            eprintln!();
+            std::process::exit(ExitCode::BadInput as i32);
+        }
+        Some(Command::Server { dry_run: false, .. }) => {
             let (dry_run, http_bind, control_window, strict_overrun) = match &cli.command {
                 Some(Command::Server {
                     dry_run,
@@ -68,12 +74,101 @@ fn run_main() -> Result<()> {
         }
         Some(Command::Server { .. }) => dry_run_check(&cli.db),
         Some(_) => {
-            // CLI mode — open DB and dispatch command
-            let conn = db::schema::open(&cli.db)
-                .with_context(|| format!("opening database {} for s7trace", cli.db))?;
+            validate_client_target(&cli)?;
+            let conn = if cli.remote_server.is_some() {
+                db::schema::open_memory()
+                    .context("opening in-memory client placeholder database")?
+            } else {
+                db::schema::open(&cli.db)
+                    .with_context(|| format!("opening database {} for s7trace", cli.db))?
+            };
             let exit_code = dispatch(&cli, &conn)?;
             std::process::exit(exit_code as i32);
         }
+    }
+}
+
+fn validate_client_target(cli: &Cli) -> Result<()> {
+    let cmd = cli
+        .command
+        .as_ref()
+        .expect("validate_client_target called without command");
+    if cli.remote_server.is_none() && !cli.local_db {
+        eprintln!(
+            "error: client target not specified. Use `-r http://HOST:8080` for a server, or `--local-db` for direct local SQLite access."
+        );
+        std::process::exit(ExitCode::BadInput as i32);
+    }
+    if cli.remote_server.is_some() && !supports_remote(cmd) {
+        eprintln!(
+            "error: `{}` does not support remote mode. Use `--local-db` on the server host with the correct --db path, or use a dedicated supported remote command.",
+            command_name(cmd)
+        );
+        std::process::exit(ExitCode::BadInput as i32);
+    }
+    Ok(())
+}
+
+fn supports_remote(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Sql { .. }
+            | Command::CommandCancel { .. }
+            | Command::TagAdd { .. }
+            | Command::TagUpdate { .. }
+            | Command::TagDisable { .. }
+            | Command::TagRevalidate { .. }
+            | Command::Read { .. }
+            | Command::ReadRaw { .. }
+            | Command::Status { .. }
+            | Command::SetCreate { .. }
+            | Command::SetAddTag { .. }
+            | Command::SetRemoveTag { .. }
+            | Command::SetEnable { .. }
+            | Command::SetDisable { .. }
+            | Command::SetList { .. }
+            | Command::SetShow { .. }
+            | Command::CollectionStart { .. }
+            | Command::CollectionStop { .. }
+            | Command::PlcAdd { .. }
+            | Command::PollGroupAdd { .. }
+            | Command::TagImport { .. }
+    )
+}
+
+fn command_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Sql { .. } => "sql",
+        Command::AdminSql { .. } => "admin-sql",
+        Command::CommandList { .. } => "command-list",
+        Command::CommandWait { .. } => "command-wait",
+        Command::CommandCancel { .. } => "command-cancel",
+        Command::CommandResult { .. } => "command-result",
+        Command::TagAdd { .. } => "tag-add",
+        Command::TagUpdate { .. } => "tag-update",
+        Command::TagDisable { .. } => "tag-disable",
+        Command::TagRevalidate { .. } => "tag-revalidate",
+        Command::Read { .. } => "read",
+        Command::ReadRaw { .. } => "read-raw",
+        Command::Status { .. } => "status",
+        Command::SetCreate { .. } => "set-create",
+        Command::SetAddTag { .. } => "set-add-tag",
+        Command::SetRemoveTag { .. } => "set-remove-tag",
+        Command::SetEnable { .. } => "set-enable",
+        Command::SetDisable { .. } => "set-disable",
+        Command::SetList { .. } => "set-list",
+        Command::SetShow { .. } => "set-show",
+        Command::CollectionStart { .. } => "collection-start",
+        Command::CollectionStop { .. } => "collection-stop",
+        Command::HistoryClean { .. } => "history-clean",
+        Command::HistoryDeleteDataset { .. } => "history-delete-dataset",
+        Command::HistoryVacuum { .. } => "history-vacuum",
+        Command::PlcAdd { .. } => "plc-add",
+        Command::PollGroupAdd { .. } => "poll-group-add",
+        Command::TagImport { .. } => "tag-import",
+        Command::Event { .. } => "event",
+        Command::Note { .. } => "note",
+        Command::Server { .. } => "server",
     }
 }
 
@@ -1476,7 +1571,7 @@ fn handle_set_add_tag(
         let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
 
         if from_sql.is_some() {
-            return Err(anyhow::anyhow!("--from-sql not supported with --remote-server"));
+            return Err(anyhow::anyhow!("--from-sql not supported in remote mode"));
         }
 
         // Resolve from_file client-side into a comma list
@@ -1623,7 +1718,7 @@ fn handle_set_remove_tag(
         let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
 
         if from_sql.is_some() {
-            return Err(anyhow::anyhow!("--from-sql not supported with --remote-server"));
+            return Err(anyhow::anyhow!("--from-sql not supported in remote mode"));
         }
 
         let tag_str = tag.ok_or_else(|| anyhow::anyhow!("provide --tag"))?;
@@ -2684,6 +2779,7 @@ mod tests {
         Cli {
             db: ":memory:".into(),
             remote_server: None,
+            local_db: true,
             remote_timeout_ms: 30_000,
             command: None,
         }
@@ -2711,6 +2807,7 @@ mod tests {
         let conn = db::schema::open_memory().unwrap();
         let mut cli = local_cli();
         cli.remote_server = Some("http://127.0.0.1:8080".into());
+        cli.local_db = false;
         let result = handle_admin_sql(&cli, &conn, "UPDATE plc SET enabled = 0");
         assert!(result.is_ok());
         assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
@@ -2722,6 +2819,7 @@ mod tests {
         let cli = Cli {
             db: ":memory:".into(),
             remote_server: None,
+            local_db: true,
             remote_timeout_ms: 30_000,
             command: None,
         };
@@ -2749,6 +2847,7 @@ mod tests {
         let cli = Cli {
             db: ":memory:".into(),
             remote_server: None,
+            local_db: true,
             remote_timeout_ms: 30_000,
             command: None,
         };
@@ -2763,6 +2862,7 @@ mod tests {
         let cli = Cli {
             db: ":memory:".into(),
             remote_server: None,
+            local_db: true,
             remote_timeout_ms: 30_000,
             command: None,
         };
@@ -2804,6 +2904,7 @@ mod tests {
         let cli = Cli {
             db: ":memory:".into(),
             remote_server: None,
+            local_db: true,
             remote_timeout_ms: 30_000,
             command: None,
         };
@@ -2876,6 +2977,7 @@ mod tests {
         let cli = Cli {
             db: ":memory:".into(),
             remote_server: None,
+            local_db: true,
             remote_timeout_ms: 30_000,
             command: None,
         };
@@ -2907,6 +3009,7 @@ mod tests {
         let cli = Cli {
             db: ":memory:".into(),
             remote_server: None,
+            local_db: true,
             remote_timeout_ms: 30_000,
             command: None,
         };
@@ -2955,6 +3058,7 @@ signals:
         let cli = Cli {
             db: ":memory:".into(),
             remote_server: None,
+            local_db: true,
             remote_timeout_ms: 30_000,
             command: None,
         };
@@ -3009,6 +3113,7 @@ signals:
         let cli = Cli {
             db: ":memory:".into(),
             remote_server: Some("http://example.com".into()),
+            local_db: false,
             remote_timeout_ms: 30_000,
             command: None,
         };

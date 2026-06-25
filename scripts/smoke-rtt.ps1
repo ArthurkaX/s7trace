@@ -41,7 +41,7 @@ Remove-Item -Path "$DB","$DB-wal","$DB-shm" -ErrorAction SilentlyContinue
 
 function Run($Args) {
     Write-Host ">> $Bin $Args" -ForegroundColor DarkGray
-    & $Bin --db $DB @Args
+    & $Bin --db $DB --local-db @Args
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "command exited with $LASTEXITCODE"
     }

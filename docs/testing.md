@@ -92,8 +92,8 @@ cargo build
 "$BIN" --db "$DB" server --dry-run
 
 # 1. Create the PLC and poll group (CLI commands, no raw SQL).
-"$BIN" --db "$DB" plc-add --name rtt --host 192.168.0.50:102 --rack 0 --slot 2
-"$BIN" --db "$DB" poll-group-add --name fast --period-ms 40
+"$BIN" --db "$DB" --local-db plc-add --name rtt --host 192.168.0.50:102 --rack 0 --slot 2
+"$BIN" --db "$DB" --local-db poll-group-add --name fast --period-ms 40
 
 # 2. Start the server.
 "$BIN" --db "$DB" server --control-window &     # control window optional
@@ -102,26 +102,26 @@ cargo build
 #    tag-import parses the signals: list, infers types from address widths,
 #    creates all tags through the queue, and auto-creates the metric set.
 #    Add --validate to immediately read each tag from the PLC.
-"$BIN" --db "$DB" tag-import --plc rtt --file temp/rtt_diagnostic.yaml \
+"$BIN" --db "$DB" --local-db tag-import --plc rtt --file temp/rtt_diagnostic.yaml \
   --set rtt_diag --poll-group fast --validate
 
 # 4. The set was already created by tag-import. If you need to add more tags
 #    or create a set manually later:
-#    "$BIN" --db "$DB" set-create  --plc rtt --name extra_set
-#    "$BIN" --db "$DB" set-add-tag --set extra_set --tag DB5997.Entries_Used
-#    "$BIN" --db "$DB" set-enable  extra_set
+#    "$BIN" --db "$DB" --local-db set-create  --plc rtt --name extra_set
+#    "$BIN" --db "$DB" --local-db set-add-tag --set extra_set --tag DB5997.Entries_Used
+#    "$BIN" --db "$DB" --local-db set-enable  extra_set
 
 # 5. Start collection into a named dataset.
-"$BIN" --db "$DB" collection-start --plc rtt --dataset rtt_test --set rtt_diag
+"$BIN" --db "$DB" --local-db collection-start --plc rtt --dataset rtt_test --set rtt_diag
 
 # 6. Observe -- read-only only.
-"$BIN" --db "$DB" status --format text
-"$BIN" --db "$DB" sql "SELECT id, name, address, bad, COALESCE(bad_class,'-') AS bc
+"$BIN" --db "$DB" --local-db status --format text
+"$BIN" --db "$DB" --local-db sql "SELECT id, name, address, bad, COALESCE(bad_class,'-') AS bc
                        FROM tag ORDER BY id;"
-"$BIN" --db "$DB" sql "SELECT state, COUNT(*) FROM command_request GROUP BY state;"
+"$BIN" --db "$DB" --local-db sql "SELECT state, COUNT(*) FROM command_request GROUP BY state;"
 
 # 7. Tear down.
-"$BIN" --db "$DB" collection-stop --plc rtt
+"$BIN" --db "$DB" --local-db collection-stop --plc rtt
 taskkill //F //IM s7trace.exe
 ```
 

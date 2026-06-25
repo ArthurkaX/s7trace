@@ -18,7 +18,8 @@ inspection and controlled database maintenance, not for direct PLC access.
 Recommended command families:
 
 ```text
-s7trace sql              # read-only SQL, default output json/jsonl/table
+s7trace -r URL sql       # remote read-only SQL through the CLI transport
+s7trace --local-db sql   # local read-only SQL against --db
 s7trace command-list     # inspect queued commands
 s7trace command-wait     # wait for queued command completion
 s7trace command-result   # print stored command result
@@ -51,12 +52,15 @@ Read-only SQL can execute directly in the CLI.
 The default SQL mode should be read-only:
 
 ```text
-s7trace sql "select name, bad, bad_class, bad_detail from tag where bad = 1"
+s7trace --local-db sql "select name, bad, bad_class, bad_detail from tag where bad = 1"
+s7trace -r http://HOST:8080 sql "select name, bad, bad_class, bad_detail from tag where bad = 1"
 ```
 
 Default behavior:
 
-- Open SQLite with a read-only connection.
+- Use the target selected by `-r URL` or `--local-db`. The CLI must not fall
+  back to a local database implicitly.
+- Open local SQLite with a read-only connection in `--local-db` mode.
 - Allow only statements that produce rows.
 - Apply a default row limit unless the query already has a tighter limit.
 - Support `--format table`, `--format json`, and `--format jsonl`.
@@ -66,15 +70,19 @@ Default behavior:
 LLM-friendly default:
 
 ```text
-s7trace sql --format jsonl --limit 200 "select * from v_tag_status"
+s7trace --local-db sql --format jsonl --limit 200 "select * from v_tag_status"
+s7trace -r http://HOST:8080 sql --format jsonl --limit 200 "select * from v_tag_status"
 ```
 
 Write-capable SQL should not be the common path. If needed for maintenance, make
 it explicit:
 
 ```text
-s7trace admin-sql --write "update tag set enabled = 0 where bad = 1"
+s7trace --local-db admin-sql "update tag set enabled = 0 where bad = 1"
 ```
+
+`admin-sql` is local-only maintenance. It is rejected with `-r`; remote writes
+must use supported typed commands, or a new typed command must be added.
 
 Normal tag changes should use typed commands instead of SQL updates because
 typed commands can validate against the PLC and return a useful result.
@@ -275,8 +283,8 @@ Minimum fields:
 The CLI can expose the same data as table or JSON:
 
 ```text
-s7trace status --format json
-s7trace sql "select * from v_tag_status where bad = 1"
+s7trace -r http://HOST:8080 status --format json
+s7trace -r http://HOST:8080 sql "select * from v_tag_status where bad = 1"
 ```
 
 ## Practical Rule

@@ -39,10 +39,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> 1. Seed DB"
-"$BIN" --db "$DB" admin-sql \
+"$BIN" --db "$DB" --local-db admin-sql \
     "INSERT INTO plc (name, host, rack, slot, enabled)
      VALUES ('test_plc', '127.0.0.1:$PLC_PORT', 0, 2, 1);" >/dev/null 2>&1
-"$BIN" --db "$DB" admin-sql \
+"$BIN" --db "$DB" --local-db admin-sql \
     "INSERT INTO poll_group (name, period_ms, enabled)
      VALUES ('fast', 100, 1);" >/dev/null 2>&1
 echo "    OK"
@@ -121,15 +121,15 @@ echo "    OK"
 
 echo "==> 8. DB inspection: tags + command queue"
 echo "    --- tags ---"
-"$BIN" --db "$DB" sql \
+"$BIN" --db "$DB" --local-db sql \
     "SELECT id, name, address, bad, COALESCE(bad_class, '-') AS bc
      FROM tag ORDER BY id;" 2>&1 | tail -10
 echo "    --- commands ---"
-"$BIN" --db "$DB" sql \
+"$BIN" --db "$DB" --local-db sql \
     "SELECT state, COUNT(*) AS n
      FROM command_request GROUP BY state;" 2>&1 | tail -5
 echo "    --- results ---"
-"$BIN" --db "$DB" sql \
+"$BIN" --db "$DB" --local-db sql \
     "SELECT cr.ok, COUNT(*) AS n
      FROM command_result cr
      JOIN command_request cmd ON cmd.id = cr.command_id

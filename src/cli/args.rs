@@ -7,20 +7,19 @@ use clap::{Parser, Subcommand};
     version,
     about = "Read-only data collection service for Siemens S7 PLCs",
     long_about = "s7trace polls and stores data from Siemens S7 PLCs.\n\n\
-        Run `s7trace server` on a host that has network access to the PLC. Every\n\
-        other subcommand is a client: it submits work to the server's durable\n\
-        command queue and prints the result. Clients reach the server either\n\
-        locally (same machine, shared --db) or over the network with -r/--remote-server.\n\
-        All commands work identically in both modes.",
+        Run `s7trace server` explicitly on a host that has network access to the PLC.\n\
+        Every other subcommand is a client. Client commands require an explicit target:\n\
+        `-r http://HOST:8080` for a server, or `--local-db` for direct local SQLite\n\
+        and command-queue access. The CLI never falls back to local DB implicitly.",
     after_help = "QUICKSTART  (bare database -> live collection):\n  \
-        s7trace plc-add --name line1 --host 192.168.0.1:102 --rack 0 --slot 2\n  \
-        s7trace poll-group-add --name fast --period-ms 1000\n  \
-        s7trace tag-import --plc line1 --file signals.yaml --set diag --poll-group fast\n  \
-        s7trace set-enable diag\n  \
-        s7trace collection-start --plc line1 --dataset run1 --set diag\n  \
-        s7trace read --plc line1 --address DB1.DBW0 --type i16\n  \
-        s7trace status --format json\n  \
-        s7trace collection-stop --plc line1\n\
+        s7trace --local-db plc-add --name line1 --host 192.168.0.1:102 --rack 0 --slot 2\n  \
+        s7trace --local-db poll-group-add --name fast --period-ms 1000\n  \
+        s7trace --local-db tag-import --plc line1 --file signals.yaml --set diag --poll-group fast\n  \
+        s7trace --local-db set-enable diag\n  \
+        s7trace --local-db collection-start --plc line1 --dataset run1 --set diag\n  \
+        s7trace --local-db read --plc line1 --address DB1.DBW0 --type i16\n  \
+        s7trace --local-db status --format json\n  \
+        s7trace --local-db collection-stop --plc line1\n\
         \n\
         COMMAND GROUPS:\n  \
         config    plc-add  poll-group-add  tag-add  tag-import  tag-update  tag-disable\n  \
@@ -30,10 +29,13 @@ use clap::{Parser, Subcommand};
         history   history-clean  history-delete-dataset  history-vacuum\n  \
         admin     server  admin-sql  tag-revalidate\n\
         \n\
-        REMOTE USE:  prefix any command with `-r http://HOST:8080`\n  \
+        TARGETS:\n  \
+        Remote server: prefix supported commands with `-r http://HOST:8080`\n  \
         (or set S7TRACE_REMOTE_SERVER). The CLI then needs no direct PLC access.\n  \
+        Local DB: add `--local-db` to opt into direct SQLite access using --db.\n  \
+        Never omit both: local DB is an explicit target, not fallback.\n  \
         HTTP is transport only: operators must use `s7trace` commands, not curl.\n  \
-        SQL access is only `s7trace sql` / `s7trace admin-sql`; direct HTTP SQL is forbidden.\n\
+        Remote SQL is only `s7trace -r URL sql`; admin-sql is local-db only.\n\
         \n\
         Run `s7trace <command> --help` for the options of a single command."
 )]
@@ -49,15 +51,20 @@ pub struct Cli {
 
     /// Route operations through a s7trace server at this URL (e.g.
     /// http://10.0.0.1:8080). This URL is CLI transport only: do not use curl
-    /// or call HTTP endpoints directly. For SQL, use `s7trace sql` (read-only)
-    /// or `s7trace admin-sql` (maintenance writes).
+    /// or call HTTP endpoints directly. For SQL, use `s7trace -r URL sql`
+    /// remotely, or `s7trace --local-db sql` / `admin-sql` locally.
     #[arg(
         short = 'r',
-        long = "remote-server",
+        long(None::<&str>),
         env = "S7TRACE_REMOTE_SERVER",
         global = true
     )]
     pub remote_server: Option<String>,
+
+    /// Explicitly use the local SQLite database selected by --db. Required for
+    /// direct local DB inspection/maintenance. Mutually exclusive with -r.
+    #[arg(long = "local-db", global = true, conflicts_with = "remote_server")]
+    pub local_db: bool,
 
     /// Maximum time to wait for a remote command to complete, in ms.
     #[arg(long = "remote-timeout-ms", default_value_t = 30_000, global = true)]
@@ -108,7 +115,7 @@ pub enum Command {
 
     /// Execute write-capable SQL against the local database (maintenance only).
     AdminSql {
-        /// SQL statement. This command is local-only: `-r/--remote-server`
+        /// SQL statement. This command is local-only: `-r`
         /// is rejected. For a server database, run this on the server host
         /// with the server's --db path. Do not use curl or direct HTTP SQL.
         query: String,

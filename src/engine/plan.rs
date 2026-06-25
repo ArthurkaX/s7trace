@@ -31,6 +31,17 @@ const S7_MULTI_RESP_PER_ITEM: usize = 4; // 4-byte data-item header per response
 /// Headroom kept below the negotiated PDU when sizing multi-read spans.
 const S7_PDU_SAFETY_MARGIN: usize = 4;
 
+/// Maximum items in a single multi-read request.
+///
+/// S7-300 / S7-400 CPUs often return fewer item-results than requested even
+/// when the PDU budget looks sufficient. This cap forces the planner to split
+/// large sparse-DB groups into several smaller multi-read requests, avoiding
+/// the "expected N results, got M" failure. Value chosen conservatively based
+/// on observed behaviour: DB1291 with 8 items on an S7-300 returned 5.
+///
+/// Set to 0 to disable the item-count cap (rely on PDU budget alone).
+const MAX_MULTI_READ_ITEMS: usize = 3;
+
 /// S7 pads odd-length item data up to an even boundary in the response PDU.
 fn pad_even(x: usize) -> usize {
     x + (x & 1)
@@ -165,7 +176,9 @@ pub fn build_plan(
             let item_req = S7_MULTI_REQ_PER_ITEM;
             let item_resp = S7_MULTI_RESP_PER_ITEM + pad_even(s.byte_len);
             if !bin.is_empty()
-                && (req_cost + item_req > budget || resp_cost + item_resp > budget)
+                && (bin.len() >= MAX_MULTI_READ_ITEMS
+                    || req_cost + item_req > budget
+                    || resp_cost + item_resp > budget)
             {
                 flush_bin(&mut bin, &mut optimized, poll_group_id);
                 req_cost = S7_MULTI_REQ_HEADER;

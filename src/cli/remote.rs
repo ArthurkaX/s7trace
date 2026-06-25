@@ -106,11 +106,48 @@ pub fn get_tags(
         .with_context(|| format!("invalid JSON from {url}: {resp}"))
 }
 
+/// Fetch /v1/sets?plc=... and return the JSON array.
+pub fn get_set_list(
+    base_url: &str,
+    plc: Option<&str>,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let url = if let Some(p) = plc {
+        format!("/v1/sets?plc={}", urlencode(p))
+    } else {
+        "/v1/sets".to_string()
+    };
+    let resp = http_get(base_url, &url, timeout)?;
+    serde_json::from_str(&resp)
+        .with_context(|| format!("invalid JSON from {url}: {resp}"))
+}
+
+/// Fetch /v1/set/{name} and return the JSON object.
+pub fn get_set_show(
+    base_url: &str,
+    set_name: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let url = format!("/v1/set/{}", urlencode(set_name));
+    let resp = http_get(base_url, &url, timeout)?;
+    serde_json::from_str(&resp)
+        .with_context(|| format!("invalid JSON from {url}: {resp}"))
+}
+
+/// POST /v1/command/{id}/cancel to cancel a pending command.
+pub fn cancel_command(base_url: &str, command_id: i64, timeout: Duration) -> Result<()> {
+    let path = format!("/v1/command/{command_id}/cancel");
+    let resp = http_post(base_url, &path, "", timeout)?;
+    // Server returns 204 No Content on success
+    let _ = resp;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Minimal std::net HTTP client (no external crate)
 // ---------------------------------------------------------------------------
 
-fn http_get(base_url: &str, path: &str, timeout: Duration) -> Result<String> {
+pub fn http_get(base_url: &str, path: &str, timeout: Duration) -> Result<String> {
     let (host, port) = parse_base(base_url)?;
     let addr = format!("{host}:{port}");
     let mut stream = TcpStream::connect_timeout(&addr.parse()?, timeout)
@@ -189,7 +226,7 @@ fn parse_http_response(buf: &[u8]) -> Result<String> {
     Ok(body)
 }
 
-fn urlencode(s: &str) -> String {
+pub fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

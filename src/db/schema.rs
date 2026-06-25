@@ -111,10 +111,11 @@ mod tests {
     #[test]
     fn test_migration_file_matches_docs() {
         // `migrations/0001_initial.sql` and `docs/schema.sql` must stay
-        // byte-identical so that re-opening a database is always safe.
+        // logically identical so that re-opening a database is always safe.
         // If you change the schema, update both files.
         let docs_sql = std::fs::read_to_string("docs/schema.sql")
             .expect("read docs/schema.sql");
+        let docs_sql = docs_sql.replace("\r\n", "\n");
         assert_eq!(
             MIGRATION_0001, docs_sql,
             "migrations/0001_initial.sql and docs/schema.sql diverged"

@@ -11,6 +11,11 @@
 //! - `POST /command`            — submit a new command (JSON: `{kind, request, timeout_ms?}`)
 //! - `POST /command/{id}/cancel` — cancel pending command
 //!
+//! The HTTP surface is an internal transport for the `s7trace` CLI. Operators
+//! must use `s7trace` commands instead of calling these endpoints directly.
+//! SQL access is especially restricted to `s7trace sql` / `s7trace admin-sql`;
+//! direct `/sql` calls are a private CLI transport detail.
+//!
 //! Implementation is a tiny self-contained HTTP/1.1 server with a
 //! thread-per-connection model. No external HTTP crate is required to
 //! keep dependencies minimal and avoid pulling in TLS / async runtime.
@@ -196,6 +201,7 @@ fn route(
         ("GET", "/rollup") => handle_rollup(db, query),
         ("GET", "/event") => handle_event(db, query),
         ("GET", "/command") => handle_command_list(db, query),
+        ("GET", "/sql") => handle_sql(db, query),
         ("GET", p) if p.starts_with("/command/") => {
             let rest = &p["/command/".len()..];
             if let Some(id_str) = rest.split('/').next() {
@@ -213,6 +219,14 @@ fn route(
             }
             Response::err(400, "invalid command id")
         }
+        ("GET", "/sets") => handle_set_list_api(db, query),
+        ("GET", p) if p.starts_with("/set/") => {
+            let name = &p["/set/".len()..];
+            if name.is_empty() {
+                return Response::err(400, "missing set name");
+            }
+            handle_set_show_api(db, name)
+        }
         ("GET", "/") => Response::json(serde_json::json!({
             "service": "s7trace",
             "api_version": 1,
@@ -226,7 +240,11 @@ fn route(
                 "GET /v1/command/{id}",
                 "POST /v1/command",
                 "POST /v1/command/{id}/cancel",
+                "GET /v1/sets?plc=",
+                "GET /v1/set/{name}",
             ],
+            "operator_interface": "Use s7trace CLI commands only; HTTP is transport, not a public API.",
+            "sql_policy": "Use s7trace sql or s7trace admin-sql. Direct HTTP SQL/curl is forbidden.",
         })),
         ("GET", _) => Response::err(404, "not found"),
         ("POST", _) => Response::err(404, "not found"),
@@ -818,10 +836,178 @@ fn handle_command_cancel(db: &Arc<Mutex<Connection>>, id: i64) -> Response {
     }
 }
 
+fn handle_set_list_api(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
+    let conn = db.lock();
+    let plc = qparam(query, "plc");
+
+    let (sql, plc_param): (&str, bool) = if plc.is_some() {
+        ("SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
+          FROM v_metric_set_status vms WHERE vms.plc = ?1 ORDER BY vms.plc, vms.metric_set", true)
+    } else {
+        ("SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
+          FROM v_metric_set_status vms ORDER BY vms.plc, vms.metric_set", false)
+    };
+
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => return Response::err(500, &format!("query: {e}")),
+    };
+
+    let items: Vec<serde_json::Value> = if plc_param {
+        let plc_name = plc.unwrap();
+        match stmt.query_map(rusqlite::params![plc_name], |row| {
+            Ok(serde_json::json!({
+                "plc": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "enabled": row.get::<_, i64>(2)? != 0,
+                "tags_total": row.get::<_, i64>(3)?,
+                "tags_healthy": row.get::<_, i64>(4)?,
+                "tags_bad": row.get::<_, i64>(5)?,
+            }))
+        }) {
+            Ok(r) => r.filter_map(|x| x.ok()).collect(),
+            Err(e) => return Response::err(500, &format!("query: {e}")),
+        }
+    } else {
+        match stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "plc": row.get::<_, String>(0)?,
+                "name": row.get::<_, String>(1)?,
+                "enabled": row.get::<_, i64>(2)? != 0,
+                "tags_total": row.get::<_, i64>(3)?,
+                "tags_healthy": row.get::<_, i64>(4)?,
+                "tags_bad": row.get::<_, i64>(5)?,
+            }))
+        }) {
+            Ok(r) => r.filter_map(|x| x.ok()).collect(),
+            Err(e) => return Response::err(500, &format!("query: {e}")),
+        }
+    };
+    Response::json(serde_json::json!(items))
+}
+
+fn handle_set_show_api(db: &Arc<Mutex<Connection>>, set_name: &str) -> Response {
+    let conn = db.lock();
+
+    let set_info = match conn.query_row(
+        "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
+         FROM metric_set ms WHERE ms.name = ?1",
+        rusqlite::params![set_name],
+        |row| {
+            let id: i64 = row.get(0)?;
+            let plc_id: i64 = row.get(1)?;
+            let name: String = row.get(2)?;
+            let enabled: bool = row.get::<_, i64>(3)? != 0;
+            let desc: Option<String> = row.get(4)?;
+            Ok((id, plc_id, name, enabled, desc))
+        },
+    ) {
+        Ok(info) => info,
+        Err(_) => return Response::err(404, &format!("metric set '{set_name}' not found")),
+    };
+
+    let (id, plc_id, name, enabled, description) = set_info;
+
+    let mut stmt = match conn.prepare(
+        "SELECT t.id, t.name, t.address, t.data_type, t.bad, t.bad_class
+         FROM v_metric_set_member vmsm
+         JOIN tag t ON t.id = vmsm.tag_id
+         WHERE vmsm.metric_set = ?1",
+    ) {
+        Ok(s) => s,
+        Err(e) => return Response::err(500, &format!("query members: {e}")),
+    };
+
+    let members: Vec<serde_json::Value> = match stmt.query_map(rusqlite::params![set_name], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, i64>(0)?,
+            "name": row.get::<_, String>(1)?,
+            "address": row.get::<_, String>(2)?,
+            "data_type": row.get::<_, String>(3)?,
+            "bad": row.get::<_, i64>(4)? != 0,
+            "bad_class": row.get::<_, Option<String>>(5)?,
+        }))
+    }) {
+        Ok(rows) => rows.filter_map(|x| x.ok()).collect(),
+        Err(e) => return Response::err(500, &format!("query members: {e}")),
+    };
+
+    Response::json(serde_json::json!({
+        "id": id,
+        "plc_id": plc_id,
+        "name": name,
+        "enabled": enabled,
+        "description": description,
+        "members": members,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
+fn handle_sql(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
+    let raw = match param_owned(query, "query") {
+        Some(q) => q,
+        None => return Response::err(400, "missing query parameter"),
+    };
+    let trimmed = raw.trim().to_uppercase();
+    if !trimmed.starts_with("SELECT")
+        && !trimmed.starts_with("WITH")
+        && !trimmed.starts_with("PRAGMA")
+    {
+        return Response::err(400, "only SELECT/WITH/PRAGMA allowed");
+    }
+
+    let limit: u64 = qparam(query, "limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+
+    let limited_sql = if trimmed.contains(" LIMIT ") {
+        raw.clone()
+    } else {
+        format!("{raw} LIMIT {limit}")
+    };
+
+    let conn = db.lock();
+    let mut stmt = match conn.prepare(&limited_sql) {
+        Ok(s) => s,
+        Err(e) => return Response::err(400, &format!("sql error: {e}")),
+    };
+
+    let col_count = stmt.column_count();
+    let col_names: Vec<String> = (0..col_count)
+        .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
+        .collect();
+
+    let rows: Vec<Vec<serde_json::Value>> = match stmt.query_map([], |row| {
+        let values: Vec<serde_json::Value> = (0..col_count)
+            .map(|i| match row.get::<_, rusqlite::types::Value>(i) {
+                Ok(v) => match v {
+                    rusqlite::types::Value::Null => serde_json::Value::Null,
+                    rusqlite::types::Value::Integer(n) => serde_json::Value::Number(n.into()),
+                    rusqlite::types::Value::Real(f) => serde_json::Number::from_f64(f)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null),
+                    rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
+                    rusqlite::types::Value::Blob(b) => {
+                        serde_json::Value::String(format!("{b:02x?}"))
+                    }
+                },
+                Err(_) => serde_json::Value::Null,
+            })
+            .collect();
+        Ok(values)
+    }) {
+        Ok(r) => r.filter_map(|x| x.ok()).collect(),
+        Err(e) => return Response::err(400, &format!("sql error: {e}")),
+    };
+
+    Response::json(serde_json::json!({
+        "columns": col_names,
+        "rows": rows,
+        "count": rows.len(),
+    }))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

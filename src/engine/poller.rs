@@ -562,7 +562,7 @@ pub fn spawn_poller(
                                 plc_name, r.seq
                             );
                         } else {
-                            info!(
+                            debug!(
                                 "poller-{}: cycle {} in {:.1}ms ({} samples, {} spans)",
                                 plc_name,
                                 r.seq,

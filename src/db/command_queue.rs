@@ -34,6 +34,9 @@ pub const DEFAULT_HEARTBEAT_MS: i64 = 5_000;
 /// Maximum number of reclaim attempts before a command is marked bad.
 pub const MAX_ATTEMPTS: i64 = 3;
 
+/// Default TTL for pending commands (60 seconds).
+pub const PENDING_CMD_TTL_US: i64 = 60_000_000;
+
 /// Enqueue a new command request.
 pub fn enqueue(
     conn: &Connection,
@@ -232,6 +235,23 @@ pub fn cancel(conn: &Connection, command_id: i64) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Expire pending commands that have been pending longer than `ttl_us`.
+/// Marks them as failed with an "expired: pending past TTL" error.
+/// Returns the number of commands expired.
+pub fn expire_stale_pending(conn: &Connection, ttl_us: i64) -> Result<usize> {
+    let cutoff = now_us() - ttl_us;
+    let n = conn.execute(
+        "UPDATE command_request
+         SET state = 'bad', finished_ts = ?1, error = 'expired: pending past TTL'
+         WHERE state = 'pending' AND created_ts < ?2",
+        params![now_us(), cutoff],
+    )?;
+    if n > 0 {
+        warn!("expired {n} stale pending command(s)");
+    }
+    Ok(n)
+}
+
 /// Get command result.
 pub fn get_result(conn: &Connection, command_id: i64) -> Result<Option<CommandResult>> {
     let mut stmt = conn.prepare(
@@ -349,5 +369,39 @@ mod tests {
         // Should reclaim
         let reclaimed = claim_next(&conn).unwrap().unwrap();
         assert_eq!(reclaimed.id, id);
+    }
+
+    #[test]
+    fn test_expire_stale_pending() {
+        let conn = open_memory().unwrap();
+        // Insert an old pending command directly (created_ts far in the past)
+        let old_ts = now_us() - 1_000_000_000; // 1000 seconds ago
+        conn.execute(
+            "INSERT INTO command_request (created_ts, state, kind, request_json)
+             VALUES (?1, 'pending', 'PlcRead', '{}')",
+            params![old_ts],
+        ).unwrap();
+        // Insert a recent pending command (should NOT be expired)
+        let id_recent = crate::db::command_queue::enqueue(
+            &conn,
+            CommandKind::PlcRead,
+            r#"{}"#,
+            None,
+            None,
+            None,
+        ).unwrap();
+
+        // Expire with a short TTL that covers the old but not the recent
+        let expired = expire_stale_pending(&conn, 500_000_000).unwrap(); // 500s TTL
+        assert_eq!(expired, 1, "should expire exactly 1 old command");
+
+        // Verify the recent command is still pending
+        let recent = get_request(&conn, id_recent).unwrap().unwrap();
+        assert_eq!(recent.state as i32, CommandState::Pending as i32);
+
+        // Verify the old command is now bad
+        let old_id = id_recent - 1;
+        let old = get_request(&conn, old_id).unwrap().unwrap();
+        assert_eq!(old.state as i32, CommandState::Bad as i32);
     }
 }

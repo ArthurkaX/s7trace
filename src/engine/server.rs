@@ -985,6 +985,36 @@ fn execute_command(
                     }
                 }
 
+                "tag_enable" => {
+                    let tag_id = resolve_tag_id(conn, &req)?;
+                    {
+                        let plc_id: Option<i64> = conn
+                            .query_row(
+                                "SELECT plc_id FROM tag WHERE id = ?1",
+                                rusqlite::params![tag_id],
+                                |row| row.get(0),
+                            )
+                            .ok();
+                        conn.execute(
+                            "UPDATE tag SET enabled = 1 WHERE id = ?1",
+                            rusqlite::params![tag_id],
+                        )?;
+                        let reason = format!("tag_enable id={tag_id}");
+                        let _ = db::config_apply::schedule(
+                            conn,
+                            ApplyScope::Tag,
+                            plc_id,
+                            None,
+                            None,
+                            Some(tag_id),
+                            &reason,
+                            db::config_apply::PLAN_COOLDOWN_MS,
+                            None,
+                        );
+                        Ok((true, format!("tag {tag_id} enabled, apply scheduled")))
+                    }
+                }
+
                 "tag_update" => {
                     let tag_id = resolve_tag_id(conn, &req)?;
                     let now = now_us();
@@ -1504,6 +1534,74 @@ fn execute_command(
                         None,
                     );
                     Ok((true, format!("success set={set_name} enabled=0 apply_state=pending")))
+                }
+
+                "set_add_tag" => {
+                    let set_name = req["set_name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing set_name"))?;
+                    let tag_str = req["tag"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing tag"))?;
+
+                    let (set_id, plc_id): (i64, i64) = conn
+                        .query_row(
+                            "SELECT ms.id, ms.plc_id FROM metric_set ms WHERE ms.name = ?1",
+                            rusqlite::params![set_name],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
+
+                    let now = now_us();
+                    let pieces: Vec<&str> = tag_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                    let mut added = 0usize;
+                    for piece in &pieces {
+                        let tag_id: i64 = conn
+                            .query_row(
+                                "SELECT id FROM tag WHERE plc_id = ?1 AND name = ?2",
+                                rusqlite::params![plc_id, piece],
+                                |row| row.get(0),
+                            )
+                            .map_err(|_| anyhow::anyhow!("tag '{piece}' not found"))?;
+                        let n = conn.execute(
+                            "INSERT OR IGNORE INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![set_id, tag_id, plc_id, now],
+                        )?;
+                        added += n;
+                    }
+                    let requested = pieces.len();
+                    Ok((true, format!("success set='{set_name}' requested={requested} added={added} already_member={}", requested - added)))
+                }
+
+                "set_remove_tag" => {
+                    let set_name = req["set_name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing set_name"))?;
+                    let tag_str = req["tag"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing tag"))?;
+
+                    let set_id: i64 = conn
+                        .query_row(
+                            "SELECT id FROM metric_set WHERE name = ?1",
+                            rusqlite::params![set_name],
+                            |row| row.get(0),
+                        )
+                        .map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
+
+                    let affected = if let Ok(tag_id) = tag_str.parse::<i64>() {
+                        conn.execute(
+                            "DELETE FROM metric_set_tag WHERE metric_set_id = ?1 AND tag_id = ?2",
+                            rusqlite::params![set_id, tag_id],
+                        )?
+                    } else {
+                        conn.execute(
+                            "DELETE FROM metric_set_tag WHERE metric_set_id = ?1 AND tag_id IN (SELECT id FROM tag WHERE name = ?2)",
+                            rusqlite::params![set_id, tag_str],
+                        )?
+                    };
+                    Ok((true, format!("success removed={affected} tags from set '{set_name}'")))
                 }
 
                 "tag_import" => {
@@ -2318,6 +2416,59 @@ impl Server {
                 );
             })?;
 
+        // Resume pollers for any active datasets (survive server restart).
+        {
+            let conn = self.db.lock();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT d.plc_id, p.name, pg.id, pg.period_ms
+                 FROM dataset d
+                 JOIN plc p              ON p.id = d.plc_id
+                 JOIN tag t             ON t.plc_id = d.plc_id
+                 JOIN poll_group pg     ON pg.id = t.poll_group_id
+                 JOIN metric_set_tag mst ON mst.tag_id = t.id
+                 JOIN metric_set ms     ON ms.id = mst.metric_set_id
+                 WHERE d.state = 'active'
+                   AND t.enabled = 1
+                   AND t.bad = 0
+                   AND ms.enabled = 1
+                 ORDER BY d.plc_id, pg.id",
+            )?;
+            let rows: Vec<(i64, String, i64, u64)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+
+            let count = rows.len();
+            for (plc_id, plc_name, pg_id, period_ms) in &rows {
+                if let Err(e) = spawn_one_poller(
+                    &self.plcs,
+                    &self.pollers,
+                    &self.pdu_cache,
+                    &sample_tx,
+                    &conn,
+                    *plc_id,
+                    plc_name,
+                    *pg_id,
+                    *period_ms,
+                    self.overrun_mode,
+                ) {
+                    error!(
+                        "resume poller failed for PLC {} group {}: {e}",
+                        plc_id, pg_id
+                    );
+                }
+            }
+            info!("resumed {count} poller(s) for active dataset(s)");
+        }
+
         // Optionally start HTTP API
         if let Some(bind) = self.http_bind.clone() {
             let db_http = self.db.clone();
@@ -2387,6 +2538,17 @@ impl Server {
                     "status: {} PLC(s), {} active tag(s), {} bad, {} pending cmd(s), {} active dataset(s), {} poller(s)",
                     self.plcs.lock().len(), tag_count, bad_count, queue_count, active_ds, poller_count,
                 );
+            }
+
+            // Expire stale pending commands every 12 ticks (60 s)
+            if tick % 12 == 0 {
+                let conn = self.db.lock();
+                let expired = db::command_queue::expire_stale_pending(&conn, db::command_queue::PENDING_CMD_TTL_US)
+                    .unwrap_or(0);
+                if expired > 0 {
+                    info!("expired {expired} stale pending command(s)");
+                }
+                drop(conn);
             }
         }
 

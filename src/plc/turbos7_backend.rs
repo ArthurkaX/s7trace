@@ -149,17 +149,57 @@ impl PlcClient for Turbo7Client {
     }
 
     fn read_multi(&mut self, items: &[ReadItem]) -> Result<Vec<ReadResult>, PlcError> {
-        // turbos7's read_multiple helper is not in the public S7Client
-        // surface. Fall back to per-item read_area. The pollers do not
-        // currently use read_multi, so this is a safe stub.
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
-            let data = self.read_db(item.db_num, item.start, item.len)?;
-            out.push(ReadResult {
-                item: item.clone(),
-                data,
-            });
+        let client = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PlcError::Disconnected("read_multi: not connected".into()))?;
+        const S7_AREA_DB: u8 = 0x84;
+        let t_items: Vec<turbos7::ReadItem> = items
+            .iter()
+            .map(|it| turbos7::ReadItem {
+                area: S7_AREA_DB,
+                db_number: it.db_num,
+                start: it.start as u32,
+                size: it.len as u16,
+            })
+            .collect();
+        let res: turbos7::Result<Vec<turbos7::ReadResult>> = runtime().block_on(async {
+            client.read_multiple(&t_items).await
+        });
+        if res.is_err() {
+            if res.as_ref().err().map_or(false, |e| {
+                matches!(
+                    e,
+                    turbos7::Error::Io(_) | turbos7::Error::Connection(_) | turbos7::Error::Timeout
+                )
+            }) {
+                self.inner = None;
+            }
         }
+        let results = res.map_err(|e| plc_error_from_turbos7(&e))?;
+        if results.len() != items.len() {
+            return Err(PlcError::ProtocolError(format!(
+                "read_multi: expected {} results, got {}",
+                items.len(),
+                results.len()
+            )));
+        }
+        for (item, r) in items.iter().zip(results.iter()) {
+            if !r.success {
+                return Err(PlcError::ProtocolError(format!(
+                    "read_multi: item DB{} @{} failed (error_code={:?})",
+                    item.db_num, item.start, r.error_code
+                )));
+            }
+        }
+        let out: Vec<ReadResult> = items
+            .iter()
+            .zip(results.into_iter())
+            .map(|(item, r)| ReadResult {
+                item: item.clone(),
+                data: r.data,
+            })
+            .collect();
         Ok(out)
     }
 

@@ -16,6 +16,67 @@ const S7_READ_OVERHEAD: usize = 30; // approximate
 /// Minimum number of tags in the same DB to consider multi-read grouping.
 const MULTI_READ_MIN_TAGS: usize = 2;
 
+// S7 multi-variable-read (Read Var, function 0x04) framing overhead, in bytes.
+// turbos7's `read_multiple` issues exactly ONE request PDU and parses ONE
+// response PDU — it never chunks — so a multi-read span must fit a single
+// negotiated PDU on BOTH the request and response sides, or the PLC returns
+// fewer item-results than requested (observed: "expected 15 results, got 5"
+// on an S7-300 with pdu=240). Costs derived from turbos7 0.2.1 protocol/s7.rs:
+//   request:  S7_MULTI_REQ_HEADER + S7_MULTI_REQ_PER_ITEM * N
+//   response: S7_MULTI_RESP_HEADER + Σ (S7_MULTI_RESP_PER_ITEM + pad_even(len_i))
+const S7_MULTI_REQ_HEADER: usize = 12; // S7 header (10) + read-param header (2)
+const S7_MULTI_REQ_PER_ITEM: usize = 12; // 12-byte item specifier per request item
+const S7_MULTI_RESP_HEADER: usize = 14; // S7 header (12) + param echo (2)
+const S7_MULTI_RESP_PER_ITEM: usize = 4; // 4-byte data-item header per response item
+/// Headroom kept below the negotiated PDU when sizing multi-read spans.
+const S7_PDU_SAFETY_MARGIN: usize = 4;
+
+/// S7 pads odd-length item data up to an even boundary in the response PDU.
+fn pad_even(x: usize) -> usize {
+    x + (x & 1)
+}
+
+/// Build one `MultiRead` span from a set of same-DB block spans. Concatenates
+/// their tags and turns each source span into one multi-read item; the
+/// `byte_offset`/`byte_len` envelope spans min-start..max-end for diagnostics.
+fn make_multi_span(spans: &[ReadSpan], poll_group_id: i64) -> ReadSpan {
+    let mut multi = ReadSpan {
+        db_num: spans[0].db_num,
+        byte_offset: 0,
+        byte_len: 0,
+        tag_ids: Vec::new(),
+        poll_group_id,
+        kind: SpanKind::MultiRead,
+        multi_items: Vec::new(),
+    };
+    let mut min_start = usize::MAX;
+    let mut max_end = 0;
+    for s in spans {
+        multi.tag_ids.extend_from_slice(&s.tag_ids);
+        multi.multi_items.push(ReadItem {
+            db_num: s.db_num,
+            start: s.byte_offset,
+            len: s.byte_len,
+        });
+        min_start = min_start.min(s.byte_offset);
+        max_end = max_end.max(s.byte_offset + s.byte_len);
+    }
+    multi.byte_offset = min_start;
+    multi.byte_len = max_end - min_start;
+    multi
+}
+
+/// Emit a packed bin: <2 items → keep the original block read(s) (a multi-read
+/// of one is pointless), ≥2 items → one `MultiRead` span.
+fn flush_bin(bin: &mut Vec<ReadSpan>, out: &mut Vec<ReadSpan>, poll_group_id: i64) {
+    if bin.len() >= MULTI_READ_MIN_TAGS {
+        out.push(make_multi_span(bin, poll_group_id));
+        bin.clear();
+    } else {
+        out.extend(bin.drain(..));
+    }
+}
+
 /// Build a read plan for a given PLC and poll group from the active tags.
 ///
 /// Tags are grouped by DB number, sorted by offset, and merged into spans.
@@ -77,59 +138,44 @@ pub fn build_plan(
         spans.push(span);
     }
 
-    // Phase 2: Group sparse same-DB spans into multi-read spans.
-    // Walk through spans and merge consecutive spans in the same DB
-    // that would benefit from a multi-variable read.
+    // Phase 2: Group sparse same-DB spans into multi-read spans, packing them
+    // into bins that each fit a single S7 multi-variable-read PDU (both the
+    // request and the response must fit — see the S7_MULTI_* constants). An
+    // oversized merge makes the PLC silently drop trailing items.
+    let budget = pdu_payload.saturating_sub(S7_PDU_SAFETY_MARGIN);
     let mut optimized: Vec<ReadSpan> = Vec::new();
     let mut i = 0;
     while i < spans.len() {
         let db = spans[i].db_num;
 
-        // Collect all contiguous spans for this DB
+        // Collect all contiguous spans for this DB.
         let mut db_spans: Vec<ReadSpan> = Vec::new();
         while i < spans.len() && spans[i].db_num == db {
             db_spans.push(spans[i].clone());
             i += 1;
         }
 
-        if db_spans.len() >= MULTI_READ_MIN_TAGS {
-            // Check PDU limit: sum of all item lengths must not exceed effective_payload
-            let total_payload: usize = db_spans.iter().map(|s| s.byte_len).sum();
-            if total_payload <= effective_payload {
-                // Merge all spans in this DB into one multi-read.
-                // Each original block-read span becomes one item in the multi-read.
-                let mut multi: ReadSpan = ReadSpan {
-                    db_num: db,
-                    byte_offset: 0,
-                    byte_len: 0,
-                    tag_ids: Vec::new(),
-                    poll_group_id,
-                    kind: SpanKind::MultiRead,
-                    multi_items: Vec::new(),
-                };
-                for s in &db_spans {
-                    multi.tag_ids.extend_from_slice(&s.tag_ids);
-                    multi.multi_items.push(ReadItem {
-                        db_num: s.db_num,
-                        start: s.byte_offset,
-                        len: s.byte_len,
-                    });
-                }
-                if let (Some(first), Some(last)) = (db_spans.first(), db_spans.last()) {
-                    let first_start = first.byte_offset;
-                    let last_end = last.byte_offset + last.byte_len;
-                    multi.byte_offset = first_start;
-                    multi.byte_len = last_end - first_start;
-                }
-                optimized.push(multi);
-            } else {
-                // Exceeds PDU payload — keep as individual block-read spans
-                optimized.extend(db_spans);
+        // Greedily pack this DB's spans into multi-read bins. Start a new bin
+        // whenever adding the next item would overflow either the request or
+        // response PDU budget.
+        let mut bin: Vec<ReadSpan> = Vec::new();
+        let mut req_cost = S7_MULTI_REQ_HEADER;
+        let mut resp_cost = S7_MULTI_RESP_HEADER;
+        for s in db_spans {
+            let item_req = S7_MULTI_REQ_PER_ITEM;
+            let item_resp = S7_MULTI_RESP_PER_ITEM + pad_even(s.byte_len);
+            if !bin.is_empty()
+                && (req_cost + item_req > budget || resp_cost + item_resp > budget)
+            {
+                flush_bin(&mut bin, &mut optimized, poll_group_id);
+                req_cost = S7_MULTI_REQ_HEADER;
+                resp_cost = S7_MULTI_RESP_HEADER;
             }
-        } else {
-            // Keep as individual block-read spans
-            optimized.extend(db_spans);
+            req_cost += item_req;
+            resp_cost += item_resp;
+            bin.push(s);
         }
+        flush_bin(&mut bin, &mut optimized, poll_group_id);
     }
 
     ReadPlan {
@@ -257,5 +303,80 @@ mod tests {
         assert_eq!(plan.spans.len(), 1);
         assert_eq!(plan.spans[0].kind, SpanKind::MultiRead);
         assert_eq!(plan.spans[0].multi_items.len(), 3);
+    }
+
+    // Recompute the actual S7 wire costs for a multi-read span, mirroring the
+    // backend, to assert every emitted span fits one PDU.
+    fn multi_req_cost(span: &ReadSpan) -> usize {
+        S7_MULTI_REQ_HEADER + S7_MULTI_REQ_PER_ITEM * span.multi_items.len()
+    }
+    fn multi_resp_cost(span: &ReadSpan) -> usize {
+        S7_MULTI_RESP_HEADER
+            + span
+                .multi_items
+                .iter()
+                .map(|it| S7_MULTI_RESP_PER_ITEM + pad_even(it.len))
+                .sum::<usize>()
+    }
+
+    #[test]
+    fn test_multi_read_split_to_fit_pdu() {
+        // Many sparse same-DB tags that cannot all fit one 240-byte PDU.
+        // They must split into several MultiRead spans, each within budget,
+        // with no tag lost or duplicated. (Reproduces the S7-300 field case
+        // that produced "expected N results, got M".)
+        let pdu = 240;
+        let n = 40;
+        let mut tags = Vec::new();
+        for i in 0..n {
+            // 4-byte tags spaced 50 bytes apart → every tag is its own sparse span.
+            tags.push(make_tag(i as i64, 1, (i as usize) * 50, 4, 1));
+        }
+        let plan = build_plan(1, 1, &tags, pdu, 8);
+
+        // Must have split into more than one span.
+        assert!(
+            plan.spans.len() >= 2,
+            "expected a split, got {} span(s)",
+            plan.spans.len()
+        );
+
+        // Every MultiRead span must fit both PDU budgets; collect all tag ids.
+        let budget = pdu - S7_PDU_SAFETY_MARGIN;
+        let mut seen: Vec<i64> = Vec::new();
+        for span in &plan.spans {
+            if span.kind == SpanKind::MultiRead {
+                assert!(span.multi_items.len() >= MULTI_READ_MIN_TAGS);
+                assert!(
+                    multi_req_cost(span) <= budget,
+                    "req cost {} > budget {}",
+                    multi_req_cost(span),
+                    budget
+                );
+                assert!(
+                    multi_resp_cost(span) <= budget,
+                    "resp cost {} > budget {}",
+                    multi_resp_cost(span),
+                    budget
+                );
+            }
+            seen.extend_from_slice(&span.tag_ids);
+        }
+        seen.sort_unstable();
+        let expected: Vec<i64> = (0..n as i64).collect();
+        assert_eq!(seen, expected, "every tag must appear exactly once");
+    }
+
+    #[test]
+    fn test_single_sparse_span_stays_block_read() {
+        // One lone sparse tag in a DB has nothing to pair with → BlockRead.
+        let tags = vec![
+            make_tag(1, 1, 0, 2, 1),
+            make_tag(2, 2, 0, 2, 1), // different DB so DB1 has a single span
+        ];
+        let plan = build_plan(1, 1, &tags, 240, 8);
+        let db1: Vec<&ReadSpan> = plan.spans.iter().filter(|s| s.db_num == 1).collect();
+        assert_eq!(db1.len(), 1);
+        assert_eq!(db1[0].kind, SpanKind::BlockRead);
     }
 }

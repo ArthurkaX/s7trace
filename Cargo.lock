@@ -860,8 +860,6 @@ dependencies = [
 [[package]]
 name = "turbos7"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "588384facc99bc8380d86516889ab9880225fc30a5b36d13384004a81f351659"
 dependencies = [
  "bytes",
  "thiserror 1.0.69",

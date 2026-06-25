@@ -10,12 +10,23 @@ mod platform;
 mod plc;
 mod types;
 
-use cli::args::{Cli, Command};
+use cli::args::{Cli, Command, EventAction};
 use cli::format::Format;
+use cli::remote::urlencode;
 use plc::create_plc_client;
 use types::*;
 
 fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("s7trace-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run_main)
+        .context("starting s7trace main thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("s7trace main thread panicked"))?
+}
+
+fn run_main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_micros()
         .init();
@@ -111,9 +122,11 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             format: fmt,
             limit,
             timeout_ms: _,
-        } => handle_sql(conn, query, fmt, *limit),
+        } => handle_sql(conn, cli, query, fmt, *limit),
         Command::AdminSql { query } => handle_admin_sql(conn, query),
-        Command::CommandList { state, format: fmt } => handle_command_list(conn, state.as_deref(), fmt),
+        Command::CommandList { state, format: fmt } => {
+            handle_command_list(conn, state.as_deref(), fmt)
+        }
         Command::CommandWait {
             command_id,
             poll_ms,
@@ -123,6 +136,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             command_id,
             format: fmt,
         } => handle_command_result(conn, *command_id, fmt),
+        Command::CommandCancel { command_id } => handle_command_cancel(conn, cli, *command_id),
         Command::TagAdd {
             plc,
             name,
@@ -169,16 +183,12 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             store_mode.as_deref(),
             storage_hook.as_deref(),
         ),
-        Command::TagDisable {
-            tag_id,
-            plc,
-            name,
-        } => handle_tag_disable(conn, cli, *tag_id, plc.as_deref(), name.as_deref()),
-        Command::TagRevalidate {
-            tag_id,
-            plc,
-            name,
-        } => handle_tag_revalidate(conn, cli, *tag_id, plc.as_deref(), name.as_deref()),
+        Command::TagDisable { tag_id, plc, name } => {
+            handle_tag_disable(conn, cli, *tag_id, plc.as_deref(), name.as_deref())
+        }
+        Command::TagRevalidate { tag_id, plc, name } => {
+            handle_tag_revalidate(conn, cli, *tag_id, plc.as_deref(), name.as_deref())
+        }
         Command::Read {
             plc,
             address,
@@ -194,7 +204,17 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             format: fmt,
             save_probe,
             no_wait,
-        } => handle_read_raw(conn, cli, plc, *db, *start, *len, fmt, *save_probe, *no_wait),
+        } => handle_read_raw(
+            conn,
+            cli,
+            plc,
+            *db,
+            *start,
+            *len,
+            fmt,
+            *save_probe,
+            *no_wait,
+        ),
         Command::Status { format: fmt } => handle_status(cli, conn, fmt),
         Command::SetCreate {
             plc,
@@ -208,6 +228,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             from_file,
         } => handle_set_add_tag(
             conn,
+            cli,
             set_name,
             tag.as_deref(),
             from_sql.as_deref(),
@@ -217,18 +238,25 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             set_name,
             tag,
             from_sql,
-        } => handle_set_remove_tag(conn, set_name, tag.as_deref(), from_sql.as_deref()),
+        } => handle_set_remove_tag(conn, cli, set_name, tag.as_deref(), from_sql.as_deref()),
         Command::SetEnable {
             set_name,
             async_mode,
         } => handle_set_enable(conn, cli, set_name, *async_mode),
         Command::SetDisable { set_name } => handle_set_disable(conn, cli, set_name),
-        Command::SetList { plc } => handle_set_list(conn, plc.as_deref()),
-        Command::SetShow { set_name, set_flag } => handle_set_show(conn, set_name.as_deref(), set_flag.as_deref()),
-        Command::CollectionStart { plc, dataset, sets, no_wait } => {
-            handle_collection_start(conn, cli, plc, dataset, sets, *no_wait)
+        Command::SetList { plc } => handle_set_list(cli, conn, plc.as_deref()),
+        Command::SetShow { set_name, set_flag } => {
+            handle_set_show(conn, cli, set_name.as_deref(), set_flag.as_deref())
         }
-        Command::CollectionStop { plc, no_wait } => handle_collection_stop(conn, cli, plc, *no_wait),
+        Command::CollectionStart {
+            plc,
+            dataset,
+            sets,
+            no_wait,
+        } => handle_collection_start(conn, cli, plc, dataset, sets, *no_wait),
+        Command::CollectionStop { plc, no_wait } => {
+            handle_collection_stop(conn, cli, plc, *no_wait)
+        }
         Command::HistoryClean {
             plc,
             before_ts,
@@ -249,6 +277,19 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
         Command::PollGroupAdd { name, period_ms } => {
             handle_poll_group_add(cli, conn, name, *period_ms)
         }
+        Command::Event { action } => handle_event_add(conn, cli, action),
+        Command::Note { text, plc, dataset } => handle_event_add(
+            conn,
+            cli,
+            &EventAction::Add {
+                text: text.clone(),
+                kind: "note".to_string(),
+                severity: "info".to_string(),
+                plc: plc.clone(),
+                dataset: dataset.clone(),
+                cycle_id: None,
+            },
+        ),
         Command::TagImport {
             plc,
             file,
@@ -278,8 +319,61 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
 // SQL handlers
 // ---------------------------------------------------------------------------
 
-fn handle_sql(conn: &Connection, query: &str, fmt: &str, limit: u64) -> Result<ExitCode> {
-    // Ensure read-only: reject anything that isn't a SELECT or WITH
+fn handle_sql(conn: &Connection, cli: &Cli, query: &str, fmt: &str, limit: u64) -> Result<ExitCode> {
+    // Ensure read-only: reject anything that isn't a SELECT or WITH.
+    // Remote mode uses the private HTTP transport, but the user interface
+    // remains this CLI command.
+    if let Some(base) = &cli.remote_server {
+        let encoded = urlencode(query);
+        let url = format!("/v1/sql?query={}&limit={}", encoded, limit);
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let resp = match cli::remote::http_get(base, &url, timeout) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return Ok(ExitCode::BadInput);
+            }
+        };
+        let v: serde_json::Value = match serde_json::from_str(&resp) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error parsing server response: {e}");
+                return Ok(ExitCode::BadInput);
+            }
+        };
+        let columns: Vec<String> = v["columns"].as_array()
+            .map(|a| a.iter().map(|x| x.as_str().unwrap_or("?").to_string()).collect())
+            .unwrap_or_default();
+        let rows = v["rows"].as_array().cloned().unwrap_or_default();
+        let out_fmt = Format::from_str(fmt);
+        match out_fmt {
+            Format::Table => {
+                println!("{}", columns.join("\t"));
+                for row in &rows {
+                    let vals: Vec<String> = row.as_array().unwrap().iter().map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Null => "NULL".to_string(),
+                        other => other.to_string(),
+                    }).collect();
+                    println!("{}", vals.join("\t"));
+                }
+            }
+            Format::Json => {
+                println!("{}", serde_json::to_string_pretty(&rows).unwrap_or_default());
+            }
+            _ => {
+                for row in &rows {
+                    let vals: Vec<String> = row.as_array().unwrap().iter().map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }).collect();
+                    println!("{}", vals.join(" "));
+                }
+            }
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     let trimmed = query.trim().to_uppercase();
     if !trimmed.starts_with("SELECT")
         && !trimmed.starts_with("WITH")
@@ -443,7 +537,12 @@ fn fmt_ts(us: i64) -> String {
         .unwrap_or_else(|| us.to_string())
 }
 
-fn wait_and_print(conn: &Connection, command_id: i64, poll_ms: u64, timeout_ms: u64) -> Result<ExitCode> {
+fn wait_and_print(
+    conn: &Connection,
+    command_id: i64,
+    poll_ms: u64,
+    timeout_ms: u64,
+) -> Result<ExitCode> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let poll_dur = std::time::Duration::from_millis(poll_ms);
 
@@ -506,6 +605,27 @@ fn handle_command_result(conn: &Connection, command_id: i64, fmt: &str) -> Resul
         None => {
             eprintln!("command {command_id}: no result yet (still pending or unknown)");
             Ok(ExitCode::Overload)
+        }
+    }
+}
+
+fn handle_command_cancel(conn: &Connection, cli: &Cli, command_id: i64) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        cli::remote::cancel_command(base, command_id, timeout)?;
+        println!("success command {command_id} cancelled");
+        return Ok(ExitCode::Ok);
+    }
+
+    match db::command_queue::cancel(conn, command_id)? {
+        true => {
+            println!("success command {command_id} cancelled");
+            Ok(ExitCode::Ok)
+        }
+        false => {
+            eprintln!("error: command {command_id} not cancellable (not in pending state)");
+            Ok(ExitCode::BadInput)
         }
     }
 }
@@ -812,7 +932,13 @@ fn handle_tag_update(
     Ok(ExitCode::Ok)
 }
 
-fn handle_tag_disable(conn: &Connection, cli: &Cli, tag_id_opt: Option<i64>, plc: Option<&str>, name: Option<&str>) -> Result<ExitCode> {
+fn handle_tag_disable(
+    conn: &Connection,
+    cli: &Cli,
+    tag_id_opt: Option<i64>,
+    plc: Option<&str>,
+    name: Option<&str>,
+) -> Result<ExitCode> {
     if let Some(base) = &cli.remote_server {
         let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
         let req = serde_json::json!({
@@ -869,7 +995,13 @@ fn handle_tag_disable(conn: &Connection, cli: &Cli, tag_id_opt: Option<i64>, plc
     Ok(ExitCode::Ok)
 }
 
-fn handle_tag_revalidate(conn: &Connection, cli: &Cli, tag_id_opt: Option<i64>, plc: Option<&str>, name: Option<&str>) -> Result<ExitCode> {
+fn handle_tag_revalidate(
+    conn: &Connection,
+    cli: &Cli,
+    tag_id_opt: Option<i64>,
+    plc: Option<&str>,
+    name: Option<&str>,
+) -> Result<ExitCode> {
     if let Some(base) = &cli.remote_server {
         let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
         let req = serde_json::json!({
@@ -950,8 +1082,12 @@ fn handle_read(
         )?;
         println!("queued command_id={id}");
         if !no_wait {
-            let (state, result, ok, err) =
-                cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+            let (state, result, ok, err) = cli::remote::wait_command(
+                base,
+                id,
+                timeout,
+                std::time::Duration::from_millis(200),
+            )?;
             if ok {
                 println!("{result}");
             } else {
@@ -1322,11 +1458,65 @@ fn handle_set_create(
 
 fn handle_set_add_tag(
     conn: &Connection,
+    cli: &Cli,
     set_name: &str,
     tag: Option<&str>,
     from_sql: Option<&str>,
     from_file: Option<&str>,
 ) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+
+        if from_sql.is_some() {
+            return Err(anyhow::anyhow!("--from-sql not supported with --remote-server"));
+        }
+
+        // Resolve from_file client-side into a comma list
+        let tag_str = if let Some(path) = from_file {
+            let content =
+                std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+            let names: Vec<&str> = content
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            if names.is_empty() {
+                return Err(anyhow::anyhow!("no tag names found in {path}"));
+            }
+            Some(names.join(","))
+        } else {
+            tag.map(|s| s.to_string())
+        };
+
+        let tag_str =
+            tag_str.ok_or_else(|| anyhow::anyhow!("provide --tag or --from-file"))?;
+
+        let req = serde_json::json!({
+            "action": "set_add_tag",
+            "set_name": set_name,
+            "tag": tag_str,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     // Resolve set
     let set: (i64, i64) = conn
         .query_row(
@@ -1416,10 +1606,46 @@ fn handle_set_add_tag(
 
 fn handle_set_remove_tag(
     conn: &Connection,
+    cli: &Cli,
     set_name: &str,
     tag: Option<&str>,
     from_sql: Option<&str>,
 ) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+
+        if from_sql.is_some() {
+            return Err(anyhow::anyhow!("--from-sql not supported with --remote-server"));
+        }
+
+        let tag_str = tag.ok_or_else(|| anyhow::anyhow!("provide --tag"))?;
+
+        let req = serde_json::json!({
+            "action": "set_remove_tag",
+            "set_name": set_name,
+            "tag": tag_str,
+        });
+        let id = cli::remote::enqueue_command(
+            base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     let set_id: i64 = conn
         .query_row(
             "SELECT id FROM metric_set WHERE name = ?1",
@@ -1608,7 +1834,30 @@ fn handle_set_disable(conn: &Connection, _cli: &Cli, set_name: &str) -> Result<E
     Ok(ExitCode::Ok)
 }
 
-fn handle_set_list(conn: &Connection, plc: Option<&str>) -> Result<ExitCode> {
+fn handle_set_list(cli: &Cli, conn: &Connection, plc: Option<&str>) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let data = cli::remote::get_set_list(base, plc, timeout)?;
+        // Render same human output as local mode
+        println!(
+            "{:<20} {:<30} {:<8} {:<6} {:<8} {:<4}",
+            "PLC", "Set", "Enabled", "Total", "Healthy", "Bad"
+        );
+        if let Some(arr) = data.as_array() {
+            for item in arr {
+                let plc_name = item["plc"].as_str().unwrap_or("?");
+                let name = item["name"].as_str().unwrap_or("?");
+                let enabled = item["enabled"].as_bool().unwrap_or(false);
+                let total = item["tags_total"].as_i64().unwrap_or(0);
+                let healthy = item["tags_healthy"].as_i64().unwrap_or(0);
+                let bad = item["tags_bad"].as_i64().unwrap_or(0);
+                println!("{plc_name:<20} {name:<30} {enabled:<8} {total:<6} {healthy:<8} {bad:<4}");
+            }
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     let (query, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if plc.is_some() {
         ("SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
           FROM v_metric_set_status vms WHERE vms.plc = ?1 ORDER BY vms.plc, vms.metric_set",
@@ -1646,7 +1895,12 @@ fn handle_set_list(conn: &Connection, plc: Option<&str>) -> Result<ExitCode> {
     Ok(ExitCode::Ok)
 }
 
-fn handle_set_show(conn: &Connection, set_name_pos: Option<&str>, set_flag: Option<&str>) -> Result<ExitCode> {
+fn handle_set_show(
+    conn: &Connection,
+    cli: &Cli,
+    set_name_pos: Option<&str>,
+    set_flag: Option<&str>,
+) -> Result<ExitCode> {
     let set_name = match set_flag.or(set_name_pos) {
         Some(n) => n,
         None => {
@@ -1654,6 +1908,31 @@ fn handle_set_show(conn: &Connection, set_name_pos: Option<&str>, set_flag: Opti
             return Ok(ExitCode::BadInput);
         }
     };
+    // Remote mode
+    if let Some(base) = &cli.remote_server {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let data = cli::remote::get_set_show(base, set_name, timeout)?;
+        println!("Set: {}", data["name"].as_str().unwrap_or(set_name));
+        println!("Enabled: {}", data["enabled"].as_bool().unwrap_or(false));
+        if let Some(members) = data["members"].as_array() {
+            println!("\nMembers:");
+            for member in members {
+                let id = member["id"].as_i64().unwrap_or(0);
+                let name = member["name"].as_str().unwrap_or("?");
+                let address = member["address"].as_str().unwrap_or("?");
+                let dt = member["data_type"].as_str().unwrap_or("?");
+                let bad = member["bad"].as_bool().unwrap_or(false);
+                let bad_str = if bad {
+                    format!(" BAD={}", member["bad_class"].as_str().unwrap_or("unknown"))
+                } else {
+                    String::new()
+                };
+                println!("  #{id} {name} ({address}, {dt}){bad_str}");
+            }
+        }
+        return Ok(ExitCode::Ok);
+    }
+
     let set_info = conn
         .query_row(
             "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
@@ -2104,6 +2383,77 @@ fn handle_poll_group_add(
     Ok(ExitCode::Ok)
 }
 
+fn handle_event_add(conn: &Connection, cli: &Cli, action: &EventAction) -> Result<ExitCode> {
+    let EventAction::Add {
+        text,
+        kind,
+        severity,
+        plc,
+        dataset,
+        cycle_id,
+    } = action;
+
+    // Remote mode not supported yet — event markers are local-only.
+    if cli.remote_server.is_some() {
+        eprintln!("error: event markers are not supported via remote server yet");
+        return Ok(ExitCode::BadInput);
+    }
+
+    if text.trim().is_empty() {
+        eprintln!("error: event text cannot be empty");
+        return Ok(ExitCode::BadInput);
+    }
+
+    // Resolve plc_id: either from --plc flag or auto-detect the first enabled PLC.
+    let plc_id: i64 = match plc {
+        Some(name) => conn
+            .query_row(
+                "SELECT id FROM plc WHERE name = ?1",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("PLC '{name}' not found. Create it first with 's7trace plc-add'.")
+            })?,
+        None => conn
+            .query_row(
+                "SELECT id FROM plc WHERE enabled = 1 ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "no PLC found. Either create a PLC with 's7trace plc-add' or specify --plc."
+                )
+            })?,
+    };
+
+    // Resolve optional dataset_id
+    let dataset_id: Option<i64> = match dataset {
+        Some(name) => Some(
+            conn.query_row(
+                "SELECT id FROM dataset WHERE name = ?1 AND plc_id = ?2",
+                rusqlite::params![name, plc_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow::anyhow!("Dataset '{name}' not found for PLC id={plc_id}."))?,
+        ),
+        None => None,
+    };
+
+    let now_us = types::now_us();
+
+    conn.execute(
+        "INSERT INTO event_marker (dataset_id, plc_id, cycle_id, ts, kind, severity, details_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![dataset_id, plc_id, cycle_id, now_us, kind, severity, text,],
+    )?;
+
+    let id = conn.last_insert_rowid();
+    println!("event id={id} plc_id={plc_id} kind={kind} ts={now_us}");
+    Ok(ExitCode::Ok)
+}
+
 fn handle_tag_import(
     cli: &Cli,
     conn: &Connection,
@@ -2119,8 +2469,8 @@ fn handle_tag_import(
     // Remote mode: read file locally, send yaml content to server
     if let Some(base) = &cli.remote_server {
         let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
-        let content = std::fs::read_to_string(file)
-            .map_err(|e| anyhow::anyhow!("reading '{file}': {e}"))?;
+        let content =
+            std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("reading '{file}': {e}"))?;
         let req = serde_json::json!({
             "action": "tag_import",
             "plc": plc,
@@ -2190,7 +2540,10 @@ fn handle_tag_import(
             match type_str.parse::<DataType>() {
                 Ok(dt) => dt,
                 Err(e) => {
-                    failures.push((sig.name.clone(), format!("invalid type '{}': {}", type_str, e)));
+                    failures.push((
+                        sig.name.clone(),
+                        format!("invalid type '{}': {}", type_str, e),
+                    ));
                     continue;
                 }
             }
@@ -2292,7 +2645,9 @@ fn handle_tag_import(
                     .map(|b| b.to_string())
                     .unwrap_or_default();
                 let det = result.detail.as_deref().unwrap_or("");
-                println!("  validate bad {tag_name} tag_id={tag_id} bad_class={bc} detail=\"{det}\"");
+                println!(
+                    "  validate bad {tag_name} tag_id={tag_id} bad_class={bc} detail=\"{det}\""
+                );
             }
         }
     }
@@ -2318,17 +2673,28 @@ fn handle_tag_import(
 mod tests {
     use super::*;
 
+    fn local_cli() -> Cli {
+        Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            remote_timeout_ms: 30_000,
+            command: None,
+        }
+    }
+
     #[test]
     fn test_handle_sql_select() {
         let conn = db::schema::open_memory().unwrap();
-        let result = handle_sql(&conn, "SELECT 1 AS col", "json", 10);
+        let cli = local_cli();
+        let result = handle_sql(&conn, &cli, "SELECT 1 AS col", "json", 10);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_handle_sql_rejects_write() {
         let conn = db::schema::open_memory().unwrap();
-        let result = handle_sql(&conn, "DELETE FROM tag", "json", 10);
+        let cli = local_cli();
+        let result = handle_sql(&conn, &cli, "DELETE FROM tag", "json", 10);
         assert!(result.is_ok());
         assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
     }
@@ -2404,7 +2770,7 @@ mod tests {
             .unwrap();
         }
         handle_set_create(&cli, &conn, "plc1", "my_set", None).unwrap();
-        handle_set_add_tag(&conn, "my_set", Some("t1,t2,t3"), None, None).unwrap();
+        handle_set_add_tag(&conn, &cli, "my_set", Some("t1,t2,t3"), None, None).unwrap();
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM metric_set_tag WHERE metric_set_id = 1",
@@ -2448,7 +2814,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("s7trace_set_tags_{}.txt", std::process::id()));
         std::fs::write(&path, "# comment line\nalpha\n\nbeta\n").unwrap();
-        handle_set_add_tag(&conn, "s2", None, None, Some(path.to_str().unwrap())).unwrap();
+        handle_set_add_tag(&conn, &cli, "s2", None, None, Some(path.to_str().unwrap())).unwrap();
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM metric_set_tag WHERE metric_set_id = 1",
@@ -2505,7 +2871,11 @@ mod tests {
             .unwrap();
         assert!(id > 0);
         let s: String = conn
-            .query_row("SELECT connectivity FROM plc WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+            .query_row(
+                "SELECT connectivity FROM plc WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(s, "unknown");
 
@@ -2527,11 +2897,9 @@ mod tests {
         let r = handle_poll_group_add(&cli, &conn, "fast", 40).unwrap();
         assert_eq!(r as i32, ExitCode::Ok as i32);
         let id: i64 = conn
-            .query_row(
-                "SELECT id FROM poll_group WHERE name = 'fast'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT id FROM poll_group WHERE name = 'fast'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(id > 0);
 
@@ -2561,8 +2929,10 @@ signals:
   - name: SigC
     address: DB1.DBX10.0
 ";
-        let path =
-            std::env::temp_dir().join(format!("s7trace_tag_import_test_{}.yaml", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "s7trace_tag_import_test_{}.yaml",
+            std::process::id()
+        ));
         std::fs::write(&path, yaml).unwrap();
 
         let cli = Cli {
@@ -2628,7 +2998,16 @@ signals:
         // Remote path reads file first (before connecting to server); file-not-found
         // should propagate as an error the same way the local path does.
         let r = handle_tag_import(
-            &cli, &conn, "x", "/nonexistent", None, "slow", "on_change", "on_change", "state", false,
+            &cli,
+            &conn,
+            "x",
+            "/nonexistent",
+            None,
+            "slow",
+            "on_change",
+            "on_change",
+            "state",
+            false,
         );
         assert!(r.is_err());
     }

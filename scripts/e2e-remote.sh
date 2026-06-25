@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end smoke test for s7trace remote mode.
 #
-# Runs the full pipeline (CLI -> HTTP -> server -> PLC) against a
+# Runs the full pipeline (CLI -> private HTTP transport -> server -> PLC) against a
 # non-responsive PLC port. Verifies that:
-#   - HTTP /v1/status works
-#   - CLI tag-add via --remote-server submits and receives result
+#   - remote CLI status works
+#   - CLI tag-add via -r submits and receives result
 #   - tag is marked bad=1, bad_class=disconnected
 #   - bit-level addresses (DBX) are accepted
 #   - command queue/result tables reflect execution
@@ -58,18 +58,20 @@ if ! kill -0 $SERVER_PID 2>/dev/null; then
 fi
 echo "    OK (pid $SERVER_PID)"
 
-echo "==> 3. Verify /v1/status"
-status=$(curl -s "http://127.0.0.1:$HTTP_PORT/v1/status")
+echo "==> 3. Verify remote CLI status"
+status=$("$BIN" --db "$DB" \
+    -r "http://127.0.0.1:$HTTP_PORT" \
+    status --format json 2>&1)
 echo "$status" | grep -q '"service": "s7trace"' || {
-    echo "    FAIL: server not responding to /v1/status"
+    echo "    FAIL: remote CLI status failed"
     echo "    $status"
     exit 4
 }
 echo "    OK"
 
-echo "==> 4. CLI tag-add via --remote-server (i16 address)"
+echo "==> 4. CLI tag-add via -r (i16 address)"
 out=$("$BIN" --db "$DB" \
-    --remote-server "http://127.0.0.1:$HTTP_PORT" \
+    -r "http://127.0.0.1:$HTTP_PORT" \
     --remote-timeout-ms 5000 \
     tag-add --plc test_plc --name counter.entries \
     --address DB5997.DBW0 --type i16 \
@@ -81,9 +83,9 @@ echo "$out" | grep -q "bad_class=disconnected" || {
 }
 echo "    OK"
 
-echo "==> 5. CLI tag-add via --remote-server (bit-level address DBX)"
+echo "==> 5. CLI tag-add via -r (bit-level address DBX)"
 out=$("$BIN" --db "$DB" \
-    --remote-server "http://127.0.0.1:$HTTP_PORT" \
+    -r "http://127.0.0.1:$HTTP_PORT" \
     --remote-timeout-ms 5000 \
     tag-add --plc test_plc --name flag.section_run \
     --address DB5997.DBX10.1 --type bool \
@@ -95,9 +97,9 @@ echo "$out" | grep -q "bad_class=disconnected" || {
 }
 echo "    OK"
 
-echo "==> 6. CLI status via --remote-server"
+echo "==> 6. CLI status via -r"
 out=$("$BIN" --db "$DB" \
-    --remote-server "http://127.0.0.1:$HTTP_PORT" \
+    -r "http://127.0.0.1:$HTTP_PORT" \
     status --format json 2>&1)
 echo "$out" | grep -q '"tags"' || {
     echo "    FAIL: status JSON missing 'tags' field"
@@ -105,9 +107,9 @@ echo "$out" | grep -q '"tags"' || {
 }
 echo "    OK"
 
-echo "==> 7. CLI read via --remote-server (plc_read kind)"
+echo "==> 7. CLI read via -r (plc_read kind)"
 out=$("$BIN" --db "$DB" \
-    --remote-server "http://127.0.0.1:$HTTP_PORT" \
+    -r "http://127.0.0.1:$HTTP_PORT" \
     --remote-timeout-ms 5000 \
     read --plc test_plc --address DB5997.DBW0 --type i16 --format text 2>&1)
 echo "    $out"

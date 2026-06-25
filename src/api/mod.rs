@@ -23,6 +23,7 @@
 
 use crate::db::command_queue::{self, CommandKind};
 use crate::types::now_us;
+use crate::version;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -230,7 +231,11 @@ fn route(
         }
         ("GET", "/") => Response::json(serde_json::json!({
             "service": "s7trace",
-            "api_version": 1,
+            "api_version": version::API_VERSION,
+            "version": {
+                "package": version::PACKAGE_VERSION,
+                "api": version::API_VERSION,
+            },
             "endpoints": [
                 "GET /v1/status",
                 "GET /v1/tags?plc=&enabled=",
@@ -449,6 +454,7 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
 
     Response::json(serde_json::json!({
         "service": "s7trace",
+        "version": version::status_json(&conn),
         "plcs": plcs,
         "tags": { "active": active_tags, "bad": bad_tags_total },
         "command_queue": { "pending": pending_count, "running": running_count },
@@ -1100,6 +1106,8 @@ mod tests {
         let resp = http_get(&format!("127.0.0.1:{port}"), "/v1/status");
         assert!(resp.contains("200 OK"), "status: {resp}");
         assert!(resp.contains("s7trace"), "body: {resp}");
+        assert!(resp.contains("\"version\""), "body: {resp}");
+        assert!(resp.contains("\"package\""), "body: {resp}");
         assert!(resp.contains("plcs"), "body: {resp}");
     }
 

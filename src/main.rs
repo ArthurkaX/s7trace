@@ -9,6 +9,7 @@ mod engine;
 mod platform;
 mod plc;
 mod types;
+mod version;
 
 use cli::args::{Cli, Command, EventAction};
 use cli::format::Format;
@@ -1409,6 +1410,8 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
         .unwrap_or(0);
 
     let status = serde_json::json!({
+        "service": "s7trace",
+        "version": version::status_json(conn),
         "plcs": plcs,
         "tags": {
             "active": active_tags,
@@ -1425,6 +1428,13 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
 
     match out_fmt {
         Format::Text | Format::Table => {
+            let schema_version = version::schema_version(conn).unwrap_or_else(|| "unknown".into());
+            println!(
+                "s7trace version={} schema={} api={}",
+                version::PACKAGE_VERSION,
+                schema_version,
+                version::API_VERSION
+            );
             println!("PLCs:");
             for plc in &plcs {
                 println!(

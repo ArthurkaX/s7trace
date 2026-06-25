@@ -287,6 +287,10 @@ s7trace -r http://HOST:8080 status --format json
 s7trace -r http://HOST:8080 sql "select * from v_tag_status where bad = 1"
 ```
 
+Remote status JSON includes `version.package`, `version.schema`, and
+`version.api`. Use this for the daemon version; `s7trace --version` only reports
+the local CLI binary.
+
 ## Practical Rule
 
 Use SQL for asking questions about stored state.

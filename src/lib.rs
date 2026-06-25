@@ -5,3 +5,4 @@ pub mod engine;
 pub mod platform;
 pub mod plc;
 pub mod types;
+pub mod version;

@@ -106,10 +106,11 @@ pub enum Command {
         timeout_ms: u64,
     },
 
-    /// Execute a write-capable SQL query through s7trace (maintenance only).
+    /// Execute write-capable SQL against the local database (maintenance only).
     AdminSql {
-        /// SQL statement. Maintenance writes must go through this CLI command,
-        /// not direct SQLite edits or HTTP calls.
+        /// SQL statement. This command is local-only: `-r/--remote-server`
+        /// is rejected. For a server database, run this on the server host
+        /// with the server's --db path. Do not use curl or direct HTTP SQL.
         query: String,
     },
 

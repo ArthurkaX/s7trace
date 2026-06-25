@@ -123,7 +123,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             limit,
             timeout_ms: _,
         } => handle_sql(conn, cli, query, fmt, *limit),
-        Command::AdminSql { query } => handle_admin_sql(conn, query),
+        Command::AdminSql { query } => handle_admin_sql(cli, conn, query),
         Command::CommandList { state, format: fmt } => {
             handle_command_list(conn, state.as_deref(), fmt)
         }
@@ -482,7 +482,14 @@ fn handle_sql(conn: &Connection, cli: &Cli, query: &str, fmt: &str, limit: u64) 
     Ok(ExitCode::Ok)
 }
 
-fn handle_admin_sql(conn: &Connection, query: &str) -> Result<ExitCode> {
+fn handle_admin_sql(cli: &Cli, conn: &Connection, query: &str) -> Result<ExitCode> {
+    if cli.remote_server.is_some() {
+        eprintln!(
+            "error: admin-sql is local-only and was not run. Run it on the server host with the server --db path, or use a dedicated s7trace remote command. Do not use curl/direct HTTP SQL."
+        );
+        return Ok(ExitCode::BadInput);
+    }
+
     match conn.execute_batch(query) {
         Ok(_) => {
             println!("ok rows_affected={}", conn.changes());
@@ -2695,6 +2702,16 @@ mod tests {
         let conn = db::schema::open_memory().unwrap();
         let cli = local_cli();
         let result = handle_sql(&conn, &cli, "DELETE FROM tag", "json", 10);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
+    }
+
+    #[test]
+    fn test_admin_sql_rejects_remote_mode() {
+        let conn = db::schema::open_memory().unwrap();
+        let mut cli = local_cli();
+        cli.remote_server = Some("http://127.0.0.1:8080".into());
+        let result = handle_admin_sql(&cli, &conn, "UPDATE plc SET enabled = 0");
         assert!(result.is_ok());
         assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
     }

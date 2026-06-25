@@ -244,7 +244,7 @@ fn route(
                 "GET /v1/set/{name}",
             ],
             "operator_interface": "Use s7trace CLI commands only; HTTP is transport, not a public API.",
-            "sql_policy": "Use s7trace sql or s7trace admin-sql. Direct HTTP SQL/curl is forbidden.",
+            "sql_policy": "Use s7trace sql for remote read-only SQL. admin-sql is local server-host maintenance only. Direct HTTP SQL/curl is forbidden.",
         })),
         ("GET", _) => Response::err(404, "not found"),
         ("POST", _) => Response::err(404, "not found"),

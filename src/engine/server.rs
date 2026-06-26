@@ -1611,6 +1611,41 @@ fn execute_command(
                     ))
                 }
 
+                "set_delete" => {
+                    let set_name = req["set_name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("missing set_name"))?;
+                    let set_id: i64 = match conn.query_row(
+                        "SELECT id FROM metric_set WHERE name = ?1",
+                        rusqlite::params![set_name],
+                        |row| row.get(0),
+                    ) {
+                        Ok(id) => id,
+                        Err(_) => return Ok((false, format!("metric set '{set_name}' not found"))),
+                    };
+                    // Delete dependent rows before the set itself
+                    // dataset_metric_set has FK without ON DELETE CASCADE
+                    conn.execute(
+                        "DELETE FROM dataset_metric_set WHERE metric_set_id = ?1",
+                        rusqlite::params![set_id],
+                    )?;
+                    // config_apply may reference the set
+                    conn.execute(
+                        "DELETE FROM config_apply WHERE metric_set_id = ?1 AND state IN ('pending', 'applying')",
+                        rusqlite::params![set_id],
+                    )?;
+                    // metric_set_tag cascades, but delete explicitly to be safe
+                    conn.execute(
+                        "DELETE FROM metric_set_tag WHERE metric_set_id = ?1",
+                        rusqlite::params![set_id],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM metric_set WHERE id = ?1",
+                        rusqlite::params![set_id],
+                    )?;
+                    Ok((true, format!("success set='{set_name}' deleted")))
+                }
+
                 "set_add_tag" => {
                     let set_name = req["set_name"]
                         .as_str()

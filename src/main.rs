@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use rusqlite::Connection;
@@ -54,15 +56,15 @@ fn run_main() -> Result<()> {
                 Some(Command::Server {
                     dry_run,
                     http_bind,
-                    control_window,
+                    no_ui,
                     strict_overrun,
                 }) => (
                     *dry_run,
-                    http_bind.clone(),
-                    *control_window,
+                    http_bind.clone().or(Some("0.0.0.0:7707".to_string())),
+                    !*no_ui,
                     *strict_overrun,
                 ),
-                _ => (false, None, false, false),
+                _ => (false, Some("0.0.0.0:7707".to_string()), false, false),
             };
             if dry_run {
                 return dry_run_check(&cli.db);
@@ -138,6 +140,7 @@ fn supports_remote(cmd: &Command) -> bool {
             | Command::SetDisable { .. }
             | Command::SetList { .. }
             | Command::SetShow { .. }
+            | Command::SetDelete { .. }
             | Command::CollectionStart { .. }
             | Command::CollectionStop { .. }
             | Command::PlcAdd { .. }
@@ -170,6 +173,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::SetDisable { .. } => "set-disable",
         Command::SetList { .. } => "set-list",
         Command::SetShow { .. } => "set-show",
+        Command::SetDelete { .. } => "set-delete",
         Command::CollectionStart { .. } => "collection-start",
         Command::CollectionStop { .. } => "collection-stop",
         Command::HistoryClean { .. } => "history-clean",
@@ -342,6 +346,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
         Command::SetShow { set_name, set_flag } => {
             handle_set_show(conn, cli, set_name.as_deref(), set_flag.as_deref())
         }
+        Command::SetDelete { set_name } => handle_set_delete(conn, cli, set_name),
         Command::CollectionStart { plc, dataset, sets } => {
             handle_collection_start(conn, cli, plc, dataset, sets)
         }
@@ -2171,6 +2176,68 @@ fn handle_set_show(
         println!("  #{id} {name} ({address}, {dt}){bad_str}");
     }
 
+    Ok(ExitCode::Ok)
+}
+
+fn handle_set_delete(conn: &Connection, cli: &Cli, set_name: &str) -> Result<ExitCode> {
+    // Remote mode
+    if let Some(base) = server_base(cli) {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "set_delete",
+            "set_name": set_name,
+        });
+        let id = cli::remote::enqueue_command(
+            &base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
+    // Local mode
+    let set_id: i64 = match conn.query_row(
+        "SELECT id FROM metric_set WHERE name = ?1",
+        rusqlite::params![set_name],
+        |row| row.get(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            eprintln!("metric set '{set_name}' not found");
+            return Ok(ExitCode::BadInput);
+        }
+    };
+
+    conn.execute(
+        "DELETE FROM dataset_metric_set WHERE metric_set_id = ?1",
+        rusqlite::params![set_id],
+    )?;
+    conn.execute(
+        "DELETE FROM config_apply WHERE metric_set_id = ?1 AND state IN ('pending', 'applying')",
+        rusqlite::params![set_id],
+    )?;
+    conn.execute(
+        "DELETE FROM metric_set_tag WHERE metric_set_id = ?1",
+        rusqlite::params![set_id],
+    )?;
+    conn.execute(
+        "DELETE FROM metric_set WHERE id = ?1",
+        rusqlite::params![set_id],
+    )?;
+
+    println!("deleted metric set '{set_name}'");
     Ok(ExitCode::Ok)
 }
 

@@ -89,13 +89,13 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
         /// Bind the internal HTTP transport for s7trace CLI clients
-        /// (e.g. 127.0.0.1:8080). Operators must use `s7trace -r`,
-        /// not curl.
+        /// (e.g. 127.0.0.1:8080). Default: 0.0.0.0:7707.
+        /// Operators must use `s7trace -r`, not curl.
         #[arg(long)]
         http_bind: Option<String>,
-        /// Open the Windows control window (Windows only; ignored elsewhere).
-        #[arg(long)]
-        control_window: bool,
+        /// Run the server without the Windows control window.
+        #[arg(long = "noui")]
+        no_ui: bool,
         /// Use strict overrun mode: don't skip missed poll ticks (useful for commissioning).
         #[arg(long)]
         strict_overrun: bool,
@@ -420,6 +420,12 @@ pub enum Command {
         /// Metric set name.
         #[arg(long = "set")]
         set_flag: Option<String>,
+    },
+
+    /// Delete a metric set and its membership rows (cascades to metric_set_tag).
+    SetDelete {
+        /// Metric set name.
+        set_name: String,
     },
 
     /// Start collecting data into a named dataset.

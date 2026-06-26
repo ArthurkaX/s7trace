@@ -1,20 +1,8 @@
-//! Windows control window and tray icon for s7trace server.
+//! Native Windows operator panel for `s7trace server`.
 //!
-//! Implements the "server control window" described in
-//! `docs/server-control-window.md`:
-//!
-//! - A small native Win32 window showing runtime status (uptime, DB state,
-//!   PLCs, datasets, command queue depth, last events).
-//! - A tray icon with menu (Open, Start/Stop collection, Exit).
-//! - Buttons that submit typed commands through the same `command_request`
-//!   queue the CLI uses, so ordering stays consistent.
-//!
-//! The window is intentionally NOT a database browser, SQL editor, or
-//! tag editor. Those operations stay on the CLI per the doc.
-//!
-//! Start with [`run_control_window`]; it returns when the user picks
-//! "Exit Server" from the tray menu (which sends a `server_exit` command
-//! and then posts `WM_CLOSE`).
+//! This window is embedded in the server process. It does not connect back to
+//! the local server over HTTP; it reads the shared SQLite connection and writes
+//! control requests into the same durable command queue used by the CLI.
 
 #![cfg(windows)]
 
@@ -23,117 +11,106 @@ use crate::types::CommandKind;
 use anyhow::Result;
 use parking_lot::Mutex;
 use rusqlite::Connection;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, Ordering};
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::Instant;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetSysColorBrush, GetTextMetricsW, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
-    DT_LEFT, DT_NOPREFIX, FW_NORMAL, PAINTSTRUCT, SRCCOPY, TEXTMETRICW,
-};
+use std::time::{SystemTime, UNIX_EPOCH};
+use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, LoadIconW, PostQuitMessage, RegisterClassExW,
-    SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, HMENU, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SM_CXSCREEN,
-    SM_CYSCREEN, SW_HIDE, SW_SHOW, TPM_RIGHTBUTTON, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WM_USER,
-    WNDCLASSEXW, WS_CAPTION, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
-};
+use windows_sys::Win32::UI::Controls::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const WM_TRAYICON: u32 = WM_USER + 1;
-const ID_TRAYICON: u32 = 1;
-
-const IDM_OPEN: u16 = 1001;
-const IDM_START: u16 = 1002;
-const IDM_STOP: u16 = 1003;
-const IDM_EXIT: u16 = 1004;
-
-const IDB_START: u16 = 2001;
-const IDB_STOP: u16 = 2002;
-const IDB_MINIMIZE: u16 = 2003;
-const IDB_EXIT: u16 = 2004;
-
+const CLASS_NAME: &str = "s7traceOperatorPanel";
+const WINDOW_W: i32 = 980;
+const WINDOW_H: i32 = 460;
 const IDT_REFRESH: usize = 1;
+const REFRESH_MS: u32 = 1000;
 
-static APP_STARTED: OnceLock<Instant> = OnceLock::new();
+const ID_REFRESH: u32 = 101;
+const ID_ENABLE: u32 = 102;
+const ID_DISABLE: u32 = 103;
+const ID_MINUS_50: u32 = 104;
+const ID_PLUS_50: u32 = 105;
+const ID_EXIT: u32 = 106;
+const ID_LIST: u32 = 200;
+const WM_STATUS_READY: u32 = WM_APP + 1;
+const REFRESH_MIN_US: i64 = REFRESH_MS as i64 * 1000;
 
-fn app_started() -> Instant {
-    *APP_STARTED.get_or_init(Instant::now)
-}
-static CLASS_NAME: &[u16] = &[
-    b's' as u16,
-    b'7' as u16,
-    b't' as u16,
-    b'r' as u16,
-    b'a' as u16,
-    b'c' as u16,
-    b'e' as u16,
-    b'C' as u16,
-    b't' as u16,
-    b'r' as u16,
-    b'l' as u16,
-    0,
-];
+static REFRESHING: AtomicBool = AtomicBool::new(false);
+static LAST_REFRESH_START_US: AtomicI64 = AtomicI64::new(0);
+static PENDING_SNAPSHOT: Mutex<Option<StatusSnapshot>> = Mutex::new(None);
 
-struct AppState {
-    db: Arc<Mutex<Connection>>,
-    hwnd: HWND,
-    hwnd_button_start: HWND,
-    hwnd_button_stop: HWND,
-    hwnd_button_min: HWND,
-    hwnd_button_exit: HWND,
-    hmenu_tray: HMENU,
-    font_header: isize, // Segoe UI 11pt
-    font_body: isize,   // Consolas 10pt
-    font_small: isize,  // Segoe UI 9pt
-    /// Measured line height of font_body (Consolas), set in WM_CREATE.
-    body_line_h: i32,
-    /// Cached status rendered on the next paint. Updated by the timer.
-    cached_status: Mutex<StatusSnapshot>,
-    /// Flag set when the user picked Exit so the run loop returns.
-    exit_requested: AtomicBool,
-    /// Index of the selected row (-1 = nothing selected).
-    selected_row: Mutex<isize>,
+struct Col;
+impl Col {
+    const PLC: i32 = 0;
+    const SET: i32 = 1;
+    const ON: i32 = 2;
+    const TAGS: i32 = 3;
+    const BAD: i32 = 4;
+    const PERIOD: i32 = 5;
+    const RATE: i32 = 6;
+    const AGE: i32 = 7;
+    const STATE: i32 = 8;
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone, Debug, Default)]
+struct PanelRow {
+    plc_name: String,
+    metric_set_name: Option<String>,
+    metric_set_enabled: bool,
+    tags_active: i64,
+    tags_total: i64,
+    tags_bad: i64,
+    poll_mode: String,
+    poll_group_id: Option<i64>,
+    period_ms: Option<i64>,
+    rate_hz: Option<f64>,
+    last_poll_cycle_finished_ts: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
 struct StatusSnapshot {
-    server_running: bool,
     plc_count: i64,
     active_dataset_count: i64,
     command_queue_pending: i64,
     command_queue_running: i64,
     config_apply_pending: i64,
-    rows: Vec<MetricSetRow>,
-    last_events: Vec<String>,
-    last_command_result: Option<String>,
+    rows: Vec<PanelRow>,
+    last_message: Option<String>,
 }
 
-/// A row in the dashboard table — one per (PLC, metric-set) pair.
-/// PLCs with no metric sets get one row with metric_set_name = None.
-#[derive(Clone)]
-struct MetricSetRow {
-    plc_name: String,
-    plc_connectivity: String,
-    metric_set_name: Option<String>, // None = PLC has no metric sets
-    dataset_name: Option<String>,    // active dataset, if any
-    tags_active: i64,
-    tags_bad: i64,
-    has_active_poller: bool,
+struct AppState {
+    db: Arc<Mutex<Connection>>,
+    hwnd: HWND,
+    list: HWND,
+    exit_requested: AtomicBool,
+    rows: Mutex<Vec<PanelRow>>,
+    selected_key: Mutex<Option<(String, String)>>,
+    last_message: Mutex<Option<String>>,
 }
 
-/// Run the control window. Blocks until the user exits the server.
-///
-/// `db` is the same database connection pool the server uses. The window
-/// only reads from it and writes new rows into `command_request`.
+static APP_STATE: AtomicIsize = AtomicIsize::new(0);
+
+fn state() -> &'static mut AppState {
+    let p = APP_STATE.load(Ordering::SeqCst);
+    assert!(p != 0, "operator panel state not initialized");
+    unsafe { &mut *(p as *mut AppState) }
+}
+
+fn now_us() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
+}
+
+fn wstr(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(Some(0)).collect()
+}
+
+/// Run the embedded server panel. Returns when the operator chooses Exit.
 pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
     unsafe {
         let hinstance = GetModuleHandleW(std::ptr::null());
@@ -141,65 +118,52 @@ pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
             anyhow::bail!("GetModuleHandleW failed");
         }
 
+        let mut icc: INITCOMMONCONTROLSEX = std::mem::zeroed();
+        icc.dwSize = std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32;
+        icc.dwICC = ICC_LISTVIEW_CLASSES;
+        InitCommonControlsEx(&icc);
+
+        let class = wstr(CLASS_NAME);
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
-            hInstance: hinstance,
-            hIcon: LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as *const u16),
-            hCursor: std::ptr::null_mut(),
-            hbrBackground: 16_isize as _, // COLOR_BTNFACE+1
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: CLASS_NAME.as_ptr(),
             cbClsExtra: 0,
             cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: LoadIconW(std::ptr::null_mut(), IDI_APPLICATION),
+            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class.as_ptr(),
             hIconSm: std::ptr::null_mut(),
         };
         if RegisterClassExW(&wc) == 0 {
             anyhow::bail!("RegisterClassExW failed");
         }
 
-        // Center the window
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let win_w = 620;
-        let win_h = 380;
-        let x = (screen_w - win_w) / 2;
-        let y = (screen_h - win_h) / 2;
-
-        let title = win_string("s7trace server");
-
-        // Allocate AppState and store in global BEFORE CreateWindowExW,
-        // since WM_CREATE/WM_PAINT fire synchronously during CreateWindowExW
-        // and need access to state_from_ptr().
-        let state = Box::new(AppState {
+        let app_state = Box::new(AppState {
             db,
-            hwnd: std::ptr::null_mut(), // filled in after window creation
-            hwnd_button_start: std::ptr::null_mut(),
-            hwnd_button_stop: std::ptr::null_mut(),
-            hwnd_button_min: std::ptr::null_mut(),
-            hwnd_button_exit: std::ptr::null_mut(),
-            hmenu_tray: std::ptr::null_mut(),
-            font_header: 0,
-            font_body: 0,
-            font_small: 0,
-            body_line_h: 16,
-            cached_status: Mutex::new(StatusSnapshot::default()),
+            hwnd: std::ptr::null_mut(),
+            list: std::ptr::null_mut(),
             exit_requested: AtomicBool::new(false),
-            selected_row: Mutex::new(-1),
+            rows: Mutex::new(Vec::new()),
+            selected_key: Mutex::new(None),
+            last_message: Mutex::new(None),
         });
-        let state_ptr = Box::into_raw(state) as isize;
+        let state_ptr = Box::into_raw(app_state) as isize;
         APP_STATE.store(state_ptr, Ordering::SeqCst);
 
+        let title = wstr("s7trace server");
         let hwnd = CreateWindowExW(
             0,
-            CLASS_NAME.as_ptr(),
+            class.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-            x,
-            y,
-            win_w,
-            win_h,
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            WINDOW_W,
+            WINDOW_H,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
@@ -210,15 +174,10 @@ pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
             let _ = Box::from_raw(state_ptr as *mut AppState);
             anyhow::bail!("CreateWindowExW failed");
         }
-        // Update the real hwnd in the state (WM_CREATE handler uses the
-        // function parameter hwnd directly, but other code reads from
-        // the AppState field).
-        state_from_ptr().hwnd = hwnd;
+        state().hwnd = hwnd;
 
-        SetWindowTextW(hwnd, title.as_ptr());
-        ShowWindow(hwnd, SW_SHOW);
+        start_refresh(hwnd);
 
-        // Pump messages until WM_QUIT
         let mut msg: MSG = std::mem::zeroed();
         loop {
             let rv = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
@@ -227,948 +186,740 @@ pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
-            if state_from_ptr().exit_requested.load(Ordering::SeqCst) {
-                // Submit a final WM_QUIT so GetMessageW returns 0 next iteration
+            if state().exit_requested.load(Ordering::SeqCst) {
                 PostQuitMessage(0);
             }
         }
 
-        // Cleanup tray
-        let st = state_from_ptr();
-        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = st.hwnd;
-        nid.uID = ID_TRAYICON;
-        Shell_NotifyIconW(NIM_DELETE, &nid);
-        DestroyWindow(st.hwnd);
-        let _ = Box::from_raw(state_ptr as *mut AppState);
+        DestroyWindow(hwnd);
         APP_STATE.store(0, Ordering::SeqCst);
+        let _ = Box::from_raw(state_ptr as *mut AppState);
         Ok(())
     }
 }
 
-static APP_STATE: AtomicIsize = AtomicIsize::new(0);
-
-fn state_from_ptr() -> &'static mut AppState {
-    let p = APP_STATE.load(Ordering::SeqCst);
-    assert!(p != 0, "control window state not initialized");
-    unsafe { &mut *(p as *mut AppState) }
-}
-
-/// Convert a Rust string to a null-terminated UTF-16 vector suitable for
-/// Win32 APIs that take `*const u16`.
-fn win_string(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
     match msg {
         WM_CREATE => {
-            let st = state_from_ptr();
-            // Buttons
-            let hinstance = GetModuleHandleW(std::ptr::null());
-            let text = |s: &str| win_string(s);
-            let bw = 80;
-            let bh = 26;
-            let pad = 6;
-            let mut crect: RECT = std::mem::zeroed();
-            GetClientRect(hwnd, &mut crect);
-            let base_y = crect.bottom - bh - 10;
-            let total_w = bw * 4 + pad * 3;
-            let start_x = (crect.right - total_w) / 2;
-            st.hwnd_button_start = CreateWindowExW(
-                0,
-                text("BUTTON").as_ptr(),
-                text("Start").as_ptr(),
-                WS_VISIBLE | WS_OVERLAPPED | WS_CAPTION,
-                start_x,
-                base_y,
-                bw,
-                bh,
-                hwnd,
-                IDB_START as HMENU,
-                hinstance,
-                std::ptr::null(),
-            );
-            st.hwnd_button_stop = CreateWindowExW(
-                0,
-                text("BUTTON").as_ptr(),
-                text("Stop").as_ptr(),
-                WS_VISIBLE | WS_OVERLAPPED,
-                start_x + (bw + pad),
-                base_y,
-                bw,
-                bh,
-                hwnd,
-                IDB_STOP as HMENU,
-                hinstance,
-                std::ptr::null(),
-            );
-            st.hwnd_button_min = CreateWindowExW(
-                0,
-                text("BUTTON").as_ptr(),
-                text("Tray").as_ptr(),
-                WS_VISIBLE | WS_OVERLAPPED,
-                start_x + (bw + pad) * 2,
-                base_y,
-                bw,
-                bh,
-                hwnd,
-                IDB_MINIMIZE as HMENU,
-                hinstance,
-                std::ptr::null(),
-            );
-            st.hwnd_button_exit = CreateWindowExW(
-                0,
-                text("BUTTON").as_ptr(),
-                text("Exit").as_ptr(),
-                WS_VISIBLE | WS_OVERLAPPED,
-                start_x + (bw + pad) * 3,
-                base_y,
-                bw,
-                bh,
-                hwnd,
-                IDB_EXIT as HMENU,
-                hinstance,
-                std::ptr::null(),
-            );
-            // Tray menu
-            st.hmenu_tray = CreatePopupMenu();
-            AppendMenuW(
-                st.hmenu_tray,
-                MF_STRING,
-                IDM_OPEN as usize,
-                text("Open window").as_ptr(),
-            );
-            AppendMenuW(
-                st.hmenu_tray,
-                MF_STRING,
-                IDM_START as usize,
-                text("Start collection").as_ptr(),
-            );
-            AppendMenuW(
-                st.hmenu_tray,
-                MF_STRING,
-                IDM_STOP as usize,
-                text("Stop collection").as_ptr(),
-            );
-            AppendMenuW(st.hmenu_tray, MF_SEPARATOR, 0, std::ptr::null());
-            AppendMenuW(
-                st.hmenu_tray,
-                MF_STRING,
-                IDM_EXIT as usize,
-                text("Exit server").as_ptr(),
-            );
-            // Tray icon
-            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = ID_TRAYICON;
-            nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-            nid.uCallbackMessage = WM_TRAYICON;
-            nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as *const u16);
-            let tip = text("s7trace server");
-            for (dst, src) in nid.szTip.iter_mut().zip(tip.iter()) {
-                *dst = *src;
-            }
-            Shell_NotifyIconW(NIM_ADD, &nid);
-
-            // Refresh timer (1s)
-            SetTimer(hwnd, IDT_REFRESH, 1000, None);
-
-            // Create fonts
-            let segoe = text("Segoe UI");
-            let consolas = text("Consolas");
-            st.font_header = CreateFontW(
-                -16, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 5, 0, segoe.as_ptr(),
-            ) as isize;
-            st.font_body = CreateFontW(
-                -14, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 5, 0x31, consolas.as_ptr(),
-            ) as isize;
-            st.font_small = CreateFontW(
-                -12, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 5, 0, segoe.as_ptr(),
-            ) as isize;
-
-            // Measure real line height of font_body
-            let body_dc = GetDC(hwnd);
-            if !body_dc.is_null() {
-                let old_font = SelectObject(body_dc, st.font_body as _);
-                let mut tm: TEXTMETRICW = std::mem::zeroed();
-                if GetTextMetricsW(body_dc, &mut tm) != 0 {
-                    let h = (tm.tmHeight + tm.tmExternalLeading) as i32;
-                    st.body_line_h = if h > 0 { h } else { 16 };
-                }
-                SelectObject(body_dc, old_font);
-                ReleaseDC(hwnd, body_dc);
+            create_controls(hwnd);
+            SetTimer(hwnd, IDT_REFRESH, REFRESH_MS, None);
+            0
+        }
+        WM_SIZE => {
+            let w = lparam as i32 & 0xFFFF;
+            let h = (lparam as i32 >> 16) & 0xFFFF;
+            let list = state().list;
+            if !list.is_null() {
+                MoveWindow(list, 0, 34, w, h - 34, 1);
             }
             0
         }
         WM_TIMER => {
-            if wparam == IDT_REFRESH as WPARAM {
-                refresh_status(hwnd);
+            if wparam == IDT_REFRESH {
+                start_refresh(hwnd);
             }
             0
         }
-        WM_LBUTTONDOWN => {
-            // Extract cursor Y coordinate from lparam (low word = x, high word = y)
-            let y = ((lparam >> 16) & 0xFFFF) as i32;
-            // If Y is negative, treat as signed i16
-            let y_signed = if y > 32767 { y - 65536 } else { y };
-            let st = state_from_ptr();
-            let snap = st.cached_status.lock();
-            let row_top = 50 + 2 * st.body_line_h; // first data row Y
-            let row_height = st.body_line_h;
-            let rel = y_signed - row_top;
-            let idx = if rel >= 0 && rel < snap.rows.len() as i32 * row_height {
-                (rel / row_height) as isize
-            } else {
-                -1_isize
-            };
-            drop(snap);
-            *st.selected_row.lock() = idx;
-            unsafe {
-                InvalidateRect(hwnd, std::ptr::null(), 0);
-            }
-            0
-        }
-        WM_ERASEBKGND => {
-            // Prevent background erasure — we fully overwrite the
-            // client area in WM_PAINT, so the default erase-then-draw
-            // cycle causes visible flicker.
-            1
-        }
-        WM_PAINT => {
-            paint(hwnd);
-            0
-        }
-        WM_TRAYICON => {
-            let lo = (lparam & 0xFFFF) as u32;
-            if lo == WM_RBUTTONUP {
-                show_tray_menu(hwnd);
-            } else if lo == WM_LBUTTONDBLCLK {
-                ShowWindow(hwnd, SW_SHOW);
-            }
+        WM_STATUS_READY => {
+            finish_refresh(hwnd);
             0
         }
         WM_COMMAND => {
-            let id = (wparam & 0xFFFF) as u16;
-            handle_command(hwnd, id);
+            handle_command(hwnd, (wparam & 0xFFFF) as u32);
+            0
+        }
+        WM_NOTIFY => {
+            let nmhdr = lparam as *const NMHDR;
+            if !nmhdr.is_null() && (*nmhdr).hwndFrom == state().list {
+                remember_current_selection();
+            }
             0
         }
         WM_CLOSE => {
-            // Close button minimizes to tray
-            ShowWindow(hwnd, SW_HIDE);
+            ShowWindow(hwnd, SW_MINIMIZE);
             0
         }
         WM_DESTROY => {
-            let st = state_from_ptr();
-            if st.font_header != 0 {
-                DeleteObject(st.font_header as _);
-            }
-            if st.font_body != 0 {
-                DeleteObject(st.font_body as _);
-            }
-            if st.font_small != 0 {
-                DeleteObject(st.font_small as _);
-            }
+            KillTimer(hwnd, IDT_REFRESH);
             PostQuitMessage(0);
             0
         }
-        _ => {
-            // Pass through to default — do NOT invalidate here.
-            // The timer-based refresh_status drives redraws, and
-            // extra InvalidateRect calls cause flicker.
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
-fn handle_command(hwnd: HWND, id: u16) {
-    let st = state_from_ptr();
-    let db = st.db.clone();
-    let status = st.cached_status.lock();
-    unsafe {
-        match id {
-            IDB_START | IDM_START => {
-                drop(status);
-                submit_start(&db);
-            }
-            IDB_STOP | IDM_STOP => {
-                drop(status);
-                submit_stop(&db);
-            }
-            IDB_MINIMIZE => {
-                ShowWindow(hwnd, SW_HIDE);
-            }
-            IDB_EXIT | IDM_EXIT => {
-                drop(status);
-                submit_exit(&db);
-                // Server will process `server_exit` and stop. We then post WM_QUIT
-                // from the message loop once exit_requested flips.
-                st.exit_requested.store(true, Ordering::SeqCst);
-            }
-            _ => {}
-        }
-    }
-}
+unsafe fn create_controls(hwnd: HWND) {
+    let hinstance = GetModuleHandleW(std::ptr::null());
 
-fn show_tray_menu(hwnd: HWND) {
-    unsafe {
-        let st = state_from_ptr();
-        let mut pt: POINT = std::mem::zeroed();
-        GetCursorPos(&mut pt);
-        SetForegroundWindow(hwnd);
-        TrackPopupMenu(
-            st.hmenu_tray,
-            TPM_RIGHTBUTTON,
-            pt.x,
-            pt.y,
+    let button = |text: &str, x: i32, w: i32, id: u32| {
+        CreateWindowExW(
             0,
+            WC_BUTTONW,
+            wstr(text).as_ptr(),
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32,
+            x,
+            5,
+            w,
+            24,
             hwnd,
+            id as HMENU,
+            hinstance,
             std::ptr::null(),
+        )
+    };
+
+    button("Refresh", 6, 72, ID_REFRESH);
+    button("Enable", 84, 72, ID_ENABLE);
+    button("Disable", 162, 78, ID_DISABLE);
+    button("-50 ms", 246, 74, ID_MINUS_50);
+    button("+50 ms", 326, 74, ID_PLUS_50);
+    button("Exit", 406, 58, ID_EXIT);
+
+    let list = CreateWindowExW(
+        0,
+        WC_LISTVIEWW,
+        std::ptr::null(),
+        (WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS)
+            as u32,
+        0,
+        34,
+        WINDOW_W,
+        WINDOW_H - 34,
+        hwnd,
+        ID_LIST as HMENU,
+        hinstance,
+        std::ptr::null(),
+    );
+    state().list = list;
+
+    SendMessageW(
+        list,
+        LVM_SETEXTENDEDLISTVIEWSTYLE as u32,
+        0,
+        (LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER) as isize,
+    );
+
+    add_column(list, Col::PLC, "PLC", 90);
+    add_column(list, Col::SET, "Set", 190);
+    add_column(list, Col::ON, "On", 44);
+    add_column(list, Col::TAGS, "Tags", 78);
+    add_column(list, Col::BAD, "Bad", 44);
+    add_column(list, Col::PERIOD, "Period", 78);
+    add_column(list, Col::RATE, "Rate", 72);
+    add_column(list, Col::AGE, "Age", 90);
+    add_column(list, Col::STATE, "State", 90);
+}
+
+fn add_column(list: HWND, index: i32, title: &str, width: i32) {
+    let mut title_w = wstr(title);
+    let mut col = LVCOLUMNW {
+        mask: LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM | LVCF_FMT,
+        fmt: LVCFMT_LEFT,
+        cx: width,
+        pszText: title_w.as_mut_ptr(),
+        cchTextMax: title_w.len() as i32,
+        iSubItem: index,
+        ..unsafe { std::mem::zeroed() }
+    };
+    unsafe {
+        SendMessageW(
+            list,
+            LVM_INSERTCOLUMNW as u32,
+            index as usize,
+            &mut col as *mut _ as isize,
         );
     }
 }
 
-fn refresh_status(hwnd: HWND) {
-    let st = state_from_ptr();
-    let snap = read_status(&st.db);
-    *st.cached_status.lock() = snap;
+fn start_refresh(hwnd: HWND) {
+    if REFRESHING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let now = now_us();
+    let last = LAST_REFRESH_START_US.load(Ordering::SeqCst);
+    if last != 0 && now.saturating_sub(last) < REFRESH_MIN_US {
+        REFRESHING.store(false, Ordering::SeqCst);
+        return;
+    }
+    LAST_REFRESH_START_US.store(now, Ordering::SeqCst);
+
+    let db = state().db.clone();
+    let hwnd_val = hwnd as isize;
+    std::thread::spawn(move || {
+        let snapshot = read_status(&db);
+        *PENDING_SNAPSHOT.lock() = Some(snapshot);
+        unsafe {
+            PostMessageW(hwnd_val as HWND, WM_STATUS_READY, 0, 0);
+        }
+    });
+}
+
+fn finish_refresh(hwnd: HWND) {
+    let snapshot = PENDING_SNAPSHOT.lock().take();
+    REFRESHING.store(false, Ordering::SeqCst);
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+
+    let st = state();
+    *st.rows.lock() = snapshot.rows.clone();
+    render_rows(st.list, &snapshot.rows);
+
+    let msg = st.last_message.lock().clone().or(snapshot.last_message);
+    let suffix = msg.unwrap_or_else(|| {
+        format!(
+            "plc={} datasets={} queue={}+{} cfg={}",
+            snapshot.plc_count,
+            snapshot.active_dataset_count,
+            snapshot.command_queue_pending,
+            snapshot.command_queue_running,
+            snapshot.config_apply_pending
+        )
+    });
     unsafe {
-        InvalidateRect(hwnd, std::ptr::null(), 0);
+        SetWindowTextW(hwnd, wstr(&format!("s7trace server - {suffix}")).as_ptr());
+    }
+}
+
+fn render_rows(list: HWND, rows: &[PanelRow]) {
+    if list.is_null() {
+        return;
+    }
+    let selected_key = current_selection_key()
+        .or_else(|| state().selected_key.lock().clone());
+    unsafe {
+        SendMessageW(list, LVM_DELETEALLITEMS as u32, 0, 0);
+    }
+    for (i, row) in rows.iter().enumerate() {
+        insert_item(list, i as i32, &row.plc_name, i as isize);
+        set_subitem(
+            list,
+            i as i32,
+            Col::SET,
+            row.metric_set_name.as_deref().unwrap_or("---"),
+        );
+        set_subitem(
+            list,
+            i as i32,
+            Col::ON,
+            if row.metric_set_enabled { "yes" } else { "no" },
+        );
+        set_subitem(
+            list,
+            i as i32,
+            Col::TAGS,
+            &format!("{}/{}", row.tags_active, row.tags_total),
+        );
+        set_subitem(list, i as i32, Col::BAD, &row.tags_bad.to_string());
+        set_subitem(list, i as i32, Col::PERIOD, &period_text(row));
+        set_subitem(list, i as i32, Col::RATE, &rate_text(row));
+        set_subitem(list, i as i32, Col::AGE, &age_text(row));
+        set_subitem(list, i as i32, Col::STATE, &state_text(row));
+    }
+    if let Some(key) = selected_key {
+        select_row_by_key(list, rows, &key);
+    }
+}
+
+fn insert_item(list: HWND, index: i32, text: &str, param: isize) {
+    let mut text_w = wstr(text);
+    let mut item = LVITEMW {
+        mask: LVIF_TEXT | LVIF_PARAM,
+        iItem: index,
+        iSubItem: 0,
+        pszText: text_w.as_mut_ptr(),
+        cchTextMax: text_w.len() as i32,
+        lParam: param,
+        ..unsafe { std::mem::zeroed() }
+    };
+    unsafe {
+        SendMessageW(list, LVM_INSERTITEMW as u32, 0, &mut item as *mut _ as isize);
+    }
+}
+
+fn set_subitem(list: HWND, index: i32, subitem: i32, text: &str) {
+    let mut text_w = wstr(text);
+    let mut item = LVITEMW {
+        mask: LVIF_TEXT,
+        iItem: index,
+        iSubItem: subitem,
+        pszText: text_w.as_mut_ptr(),
+        cchTextMax: text_w.len() as i32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    unsafe {
+        SendMessageW(list, LVM_SETITEMW as u32, 0, &mut item as *mut _ as isize);
+    }
+}
+
+fn selected_row() -> Option<PanelRow> {
+    let st = state();
+    if let Some(sel) = selected_index(st.list) {
+        let row = st.rows.lock().get(sel as usize).cloned();
+        if let Some(row) = &row {
+            if let Some(key) = row_key(row) {
+                *st.selected_key.lock() = Some(key);
+            }
+        }
+        return row;
+    }
+    let key = st.selected_key.lock().clone()?;
+    st.rows
+        .lock()
+        .iter()
+        .find(|row| row_key(row).as_ref() == Some(&key))
+        .cloned()
+}
+
+fn selected_index(list: HWND) -> Option<i32> {
+    let sel = unsafe {
+        SendMessageW(
+            list,
+            LVM_GETNEXTITEM as u32,
+            usize::MAX,
+            LVNI_SELECTED as isize,
+        )
+    };
+    if sel < 0 {
+        None
+    } else {
+        Some(sel as i32)
+    }
+}
+
+fn row_key(row: &PanelRow) -> Option<(String, String)> {
+    row.metric_set_name
+        .as_ref()
+        .map(|set| (row.plc_name.clone(), set.clone()))
+}
+
+fn current_selection_key() -> Option<(String, String)> {
+    let st = state();
+    let sel = selected_index(st.list)?;
+    st.rows.lock().get(sel as usize).and_then(row_key)
+}
+
+fn remember_current_selection() {
+    if let Some(key) = current_selection_key() {
+        *state().selected_key.lock() = Some(key);
+    }
+}
+
+fn select_row_by_key(list: HWND, rows: &[PanelRow], key: &(String, String)) {
+    if let Some(idx) = rows
+        .iter()
+        .position(|row| row_key(row).as_ref() == Some(key))
+    {
+        let mut item = LVITEMW {
+            mask: LVIF_STATE,
+            iItem: idx as i32,
+            state: LVIS_SELECTED | LVIS_FOCUSED,
+            stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+            ..unsafe { std::mem::zeroed() }
+        };
+        unsafe {
+            SendMessageW(list, LVM_SETITEMSTATE as u32, idx, &mut item as *mut _ as isize);
+            SendMessageW(list, LVM_ENSUREVISIBLE as u32, idx, 0);
+        }
+    }
+}
+
+fn handle_command(hwnd: HWND, id: u32) {
+    match id {
+        ID_REFRESH => start_refresh(hwnd),
+        ID_ENABLE | ID_DISABLE => {
+            let Some(row) = selected_row() else {
+                set_message("select a metric set first");
+                start_refresh(hwnd);
+                return;
+            };
+            let Some(set_name) = row.metric_set_name else {
+                set_message("selected PLC has no metric set");
+                start_refresh(hwnd);
+                return;
+            };
+            let action = if id == ID_ENABLE { "set_enable" } else { "set_disable" };
+            enqueue_control(serde_json::json!({
+                "action": action,
+                "set_name": set_name,
+            }));
+            start_refresh(hwnd);
+        }
+        ID_MINUS_50 | ID_PLUS_50 => {
+            let Some(row) = selected_row() else {
+                set_message("select a metric set first");
+                start_refresh(hwnd);
+                return;
+            };
+            if row.poll_mode != "single" {
+                set_message("period adjustment requires a single poll group");
+                start_refresh(hwnd);
+                return;
+            }
+            let Some(poll_group_id) = row.poll_group_id else {
+                set_message("selected set has no poll group");
+                start_refresh(hwnd);
+                return;
+            };
+            let current = row.period_ms.unwrap_or(1000);
+            let new_period = adjust_period(current, if id == ID_MINUS_50 { -50 } else { 50 });
+            enqueue_control(serde_json::json!({
+                "action": "poll_group_update_period",
+                "poll_group_id": poll_group_id,
+                "period_ms": new_period,
+            }));
+            start_refresh(hwnd);
+        }
+        ID_EXIT => {
+            enqueue_control(serde_json::json!({"action": "server_exit"}));
+            state().exit_requested.store(true, Ordering::SeqCst);
+        }
+        _ => {}
+    }
+}
+
+fn set_message(msg: &str) {
+    *state().last_message.lock() = Some(msg.to_string());
+}
+
+fn enqueue_control(request: serde_json::Value) {
+    let st = state();
+    let conn = st.db.lock();
+    match command_queue::enqueue(
+        &conn,
+        CommandKind::Control,
+        &request.to_string(),
+        request["plc_id"].as_i64(),
+        Some("control-window"),
+        None,
+    ) {
+        Ok(id) => set_message(&format!("queued command {id}")),
+        Err(e) => set_message(&format!("enqueue failed: {e}")),
     }
 }
 
 fn read_status(db: &Arc<Mutex<Connection>>) -> StatusSnapshot {
     let conn = db.lock();
 
-    let plc_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM plc WHERE enabled = 1", [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-    let active_dataset_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM dataset WHERE state = 'active'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let command_queue_pending: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM command_request WHERE state = 'pending'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let command_queue_running: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM command_request WHERE state = 'running'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let config_apply_pending: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM config_apply WHERE state IN ('pending','debouncing','applying')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let plc_count = scalar_i64(&conn, "SELECT COUNT(*) FROM plc WHERE enabled = 1");
+    let active_dataset_count =
+        scalar_i64(&conn, "SELECT COUNT(*) FROM dataset WHERE state = 'active'");
+    let command_queue_pending =
+        scalar_i64(&conn, "SELECT COUNT(*) FROM command_request WHERE state = 'pending'");
+    let command_queue_running =
+        scalar_i64(&conn, "SELECT COUNT(*) FROM command_request WHERE state = 'running'");
+    let config_apply_pending = scalar_i64(
+        &conn,
+        "SELECT COUNT(*) FROM config_apply WHERE state IN ('pending','debouncing','applying')",
+    );
 
-    // Build enriched per-PLC metric set rows
-    let mut rows: Vec<MetricSetRow> = Vec::new();
-
-    // 1. Get all enabled PLCs
-    let plc_ids: Vec<(i64, String, String)> = {
-        let mut stmt = match conn
-            .prepare("SELECT id, name, connectivity FROM plc WHERE enabled = 1 ORDER BY id")
-        {
-            Ok(s) => s,
-            Err(_) => return StatusSnapshot::default(),
-        };
-        stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
+    let plcs: Vec<(i64, String)> = conn
+        .prepare("SELECT id, name FROM plc WHERE enabled = 1 ORDER BY id")
         .ok()
-        .map(|it| it.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    };
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
 
-    for (plc_id, plc_name, plc_connectivity) in &plc_ids {
-        // 2. Get active dataset name for this PLC
-        let dataset_name: Option<String> = conn
-            .query_row(
-                "SELECT name FROM dataset WHERE plc_id = ?1 AND state = 'active' LIMIT 1",
-                rusqlite::params![plc_id],
-                |r| r.get(0),
-            )
-            .ok();
-
-        // 3. Get metric sets for this PLC
-        let metric_sets: Vec<(String, bool, i64, i64)> = {
-            let mut stmt = match conn.prepare(
-                "SELECT ms.name, ms.enabled,
-                    (SELECT COUNT(*) FROM metric_set_tag mst
-                     JOIN tag t ON t.id = mst.tag_id
-                     WHERE mst.metric_set_id = ms.id AND t.bad = 0 AND t.enabled = 1) as tags_active,
-                    (SELECT COUNT(*) FROM metric_set_tag mst
-                     JOIN tag t ON t.id = mst.tag_id
-                     WHERE mst.metric_set_id = ms.id AND t.bad = 1) as tags_bad
-                 FROM metric_set ms
-                 WHERE ms.plc_id = ?1
-                 ORDER BY ms.id",
-            ) {
-                Ok(s) => s,
-                Err(_) => {
-                    // PLC has no metric sets — add a single fallback row
-                    rows.push(MetricSetRow {
-                        plc_name: plc_name.clone(),
-                        plc_connectivity: plc_connectivity.clone(),
-                        metric_set_name: None,
-                        dataset_name: dataset_name.clone(),
-                        tags_active: 0,
-                        tags_bad: 0,
-                        has_active_poller: dataset_name.is_some(),
-                    });
-                    continue;
-                }
-            };
-            stmt.query_map(rusqlite::params![plc_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, bool>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })
+    let mut rows = Vec::new();
+    for (plc_id, plc_name) in plcs {
+        let sets: Vec<(i64, String, bool)> = conn
+            .prepare("SELECT id, name, enabled FROM metric_set WHERE plc_id = ?1 ORDER BY id")
             .ok()
-            .map(|it| it.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        };
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![plc_id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, bool>(2)?,
+                    ))
+                })
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
 
-        if metric_sets.is_empty() {
-            // PLC has no metric sets — add a single fallback row
-            rows.push(MetricSetRow {
-                plc_name: plc_name.clone(),
-                plc_connectivity: plc_connectivity.clone(),
-                metric_set_name: None,
-                dataset_name: dataset_name.clone(),
-                tags_active: 0,
-                tags_bad: 0,
-                has_active_poller: dataset_name.is_some(),
+        if sets.is_empty() {
+            rows.push(PanelRow {
+                plc_name,
+                poll_mode: "none".to_string(),
+                ..PanelRow::default()
             });
-        } else {
-            for (ms_name, _ms_enabled, tags_active, tags_bad) in &metric_sets {
-                rows.push(MetricSetRow {
-                    plc_name: plc_name.clone(),
-                    plc_connectivity: plc_connectivity.clone(),
-                    metric_set_name: Some(ms_name.clone()),
-                    dataset_name: dataset_name.clone(),
-                    tags_active: *tags_active,
-                    tags_bad: *tags_bad,
-                    has_active_poller: dataset_name.is_some(),
-                });
-            }
+            continue;
+        }
+
+        for (set_id, set_name, set_enabled) in sets {
+            let tags_total: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM metric_set_tag WHERE metric_set_id = ?1",
+                    rusqlite::params![set_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let tags_active: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM metric_set_tag mst
+                     JOIN tag t ON t.id = mst.tag_id
+                     WHERE mst.metric_set_id = ?1 AND t.enabled = 1 AND t.bad = 0",
+                    rusqlite::params![set_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let tags_bad: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM metric_set_tag mst
+                     JOIN tag t ON t.id = mst.tag_id
+                     WHERE mst.metric_set_id = ?1 AND t.bad = 1",
+                    rusqlite::params![set_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            let groups: Vec<(i64, String, i64)> = conn
+                .prepare(
+                    "SELECT DISTINCT pg.id, pg.name, pg.period_ms
+                     FROM metric_set_tag mst
+                     JOIN tag t ON t.id = mst.tag_id
+                     JOIN poll_group pg ON pg.id = t.poll_group_id
+                     WHERE mst.metric_set_id = ?1 AND t.enabled = 1
+                     ORDER BY pg.id",
+                )
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map(rusqlite::params![set_id], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .ok()
+                    .map(|it| it.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+
+            let (poll_mode, poll_group_id, period_ms, rate_hz) =
+                match groups.as_slice() {
+                    [] => ("none".to_string(), None, None, None),
+                    [(id, _name, period)] => (
+                        "single".to_string(),
+                        Some(*id),
+                        Some(*period),
+                        Some(1000.0 / *period as f64),
+                    ),
+                    _ => ("mixed".to_string(), None, None, None),
+                };
+
+            let last_poll_cycle_finished_ts = match poll_group_id {
+                Some(pg_id) => conn
+                    .query_row(
+                        "SELECT MAX(finished_ts) FROM poll_cycle
+                         WHERE plc_id = ?1 AND poll_group_id = ?2",
+                        rusqlite::params![plc_id, pg_id],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .ok()
+                    .flatten(),
+                None => conn
+                    .query_row(
+                        "SELECT MAX(finished_ts) FROM poll_cycle WHERE plc_id = ?1",
+                        rusqlite::params![plc_id],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .ok()
+                    .flatten(),
+            };
+
+            rows.push(PanelRow {
+                plc_name: plc_name.clone(),
+                metric_set_name: Some(set_name),
+                metric_set_enabled: set_enabled,
+                tags_active,
+                tags_total,
+                tags_bad,
+                poll_mode,
+                poll_group_id,
+                period_ms,
+                rate_hz,
+                last_poll_cycle_finished_ts,
+            });
         }
     }
-
-    // Last 5 events (newest first)
-    let mut last_events: Vec<String> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT ts, kind, COALESCE(details_json, '') FROM event_marker
-         ORDER BY id DESC LIMIT 5",
-    ) {
-        if let Ok(ev_rows) = stmt.query_map([], |r| {
-            let ts: i64 = r.get(0)?;
-            let kind: String = r.get(1)?;
-            let details: String = r.get(2)?;
-            Ok(format_event(ts, &kind, &details))
-        }) {
-            for r in ev_rows.flatten() {
-                last_events.push(r);
-            }
-        }
-    }
-
-    // Last finished command result
-    let last_command_result: Option<String> = conn
-        .query_row(
-            "SELECT cr.ok || '|' || COALESCE(cr.result_json, '') || '|' || COALESCE(cr.error, '')
-             FROM command_result cr
-             JOIN command_request cmd ON cmd.id = cr.command_id
-             ORDER BY cr.command_id DESC LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
 
     StatusSnapshot {
-        server_running: plc_count > 0,
         plc_count,
         active_dataset_count,
         command_queue_pending,
         command_queue_running,
         config_apply_pending,
         rows,
-        last_events,
-        last_command_result,
+        last_message: None,
     }
 }
 
-fn format_event(ts: i64, kind: &str, details: &str) -> String {
-    let secs = ts / 1_000_000;
-    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0);
-    let timestr = match dt {
-        Some(d) => d.format("%H:%M:%S").to_string(),
-        None => "??:??:??".to_string(),
+fn scalar_i64(conn: &Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
+}
+
+fn adjust_period(current: i64, delta: i64) -> i64 {
+    std::cmp::max(current + delta, 50)
+}
+
+fn age_ms(row: &PanelRow) -> Option<i64> {
+    row.last_poll_cycle_finished_ts.map(|ts| (now_us() - ts) / 1000)
+}
+
+fn stale(row: &PanelRow) -> bool {
+    let Some(age) = age_ms(row) else {
+        return row.metric_set_enabled;
     };
-    let det = if details.is_empty() {
-        String::new()
-    } else {
-        format!(" {details}")
-    };
-    format!("{timestr}  {kind}{det}")
+    let threshold = row.period_ms.map(|p| std::cmp::max(p * 5, 5000)).unwrap_or(5000);
+    age > threshold
 }
 
-fn paint(hwnd: HWND) {
-    let st = state_from_ptr();
-    let snap = st.cached_status.lock().clone();
-    let sel = *st.selected_row.lock();
-    // st borrow ends here; values are owned clones
-    let _ = st;
-
-    unsafe {
-        let mut ps: PAINTSTRUCT = std::mem::zeroed();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let (cx, cy) = (
-            ps.rcPaint.right - ps.rcPaint.left,
-            ps.rcPaint.bottom - ps.rcPaint.top,
-        );
-        if cx <= 0 || cy <= 0 {
-            EndPaint(hwnd, &ps);
-            return;
-        }
-
-        // Double-buffer: draw to memory DC, then BitBlt to screen.
-        let mem_dc = CreateCompatibleDC(hdc);
-        let bmp = CreateCompatibleBitmap(hdc, cx, cy);
-        let old_bmp = SelectObject(mem_dc, bmp);
-
-        // Fill background with button face color
-        let bg_brush = GetSysColorBrush(15); // COLOR_BTNFACE
-        let bg_rect = RECT { left: 0, top: 0, right: cx, bottom: cy };
-        FillRect(mem_dc, &bg_rect, bg_brush);
-
-        // Transparent background for all text
-        SetBkMode(mem_dc, 1); // TRANSPARENT
-
-        let uptime = app_started().elapsed();
-        let uptime_str = format!(
-            "{:02}:{:02}:{:02}",
-            uptime.as_secs() / 3600,
-            (uptime.as_secs() / 60) % 60,
-            uptime.as_secs() % 60,
-        );
-
-        // -- Line 1: title with status dot --
-        SelectObject(mem_dc, st.font_header as _);
-        let header = win_string(&format!(
-            "s7trace  {}  {} · {}",
-            if snap.server_running { "\u{25CF}" } else { "\u{25CB}" },
-            if snap.server_running { "running" } else { "idle" },
-            uptime_str,
-        ));
-        let mut hr = RECT { left: 10, top: 8, right: cx, bottom: 28 };
-        DrawTextW(mem_dc, header.as_ptr(), -1, &mut hr, DT_LEFT | DT_NOPREFIX);
-
-        // -- Line 2: stats --
-        SelectObject(mem_dc, st.font_small as _);
-        let stats = win_string(&format!(
-            "plc {}  datasets {}  queue {}·{}  cfg {}",
-            snap.plc_count,
-            snap.active_dataset_count,
-            snap.command_queue_pending,
-            snap.command_queue_running,
-            snap.config_apply_pending,
-        ));
-        let mut sr = RECT { left: 10, top: 28, right: cx, bottom: 44 };
-        DrawTextW(mem_dc, stats.as_ptr(), -1, &mut sr, DT_LEFT | DT_NOPREFIX);
-
-        // -- Divider --
-        let div = RECT { left: 10, top: 46, right: cx - 10, bottom: 47 };
-        FillRect(mem_dc, &div, GetSysColorBrush(14)); // COLOR_GRAYTEXT
-
-        // -- Table --
-        let body_lh = st.body_line_h;
-        SelectObject(mem_dc, st.font_body as _);
-        let mut table_text =
-            String::from("PLC             TASK                   DATASET            ST     TAGS\n");
-        table_text.push_str("─────────────────────────────────────────────────────────────────────\n");
-
-        for (i, row) in snap.rows.iter().enumerate() {
-            let state = row_state(row);
-            let tags_str = format!("{}/{}", row.tags_active, row.tags_bad);
-            let ds_str = row.dataset_name.as_deref().unwrap_or("---");
-            let set_str = row.metric_set_name.as_deref().unwrap_or("---");
-            let prefix = if sel == i as isize { "> " } else { "  " };
-            table_text.push_str(&format!(
-                "{}{:<12} {:<20} {:<18} {:<6} {}\n",
-                prefix, row.plc_name, set_str, ds_str, state, tags_str,
-            ));
-        }
-
-        let table_top = 50;
-        let content_bottom = table_top + (2 + snap.rows.len() as i32) * body_lh;
-
-        let mut tr = RECT { left: 10, top: table_top, right: cx - 10, bottom: cy };
-        let tw = win_string(&table_text);
-        DrawTextW(mem_dc, tw.as_ptr(), -1, &mut tr, DT_LEFT | DT_NOPREFIX);
-
-        // -- Selected info --
-        SelectObject(mem_dc, st.font_small as _);
-        let info_text = if sel >= 0 && (sel as usize) < snap.rows.len() {
-            let r = &snap.rows[sel as usize];
-            let set_str = r.metric_set_name.as_deref().unwrap_or("(no sets)");
-            format!("selected   {} · {}", r.plc_name, set_str)
-        } else {
-            String::from("click a row to select")
-        };
-        let info_y = content_bottom + 4;
-        let iw = win_string(&info_text);
-        let mut ir = RECT { left: 10, top: info_y, right: cx - 10, bottom: info_y + 16 };
-        DrawTextW(mem_dc, iw.as_ptr(), -1, &mut ir, DT_LEFT | DT_NOPREFIX);
-
-        // -- Events --
-        let ev_y = info_y + 20;
-        SelectObject(mem_dc, st.font_body as _);
-        let mut ev_text = String::from("events\n");
-        for e in snap.last_events.iter().take(5) {
-            ev_text.push_str(&format!("  {e}\n"));
-        }
-        if let Some(r) = &snap.last_command_result {
-            ev_text.push_str(&format!("  [last cmd] {r}\n"));
-        }
-        let evw = win_string(&ev_text);
-        let mut evr = RECT { left: 10, top: ev_y, right: cx - 10, bottom: ev_y + 120 };
-        DrawTextW(mem_dc, evw.as_ptr(), -1, &mut evr, DT_LEFT | DT_NOPREFIX);
-
-        // Blit the memory DC to the screen DC in one shot
-        BitBlt(hdc, 0, 0, cx, cy, mem_dc, 0, 0, SRCCOPY);
-
-        // Cleanup
-        SelectObject(mem_dc, old_bmp);
-        DeleteObject(bmp);
-        DeleteDC(mem_dc);
-
-        EndPaint(hwnd, &ps);
+fn period_text(row: &PanelRow) -> String {
+    match row.poll_mode.as_str() {
+        "single" => format!("{}ms", row.period_ms.unwrap_or(0)),
+        "mixed" => "mixed".to_string(),
+        _ => "none".to_string(),
     }
 }
 
-/// Compute a short state string for a dashboard row.
-fn row_state(row: &MetricSetRow) -> String {
-    if row.plc_connectivity == "offline" || row.plc_connectivity == "disconnected" {
-        return "DISCONN".to_string();
-    }
-    if row.has_active_poller {
-        return format!("{} RUN", "\u{25CF}"); // filled circle
-    }
-    if row.metric_set_name.is_some() {
-        return format!("{} off", "\u{25CB}"); // empty circle
-    }
-    // No metric sets for this PLC
-    format!("{} idle", "\u{25CB}")
+fn rate_text(row: &PanelRow) -> String {
+    row.rate_hz.map(|hz| format!("{hz:.1}Hz")).unwrap_or_else(|| "-".to_string())
 }
 
-// ---------------------------------------------------------------------------
-// Command submission helpers
-// ---------------------------------------------------------------------------
-
-fn submit_start(db: &Arc<Mutex<Connection>>) {
-    let conn = db.lock();
-
-    // Try to read selection from AppState (may not be set in tests)
-    let selection: Option<(String, Option<String>)> = {
-        let ptr = APP_STATE.load(Ordering::SeqCst);
-        if ptr != 0 {
-            unsafe {
-                let st = &mut *(ptr as *mut AppState);
-                let sel = *st.selected_row.lock();
-                let rows = st.cached_status.lock().rows.clone();
-                if sel >= 0 && (sel as usize) < rows.len() {
-                    Some((
-                        rows[sel as usize].plc_name.clone(),
-                        rows[sel as usize].metric_set_name.clone(),
-                    ))
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    };
-
-    // Determine which PLC + metric set pair to use
-    let (plc_id, plc_name, set_name): (i64, String, Option<String>) =
-        if let Some((ref pname, ref msname)) = selection {
-            let pid: i64 = match conn.query_row(
-                "SELECT id FROM plc WHERE name = ?1",
-                rusqlite::params![pname],
-                |row| row.get(0),
-            ) {
-                Ok(id) => id,
-                Err(_) => {
-                    log::warn!("control window: selected PLC '{}' not found", pname);
-                    return;
-                }
-            };
-            (pid, pname.clone(), msname.clone())
-        } else {
-            // Fallback: first enabled PLC with enabled metric sets, no active dataset
-            let fallback: Option<(i64, String, String)> = conn
-                .query_row(
-                    "SELECT p.id, p.name, ms.name FROM plc p
-                     JOIN metric_set ms ON ms.plc_id = p.id
-                     WHERE p.enabled = 1 AND ms.enabled = 1
-                       AND NOT EXISTS (SELECT 1 FROM dataset d
-                                       WHERE d.plc_id = p.id AND d.state = 'active')
-                     ORDER BY p.id, ms.id LIMIT 1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .ok();
-            match fallback {
-                Some((pid, pname, msname)) => (pid, pname, Some(msname)),
-                None => {
-                    // Try any enabled PLC with no active dataset (even without sets)
-                    let any_plc: Option<(i64, String)> = conn
-                        .query_row(
-                            "SELECT p.id, p.name FROM plc p
-                             WHERE p.enabled = 1
-                               AND NOT EXISTS (SELECT 1 FROM dataset d
-                                               WHERE d.plc_id = p.id AND d.state = 'active')
-                             ORDER BY p.id LIMIT 1",
-                            [],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
-                        )
-                        .ok();
-                    match any_plc {
-                        Some((pid, pname)) => (pid, pname, None),
-                        None => {
-                            log::warn!("control window: no PLC available to start collection");
-                            return;
-                        }
-                    }
-                }
-            }
-        };
-
-    // Check no active dataset for this PLC
-    let active: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM dataset WHERE plc_id = ?1 AND state = 'active'",
-            rusqlite::params![plc_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if active > 0 {
-        log::warn!(
-            "control window: PLC '{}' already has an active dataset",
-            plc_name
-        );
-        return;
-    }
-
-    // Auto-name the dataset
-    let now = chrono::Utc::now();
-    let ts = now.format("%Y_%m_%d_%H%M").to_string();
-    let set_part = set_name.as_deref().unwrap_or(&plc_name);
-    let dataset_name = format!("{}_{}", set_part, ts);
-
-    let sets: Vec<String> = set_name.clone().into_iter().collect();
-
-    let request = serde_json::json!({
-        "action": "collection_start",
-        "plc_id": plc_id,
-        "plc": plc_name,
-        "dataset": dataset_name,
-        "sets": sets,
-    });
-    match command_queue::enqueue(
-        &conn,
-        CommandKind::Control,
-        &request.to_string(),
-        Some(plc_id),
-        Some("control-window"),
-        None,
-    ) {
-        Ok(id) => log::info!("control window: enqueued collection_start cmd id={id}"),
-        Err(e) => log::error!("control window: enqueue failed: {e}"),
+fn age_text(row: &PanelRow) -> String {
+    match age_ms(row) {
+        Some(ms) if stale(row) => format!("STALE {:.1}s", ms as f64 / 1000.0),
+        Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
+        None => "-".to_string(),
     }
 }
 
-fn submit_stop(db: &Arc<Mutex<Connection>>) {
-    let conn = db.lock();
-
-    // Try to read selection from AppState (may not be set in tests)
-    let sel_plc_name: Option<String> = {
-        let ptr = APP_STATE.load(Ordering::SeqCst);
-        if ptr != 0 {
-            unsafe {
-                let st = &mut *(ptr as *mut AppState);
-                let sel = *st.selected_row.lock();
-                let rows = st.cached_status.lock().rows.clone();
-                if sel >= 0 && (sel as usize) < rows.len() {
-                    Some(rows[sel as usize].plc_name.clone())
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    };
-
-    // Determine which PLC to stop
-    let (plc_id, plc_name): (i64, String) = if let Some(ref pname) = sel_plc_name {
-        match conn.query_row(
-            "SELECT id FROM plc WHERE name = ?1",
-            rusqlite::params![pname],
-            |row| row.get(0),
-        ) {
-            Ok(pid) => (pid, pname.clone()),
-            Err(_) => {
-                log::warn!("control window: selected PLC '{}' not found", pname);
-                // Fallback to first active dataset
-                conn.query_row(
-                    "SELECT plc_id, name FROM dataset WHERE state = 'active' ORDER BY id LIMIT 1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap_or_else(|_| {
-                    log::info!("control window: no active dataset to stop");
-                    (0, String::new())
-                })
-            }
-        }
-    } else {
-        // Fallback: first active dataset
-        conn.query_row(
-            "SELECT plc_id, name FROM dataset WHERE state = 'active' ORDER BY id LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap_or_else(|_| {
-            log::info!("control window: no active dataset to stop");
-            (0, String::new())
-        })
-    };
-
-    if plc_id == 0 {
-        return;
+fn state_text(row: &PanelRow) -> String {
+    if row.metric_set_name.is_none() {
+        return "no sets".to_string();
     }
-
-    let request = serde_json::json!({
-        "action": "collection_stop",
-        "plc_id": plc_id,
-        "plc": plc_name,
-    });
-    match command_queue::enqueue(
-        &conn,
-        CommandKind::Control,
-        &request.to_string(),
-        Some(plc_id),
-        Some("control-window"),
-        None,
-    ) {
-        Ok(id) => log::info!("control window: enqueued collection_stop cmd id={id}"),
-        Err(e) => log::error!("control window: enqueue failed: {e}"),
+    if !row.metric_set_enabled {
+        return "off".to_string();
     }
+    if row.poll_mode == "mixed" {
+        return "MIXED".to_string();
+    }
+    if stale(row) {
+        return "STALE".to_string();
+    }
+    "RUN".to_string()
 }
-
-fn submit_exit(db: &Arc<Mutex<Connection>>) {
-    let conn = db.lock();
-    // Reuse a Control-kind request with action=server_exit. The server's
-    // command worker dispatches it; the window itself doesn't kill the
-    // process directly.
-    let request = serde_json::json!({"action": "server_exit"});
-    match command_queue::enqueue(
-        &conn,
-        CommandKind::Control,
-        &request.to_string(),
-        None,
-        Some("control-window"),
-        None,
-    ) {
-        Ok(id) => log::info!("control window: enqueued server_exit cmd id={id}"),
-        Err(e) => log::error!("control window: enqueue failed: {e}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::schema;
-    use std::sync::Arc;
 
     fn temp_db() -> Arc<Mutex<Connection>> {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "s7trace_ctrl_{}_{:?}.db",
+        let path = std::env::temp_dir().join(format!(
+            "s7trace_panel_{}_{}.db",
             std::process::id(),
-            std::thread::current().id()
+            now_us()
         ));
-        let s = path.to_string_lossy().into_owned();
-        let _ = std::fs::remove_file(&s);
-        Arc::new(Mutex::new(schema::open(&s).unwrap()))
+        let _ = std::fs::remove_file(&path);
+        Arc::new(Mutex::new(schema::open(path.to_str().unwrap()).unwrap()))
     }
 
     #[test]
-    fn test_status_snapshot_for_empty_db() {
+    fn empty_db_has_no_rows() {
         let db = temp_db();
         let snap = read_status(&db);
-        assert_eq!(snap.plc_count, 0);
-        assert!(snap.rows.is_empty());
-        assert_eq!(snap.command_queue_pending, 0);
+        assert_eq!(snap.rows.len(), 0);
     }
 
     #[test]
-    fn test_status_snapshot_for_seeded_db() {
+    fn status_single_poll_group() {
+        let db = temp_db();
+        seed_single(&db);
+        let snap = read_status(&db);
+        assert_eq!(snap.rows.len(), 1);
+        let row = &snap.rows[0];
+        assert_eq!(row.poll_mode, "single");
+        assert_eq!(row.period_ms, Some(150));
+        assert_eq!(row.poll_group_id, Some(1));
+        assert!((row.rate_hz.unwrap() - 6.666).abs() < 0.01);
+    }
+
+    #[test]
+    fn status_mixed_poll_group() {
+        let db = temp_db();
+        seed_mixed(&db);
+        let snap = read_status(&db);
+        assert_eq!(snap.rows[0].poll_mode, "mixed");
+        assert_eq!(snap.rows[0].period_ms, None);
+    }
+
+    #[test]
+    fn status_none_poll_group() {
         let db = temp_db();
         let conn = db.lock();
         conn.execute_batch(
-            "INSERT INTO plc (name, host, connectivity) VALUES
-                 ('plc1', '127.0.0.1:102', 'online'),
-                 ('plc2', '127.0.0.1:103', 'offline');
-             INSERT INTO dataset (plc_id, name, state, started_ts, created_ts, updated_ts)
-                 VALUES (1, 'ds1', 'active', 1000000, 1000000, 1000000);",
+            "INSERT INTO plc (id, name, host) VALUES (1, 'plc1', '127.0.0.1');
+             INSERT INTO metric_set (id, plc_id, name, enabled, created_ts, updated_ts)
+             VALUES (1, 1, 'empty', 1, 1, 1);",
         )
         .unwrap();
         drop(conn);
         let snap = read_status(&db);
-        assert_eq!(snap.plc_count, 2);
-        assert_eq!(snap.active_dataset_count, 1);
-        // PLCs without metric sets get one fallback row each
-        assert_eq!(snap.rows.len(), 2);
-        assert_eq!(snap.rows[0].plc_connectivity, "online");
-        assert_eq!(snap.rows[1].plc_connectivity, "offline");
-        assert!(snap.rows[0].dataset_name.is_some());
-        assert_eq!(snap.rows[0].dataset_name.as_deref(), Some("ds1"));
+        assert_eq!(snap.rows[0].poll_mode, "none");
     }
 
     #[test]
-    fn test_submit_start_no_plc() {
-        let db = temp_db();
-        // No PLCs: should be a no-op + log, not a panic.
-        submit_start(&db);
+    fn period_adjustment_clamps_to_50() {
+        assert_eq!(adjust_period(50, -50), 50);
+        assert_eq!(adjust_period(80, -50), 50);
+        assert_eq!(adjust_period(150, 50), 200);
+    }
+
+    fn seed_single(db: &Arc<Mutex<Connection>>) {
+        let conn = db.lock();
+        conn.execute_batch(
+            "INSERT INTO plc (id, name, host) VALUES (1, 'plc1', '127.0.0.1');
+             INSERT INTO poll_group (id, name, period_ms) VALUES (1, 'fast', 150);
+             INSERT INTO metric_set (id, plc_id, name, enabled, created_ts, updated_ts)
+             VALUES (1, 1, 'diag', 1, 1, 1);
+             INSERT INTO tag (id, plc_id, name, address, db_num, byte_offset, byte_size,
+                              data_type, poll_group_id,
+                              store_mode, storage_hook, enabled, bad, created_ts, updated_ts)
+             VALUES (1, 1, 't1', 'DB1.DBW0', 1, 0, 2, 'i16', 1,
+                     'on_change', 'on_change', 1, 0, 1, 1);
+             INSERT INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
+             VALUES (1, 1, 1, 1);",
+        )
+        .unwrap();
+    }
+
+    fn seed_mixed(db: &Arc<Mutex<Connection>>) {
+        let conn = db.lock();
+        conn.execute_batch(
+            "INSERT INTO plc (id, name, host) VALUES (1, 'plc1', '127.0.0.1');
+             INSERT INTO poll_group (id, name, period_ms) VALUES (1, 'fast', 150);
+             INSERT INTO poll_group (id, name, period_ms) VALUES (2, 'slow', 1000);
+             INSERT INTO metric_set (id, plc_id, name, enabled, created_ts, updated_ts)
+             VALUES (1, 1, 'diag', 1, 1, 1);
+             INSERT INTO tag (id, plc_id, name, address, db_num, byte_offset, byte_size,
+                              data_type, poll_group_id,
+                              store_mode, storage_hook, enabled, bad, created_ts, updated_ts)
+             VALUES
+             (1, 1, 't1', 'DB1.DBW0', 1, 0, 2, 'i16', 1, 'on_change', 'on_change', 1, 0, 1, 1),
+             (2, 1, 't2', 'DB1.DBW2', 1, 2, 2, 'i16', 2, 'on_change', 'on_change', 1, 0, 1, 1);
+             INSERT INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
+             VALUES (1, 1, 1, 1), (1, 2, 1, 1);",
+        )
+        .unwrap();
     }
 }

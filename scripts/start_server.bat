@@ -10,6 +10,13 @@ echo   DB:   %DB%
 echo   Bind: %BIND%
 echo   Log:  %LOG%
 
+rem === Multi-read batch size (S7-300/400 multivar tuning; see docs/spike-multiread-chunking.md) ===
+rem   3 = up to 3 items per multi-read request (default). 1 = single reads (no multivar). 0 = no item cap (PDU budget only).
+set BATCH_MAX=3
+set /p BATCH_MAX=[s7trace] Multi-read batch max [S7TRACE_MULTI_BATCH_MAX] (Enter=%BATCH_MAX%):
+set S7TRACE_MULTI_BATCH_MAX=%BATCH_MAX%
+echo   Batch: %S7TRACE_MULTI_BATCH_MAX%
+
 rem === First run: initialize DB if plc table is empty ===
 set DB_STATE=
 for /f "skip=1 tokens=1" %%A in ('"%BIN%" --db "%DB%" --local-db sql "SELECT CASE WHEN COUNT(*) = 0 THEN 'empty' ELSE 'ready' END AS state FROM plc" 2^>nul') do if not defined DB_STATE set DB_STATE=%%A

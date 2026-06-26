@@ -14,9 +14,11 @@
 //! `S7TRACE_PLC_BACKEND=turbos7|rust7|mock` selects the implementation
 //! at server startup time. Default: `turbos7`.
 
+use crate::engine::plan::{pad_even, S7_MULTI_REQ_HEADER, S7_MULTI_REQ_PER_ITEM, S7_MULTI_RESP_HEADER, S7_MULTI_RESP_PER_ITEM, S7_PDU_SAFETY_MARGIN};
 use crate::plc::client::PlcClient;
 use crate::types::*;
 use log::info;
+use std::ops::Range;
 use std::sync::OnceLock;
 use std::time::Duration;
 use turbos7::S7Client;
@@ -67,6 +69,22 @@ impl Turbo7Client {
             }
         }
         (s.to_string(), 102)
+    }
+
+    /// Maximum items per multi-read batch, controlled by the
+    /// `S7TRACE_MULTI_BATCH_MAX` env var (default 3).
+    ///
+    /// Set to 0 to disable the item-count cap (rely on PDU byte budget alone
+    /// for batch splitting). This is the main knob for the
+    /// multi-read-chunking spike — sweep 3 -> 2 -> 1 without recompiling.
+    pub fn max_batch_items() -> usize {
+        match std::env::var("S7TRACE_MULTI_BATCH_MAX") {
+            Ok(v) => v.parse().unwrap_or_else(|_| {
+                log::warn!("S7TRACE_MULTI_BATCH_MAX='{v}' is not a valid usize; using default 3");
+                3
+            }),
+            Err(_) => 3,
+        }
     }
 }
 
@@ -149,57 +167,73 @@ impl PlcClient for Turbo7Client {
     }
 
     fn read_multi(&mut self, items: &[ReadItem]) -> Result<Vec<ReadResult>, PlcError> {
-        let client = self
-            .inner
-            .as_mut()
-            .ok_or_else(|| PlcError::Disconnected("read_multi: not connected".into()))?;
         const S7_AREA_DB: u8 = 0x84;
-        let t_items: Vec<turbos7::ReadItem> = items
-            .iter()
-            .map(|it| turbos7::ReadItem {
-                area: S7_AREA_DB,
-                db_number: it.db_num,
-                start: it.start as u32,
-                size: it.len as u16,
-            })
-            .collect();
-        let res: turbos7::Result<Vec<turbos7::ReadResult>> = runtime().block_on(async {
-            client.read_multiple(&t_items).await
-        });
-        if res.is_err()
-            && res.as_ref().err().is_some_and(|e| {
-                matches!(
+        let pdu = self.pdu_length;
+        let max_items = Self::max_batch_items();
+        let batches = plan_batches(items, pdu, max_items);
+
+        let mut all_results: Vec<ReadResult> = Vec::with_capacity(items.len());
+
+        for (batch_idx, range) in batches.iter().enumerate() {
+            let batch = &items[range.start..range.end];
+            let t_items: Vec<turbos7::ReadItem> = batch
+                .iter()
+                .map(|it| turbos7::ReadItem {
+                    area: S7_AREA_DB,
+                    db_number: it.db_num,
+                    start: it.start as u32,
+                    size: it.len as u16,
+                })
+                .collect();
+
+            // Isolate the client borrow so NLL releases it before
+            // we potentially mutate self.inner on transport error.
+            let res = {
+                let client = self
+                    .inner
+                    .as_mut()
+                    .ok_or_else(|| PlcError::Disconnected("read_multi: not connected".into()))?;
+                runtime()
+                    .block_on(async { client.read_multiple(&t_items).await })
+            };
+
+            // Transport errors mean the TCP connection is dead — clear inner
+            // so the poller reconnect loop re-establishes it on the next cycle.
+            if let Err(e) = &res {
+                if matches!(
                     e,
-                    turbos7::Error::Io(_) | turbos7::Error::Connection(_) | turbos7::Error::Timeout
-                )
-            }) {
-                self.inner = None;
+                    turbos7::Error::Io(_)
+                        | turbos7::Error::Connection(_)
+                        | turbos7::Error::Timeout
+                ) {
+                    self.inner = None;
+                }
             }
-        let results = res.map_err(|e| plc_error_from_turbos7(&e))?;
-        if results.len() != items.len() {
-            return Err(PlcError::ProtocolError(format!(
-                "read_multi: expected {} results, got {}",
-                items.len(),
-                results.len()
-            )));
-        }
-        for (item, r) in items.iter().zip(results.iter()) {
-            if !r.success {
+            let results = res.map_err(|e| plc_error_from_turbos7(&e))?;
+
+            if results.len() != batch.len() {
                 return Err(PlcError::ProtocolError(format!(
-                    "read_multi: item DB{} @{} failed (error_code={:?})",
-                    item.db_num, item.start, r.error_code
+                    "read_multi batch {}: expected {} results, got {}",
+                    batch_idx,
+                    batch.len(),
+                    results.len()
                 )));
             }
-        }
-        let out: Vec<ReadResult> = items
-            .iter()
-            .zip(results)
-            .map(|(item, r)| ReadResult {
+            for (item, r) in batch.iter().zip(results.iter()) {
+                if !r.success {
+                    return Err(PlcError::ProtocolError(format!(
+                        "read_multi batch {}: item DB{} @{} failed (error_code={:?})",
+                        batch_idx, item.db_num, item.start, r.error_code
+                    )));
+                }
+            }
+            all_results.extend(batch.iter().zip(results).map(|(item, r)| ReadResult {
                 item: item.clone(),
                 data: r.data,
-            })
-            .collect();
-        Ok(out)
+            }));
+        }
+
+        Ok(all_results)
     }
 
     fn label(&self) -> String {
@@ -232,6 +266,44 @@ fn plc_error_from_turbos7(e: &turbos7::Error) -> PlcError {
             detail: format!("invalid_data: {e}"),
         },
     }
+}
+
+/// Split a list of multi-read items into batches, each fitting within the
+/// negotiated PDU byte budget on both the request and response sides, and
+/// respecting an optional per-batch item-count cap.
+///
+/// Returns a vector of `Range<usize>` into the original `items` slice so the
+/// caller can slice batches and concatenate results in the original order.
+///
+/// `max_items` — 0 means "no item-count cap" (rely on PDU budget alone).
+pub(crate) fn plan_batches(
+    items: &[ReadItem],
+    pdu_bytes: usize,
+    max_items: usize,
+) -> Vec<Range<usize>> {
+    let budget = pdu_bytes.saturating_sub(S7_PDU_SAFETY_MARGIN);
+    let cap = if max_items == 0 { usize::MAX } else { max_items };
+
+    let mut batches: Vec<Range<usize>> = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let mut req_cost = S7_MULTI_REQ_HEADER;
+        let mut resp_cost = S7_MULTI_RESP_HEADER;
+        let mut j = i;
+        while j < items.len() && (j - i) < cap {
+            let item_req = S7_MULTI_REQ_PER_ITEM;
+            let item_resp = S7_MULTI_RESP_PER_ITEM + pad_even(items[j].len);
+            if req_cost + item_req > budget || resp_cost + item_resp > budget {
+                break;
+            }
+            req_cost += item_req;
+            resp_cost += item_resp;
+            j += 1;
+        }
+        batches.push(i..j);
+        i = j;
+    }
+    batches
 }
 
 // ---------------------------------------------------------------------------
@@ -301,13 +373,156 @@ mod tests {
 
     #[test]
     fn test_factory_default_is_turbos7() {
-        // Default backend is turbos7; we don't actually connect (no PLC).
-        // Just verify that the factory dispatches without panicking.
-        // The returned client won't be connected; that's fine.
         let c = create_plc_client("test", "127.0.0.1:1", 0, 2);
-        // Should be a Turbo7Client (best-effort: just confirm trait object works)
         let mut guard = c.lock();
         assert!(!guard.is_connected());
         assert!(guard.pdu_len().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_batches tests
+    // -----------------------------------------------------------------------
+
+    fn item(len: usize) -> ReadItem {
+        ReadItem {
+            db_num: 1,
+            start: 0,
+            len,
+        }
+    }
+
+    #[test]
+    fn plan_batches_single_item_always_one_batch() {
+        let items = vec![item(4)];
+        let batches = plan_batches(&items, 240, 3);
+        assert_eq!(batches, vec![0..1]);
+    }
+
+    #[test]
+    fn plan_batches_within_max_items_is_one_batch() {
+        let items = vec![item(4), item(4), item(4)];
+        let batches = plan_batches(&items, 240, 3);
+        assert_eq!(batches, vec![0..3]);
+    }
+
+    #[test]
+    fn plan_batches_exceeding_max_items_splits() {
+        // max_items=2 with 5 items => 3 batches (2+2+1)
+        let items = vec![item(4); 5];
+        let batches = plan_batches(&items, 240, 2);
+        assert_eq!(batches, vec![0..2, 2..4, 4..5]);
+    }
+
+    #[test]
+    fn plan_batches_zero_max_items_disables_count_cap() {
+        // 10 items with max=0 should all fit in one batch (PDU is large enough)
+        let items = vec![item(4); 10];
+        let batches = plan_batches(&items, 240, 0);
+        assert_eq!(batches, vec![0..10]);
+    }
+
+    #[test]
+    fn plan_batches_empty_items_yields_empty_batches() {
+        let items: Vec<ReadItem> = vec![];
+        let batches = plan_batches(&items, 240, 3);
+        assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn plan_batches_order_and_count_preserved() {
+        // 7 items, max=3 => batches [0..3, 3..6, 6..7]
+        // total items across ranges should match original
+        let items = vec![item(4); 7];
+        let batches = plan_batches(&items, 240, 3);
+        let total: usize = batches.iter().map(|r| r.len()).sum();
+        assert_eq!(total, 7);
+        // Verify ranges are contiguous and non-overlapping
+        for w in batches.windows(2) {
+            assert_eq!(w[0].end, w[1].start);
+        }
+        assert_eq!(batches[0].start, 0);
+        assert_eq!(batches.last().unwrap().end, 7);
+    }
+
+    #[test]
+    fn plan_batches_pdu_budget_splits_when_under_item_cap() {
+        // Each item has a payload that takes 200 bytes in the response.
+        // resp_cost per item = 4 + pad_even(200) = 204
+        // resp header = 14
+        // With pdu=240, budget = 236
+        // Batch 1: 1 item => resp_cost = 14 + 204 = 218 <= 236
+        // Adding a 2nd item: resp_cost = 218 + 204 = 422 > 236 => split
+        // So we get 200-byte items split one per batch even with max_items=3
+        let items = vec![item(200), item(200), item(200)];
+        let batches = plan_batches(&items, 240, 3);
+        assert_eq!(batches, vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn plan_batches_pdu_budget_mixed_item_sizes() {
+        // small items bulk together, then a large item forces a split.
+        // small: len=4 => resp_cost = 4+4=8 per item
+        // large: len=100 => resp_cost = 4+100=104 per item (100 is even)
+        // pdu=200 => budget=196, resp header=14
+        // With max_items=5:
+        //   Small items: each adds 12+8=20 cost. 14+20=34, 14+40=54, ...
+        //   After 9 small items: resp_cost = 14 + 9*8 = 86, req_cost = 12 + 9*12 = 120
+        //   Total after 9: max(120, 86) = 120 <= 196
+        //   10th small: 120+12=132 req, 86+8=94 resp => 132 <= 196, fits
+        //   Actually let me just test with specific numbers.
+        let mut items = Vec::new();
+        // 3 small items (len=4 each), then 1 large (len=100)
+        for _ in 0..3 {
+            items.push(item(4));
+        }
+        items.push(item(100));
+        // pdu=140 => budget=136
+        // req: 3 small = 12 + 3*12 = 48, + large = 48+12 = 60 <= 136
+        // resp: 3 small = 14 + 3*(4+4) = 38, + large = 38 + (4+100) = 142 > 136!
+        // So large should be its own batch.
+        let batches = plan_batches(&items, 140, 5);
+        assert_eq!(batches, vec![0..3, 3..4]);
+    }
+
+    #[test]
+    fn plan_batches_pdu_budget_small_pdu() {
+        // Very small PDU: each 4-byte item needs 24 req_bytes + 8 resp_bytes,
+        // minus headers: req=12, resp=14.
+        // req per item = 12, resp per item = 8.
+        // budget = 50 - 4 = 46.
+        // Batch: 12 + k*12 <= 46 => k*12 <= 34 => k <= 2 (24+12=36 <=46, 36+12=48 >46)
+        // resp: 14 + k*8 <= 46 => k*8 <= 32 => k <= 4
+        // So req side dominates: max 2 items per batch with pdu=50.
+        let items = vec![item(4); 6];
+        let batches = plan_batches(&items, 50, 10);
+        assert_eq!(batches, vec![0..2, 2..4, 4..6]);
+    }
+
+    #[test]
+    fn plan_batches_pdu_budget_resp_side_dominated() {
+        // Items with large response payloads but small request footprint.
+        // Each item: len=200 (even, resp=4+200=204), req=12.
+        // PDU=420 => budget=416.
+        //   req: 12 + 12 = 24 for 1 item, +12=36 for 2, etc.
+        //   resp: 14 + 204 = 218 for 1 item, 14 + 408 = 422 > 416 for 2!
+        // So only 1 item per batch, resp-side bound.
+        let items = vec![item(200); 4];
+        let batches = plan_batches(&items, 420, 10);
+        assert_eq!(batches, vec![0..1, 1..2, 2..3, 3..4]);
+    }
+
+    #[test]
+    fn plan_batches_pdu_budget_odd_item_padding() {
+        // Odd-length payloads get padded in the response. len=5 => pad_even=6.
+        // resp per item = 4 + 6 = 10.
+        // PDU=70 => budget=66.
+        //   req: 12 + k*12 <= 66 => k*12 <= 54 => k <= 4 (60 <= 66, 72 > 66)
+        //   resp: 14 + k*10 <= 66 => k*10 <= 52 => k <= 5
+        // So req side limits to 4 per batch.
+        // But if items have varying lengths (some odd, some even), the padding
+        // affects the response budget differently.
+        let items = vec![item(5); 10]; // each costs 10 resp_bytes after padding
+        let batches = plan_batches(&items, 70, 10);
+        assert_eq!(batches, vec![0..4, 4..8, 8..10]);
     }
 }

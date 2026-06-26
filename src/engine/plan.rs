@@ -24,12 +24,12 @@ const MULTI_READ_MIN_TAGS: usize = 2;
 // on an S7-300 with pdu=240). Costs derived from turbos7 0.2.1 protocol/s7.rs:
 //   request:  S7_MULTI_REQ_HEADER + S7_MULTI_REQ_PER_ITEM * N
 //   response: S7_MULTI_RESP_HEADER + Σ (S7_MULTI_RESP_PER_ITEM + pad_even(len_i))
-const S7_MULTI_REQ_HEADER: usize = 12; // S7 header (10) + read-param header (2)
-const S7_MULTI_REQ_PER_ITEM: usize = 12; // 12-byte item specifier per request item
-const S7_MULTI_RESP_HEADER: usize = 14; // S7 header (12) + param echo (2)
-const S7_MULTI_RESP_PER_ITEM: usize = 4; // 4-byte data-item header per response item
+pub(crate) const S7_MULTI_REQ_HEADER: usize = 12; // S7 header (10) + read-param header (2)
+pub(crate) const S7_MULTI_REQ_PER_ITEM: usize = 12; // 12-byte item specifier per request item
+pub(crate) const S7_MULTI_RESP_HEADER: usize = 14; // S7 header (12) + param echo (2)
+pub(crate) const S7_MULTI_RESP_PER_ITEM: usize = 4; // 4-byte data-item header per response item
 /// Headroom kept below the negotiated PDU when sizing multi-read spans.
-const S7_PDU_SAFETY_MARGIN: usize = 4;
+pub(crate) const S7_PDU_SAFETY_MARGIN: usize = 4;
 
 /// Maximum items in a single multi-read request.
 ///
@@ -43,7 +43,7 @@ const S7_PDU_SAFETY_MARGIN: usize = 4;
 const MAX_MULTI_READ_ITEMS: usize = 3;
 
 /// S7 pads odd-length item data up to an even boundary in the response PDU.
-fn pad_even(x: usize) -> usize {
+pub(crate) fn pad_even(x: usize) -> usize {
     x + (x & 1)
 }
 

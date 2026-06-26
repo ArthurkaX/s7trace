@@ -7,6 +7,8 @@ pub const S7_WL_BIT: u8 = 0x01;
 pub const S7_WL_BYTE: u8 = 0x02;
 const TS_RES_BIT: u8 = 0x03;
 const TS_RES_BYTE: u8 = 0x04;
+const TS_RES_REAL: u8 = 0x07;
+const TS_RES_OCTET: u8 = 0x09;
 
 // ---------------------------------------------------------------
 //  Одиночные запросы
@@ -283,27 +285,49 @@ pub fn parse_read_multi_response(response: &[u8]) -> Result<Vec<ReadResult>, Str
     let param_length = u16::from_be_bytes([response[6], response[7]]) as usize;
     let data_length = u16::from_be_bytes([response[8], response[9]]) as usize;
 
-    let mut pos = 12 + param_length;
-    let end_data = pos + data_length;
-    let mut results = Vec::new();
+    // Read Var response param section = function(1) + item_count(1), starting
+    // right after the 12-byte Ack_Data header.
+    let item_count = if param_length >= 2 {
+        response[13] as usize
+    } else {
+        0
+    };
 
-    while pos + 4 <= response.len() && pos < end_data {
+    let mut pos = 12 + param_length;
+    let end_data = (pos + data_length).min(response.len());
+    let mut results = Vec::with_capacity(item_count);
+
+    while results.len() < item_count && pos + 4 <= end_data {
         let return_code = response[pos];
-        let _transport_size = response[pos + 1];
-        let length = u16::from_be_bytes([response[pos + 2], response[pos + 3]]) as usize;
+        let transport_size = response[pos + 1];
+        let raw_len = u16::from_be_bytes([response[pos + 2], response[pos + 3]]) as usize;
         pos += 4;
 
-        let success = return_code == 0xFF;
-        let data = if success && pos + length <= response.len() {
-            let d = response[pos..pos + length].to_vec();
-            pos += length;
-            d
-        } else {
-            if success {
-                pos += length;
-            }
-            vec![]
+        // The data-item length field is expressed in BITS for the bit/byte/int
+        // transport sizes and in BYTES for octet/real. Convert to a byte count.
+        // (The single-read parser hides this because it clamps against the S7
+        // header data_length; the multi-read loop has no such clamp, so leaving
+        // the value in bits over-advances `pos` ~8x and drops every item after
+        // the first — the root cause of "expected N results, got 1".)
+        let byte_len = match transport_size {
+            TS_RES_OCTET | TS_RES_REAL | TS_RES_BIT => raw_len,
+            _ => raw_len / 8,
         };
+
+        let success = return_code == 0xFF;
+        let data = if success {
+            let avail = end_data.saturating_sub(pos);
+            let take = byte_len.min(avail);
+            response[pos..pos + take].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        // Advance past this item's data block. Successful items carry data that
+        // is padded up to an even boundary in the PDU; error items carry none.
+        if success {
+            pos += byte_len + (byte_len & 1);
+        }
 
         results.push(ReadResult {
             data,
@@ -329,4 +353,81 @@ fn wrap_tpkt_cotp(s7_pdu: &[u8]) -> Vec<u8> {
     ];
     full.extend_from_slice(s7_pdu);
     full
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic S7 Ack_Data (ROSCTR=0x03) "Read Var" response PDU
+    /// carrying `items` data-items. Each item is (return_code, transport_size,
+    /// data_bytes). The data-item length field is written in BITS for byte
+    /// transport, exactly as a real PLC encodes it, and successful items are
+    /// padded to an even boundary.
+    fn build_multi_response(items: &[(u8, u8, Vec<u8>)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (rc, ts, payload) in items {
+            data.push(*rc);
+            data.push(*ts);
+            if *rc == 0xFF {
+                // length field in bits for byte transport
+                let bits = (payload.len() * 8) as u16;
+                data.extend_from_slice(&bits.to_be_bytes());
+                data.extend_from_slice(payload);
+                if payload.len() % 2 == 1 {
+                    data.push(0x00); // even padding filler
+                }
+            } else {
+                // error item: zero length, no data
+                data.extend_from_slice(&0u16.to_be_bytes());
+            }
+        }
+
+        let param: [u8; 2] = [0x04, items.len() as u8]; // function + item count
+        let mut pdu = vec![0x32, 0x03, 0x00, 0x00, 0x00, 0x01];
+        pdu.extend_from_slice(&(param.len() as u16).to_be_bytes());
+        pdu.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        pdu.extend_from_slice(&[0x00, 0x00]); // error class + code (no global error)
+        pdu.extend_from_slice(&param);
+        pdu.extend_from_slice(&data);
+        pdu
+    }
+
+    #[test]
+    fn parses_all_items_with_padding_and_errors() {
+        // 3 items: even payload, odd payload (forces padding), and a per-item error.
+        let resp = build_multi_response(&[
+            (0xFF, TS_RES_BYTE, vec![0xDE, 0xAD]),       // 2 bytes, even
+            (0xFF, TS_RES_BYTE, vec![0x01, 0x02, 0x03]), // 3 bytes, odd -> padded
+            (0x0A, 0x00, vec![]),                        // error: object not found
+        ]);
+
+        let results = parse_read_multi_response(&resp).expect("parse ok");
+
+        assert_eq!(results.len(), 3, "must return one result per requested item");
+
+        assert!(results[0].success);
+        assert_eq!(results[0].data, vec![0xDE, 0xAD]);
+        assert_eq!(results[0].error_code, None);
+
+        assert!(results[1].success, "odd-length item must parse despite padding");
+        assert_eq!(results[1].data, vec![0x01, 0x02, 0x03]);
+        assert_eq!(results[1].error_code, None);
+
+        assert!(!results[2].success, "non-0xFF return code is a per-item error");
+        assert!(results[2].data.is_empty());
+        assert_eq!(results[2].error_code, Some(0x0A));
+    }
+
+    #[test]
+    fn parses_two_item_response() {
+        let resp = build_multi_response(&[
+            (0xFF, TS_RES_BYTE, vec![0x11, 0x22, 0x33, 0x44]),
+            (0xFF, TS_RES_BYTE, vec![0xAA, 0xBB]),
+        ]);
+        let results = parse_read_multi_response(&resp).expect("parse ok");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].data, vec![0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(results[1].data, vec![0xAA, 0xBB]);
+    }
 }

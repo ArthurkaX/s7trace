@@ -126,6 +126,7 @@ fn supports_remote(cmd: &Command) -> bool {
             | Command::TagAdd { .. }
             | Command::TagUpdate { .. }
             | Command::TagDisable { .. }
+            | Command::TagEnable { .. }
             | Command::TagRevalidate { .. }
             | Command::Read { .. }
             | Command::ReadRaw { .. }
@@ -141,6 +142,7 @@ fn supports_remote(cmd: &Command) -> bool {
             | Command::CollectionStop { .. }
             | Command::PlcAdd { .. }
             | Command::PollGroupAdd { .. }
+            | Command::PollGroupSetPeriod { .. }
             | Command::TagImport { .. }
     )
 }
@@ -156,6 +158,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::TagAdd { .. } => "tag-add",
         Command::TagUpdate { .. } => "tag-update",
         Command::TagDisable { .. } => "tag-disable",
+        Command::TagEnable { .. } => "tag-enable",
         Command::TagRevalidate { .. } => "tag-revalidate",
         Command::Read { .. } => "read",
         Command::ReadRaw { .. } => "read-raw",
@@ -174,6 +177,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::HistoryVacuum { .. } => "history-vacuum",
         Command::PlcAdd { .. } => "plc-add",
         Command::PollGroupAdd { .. } => "poll-group-add",
+        Command::PollGroupSetPeriod { .. } => "poll-group-set-period",
         Command::TagImport { .. } => "tag-import",
         Command::Event { .. } => "event",
         Command::Note { .. } => "note",
@@ -288,6 +292,9 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
         Command::TagDisable { tag_id, plc, name } => {
             handle_tag_disable(conn, cli, *tag_id, plc.as_deref(), name.as_deref())
         }
+        Command::TagEnable { tag_id, plc, name } => {
+            handle_tag_enable(conn, cli, *tag_id, plc.as_deref(), name.as_deref())
+        }
         Command::TagRevalidate { tag_id, plc, name } => {
             handle_tag_revalidate(conn, cli, *tag_id, plc.as_deref(), name.as_deref())
         }
@@ -304,16 +311,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             len,
             format: fmt,
             save_probe,
-        } => handle_read_raw(
-            conn,
-            cli,
-            plc,
-            *db,
-            *start,
-            *len,
-            fmt,
-            *save_probe,
-        ),
+        } => handle_read_raw(conn, cli, plc, *db, *start, *len, fmt, *save_probe),
         Command::Status { format: fmt } => handle_status(cli, conn, fmt),
         Command::SetCreate {
             plc,
@@ -338,22 +336,16 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             tag,
             from_sql,
         } => handle_set_remove_tag(conn, cli, set_name, tag.as_deref(), from_sql.as_deref()),
-        Command::SetEnable {
-            set_name,
-        } => handle_set_enable(conn, cli, set_name),
+        Command::SetEnable { set_name } => handle_set_enable(conn, cli, set_name),
         Command::SetDisable { set_name } => handle_set_disable(conn, cli, set_name),
         Command::SetList { plc } => handle_set_list(cli, conn, plc.as_deref()),
         Command::SetShow { set_name, set_flag } => {
             handle_set_show(conn, cli, set_name.as_deref(), set_flag.as_deref())
         }
-        Command::CollectionStart {
-            plc,
-            dataset,
-            sets,
-        } => handle_collection_start(conn, cli, plc, dataset, sets),
-        Command::CollectionStop { plc } => {
-            handle_collection_stop(conn, cli, plc)
+        Command::CollectionStart { plc, dataset, sets } => {
+            handle_collection_start(conn, cli, plc, dataset, sets)
         }
+        Command::CollectionStop { plc } => handle_collection_stop(conn, cli, plc),
         Command::HistoryClean {
             plc,
             before_ts,
@@ -374,6 +366,17 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
         Command::PollGroupAdd { name, period_ms } => {
             handle_poll_group_add(cli, conn, name, *period_ms)
         }
+        Command::PollGroupSetPeriod {
+            poll_group_id,
+            poll_group_name,
+            period_ms,
+        } => handle_poll_group_set_period(
+            cli,
+            conn,
+            *poll_group_id,
+            poll_group_name.as_deref(),
+            *period_ms,
+        ),
         Command::Event { action } => handle_event_add(conn, cli, action),
         Command::Note { text, plc, dataset } => handle_event_add(
             conn,
@@ -416,7 +419,13 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
 // SQL handlers
 // ---------------------------------------------------------------------------
 
-fn handle_sql(conn: &Connection, cli: &Cli, query: &str, fmt: &str, limit: u64) -> Result<ExitCode> {
+fn handle_sql(
+    conn: &Connection,
+    cli: &Cli,
+    query: &str,
+    fmt: &str,
+    limit: u64,
+) -> Result<ExitCode> {
     // Ensure read-only: reject anything that isn't a SELECT or WITH.
     // Remote mode uses the private HTTP transport, but the user interface
     // remains this CLI command.
@@ -438,8 +447,13 @@ fn handle_sql(conn: &Connection, cli: &Cli, query: &str, fmt: &str, limit: u64) 
                 return Ok(ExitCode::BadInput);
             }
         };
-        let columns: Vec<String> = v["columns"].as_array()
-            .map(|a| a.iter().map(|x| x.as_str().unwrap_or("?").to_string()).collect())
+        let columns: Vec<String> = v["columns"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|x| x.as_str().unwrap_or("?").to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         let rows = v["rows"].as_array().cloned().unwrap_or_default();
         let out_fmt = Format::from_str(fmt);
@@ -447,11 +461,16 @@ fn handle_sql(conn: &Connection, cli: &Cli, query: &str, fmt: &str, limit: u64) 
             Format::Table => {
                 println!("{}", columns.join("\t"));
                 for row in &rows {
-                    let vals: Vec<String> = row.as_array().unwrap().iter().map(|v| match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Null => "NULL".to_string(),
-                        other => other.to_string(),
-                    }).collect();
+                    let vals: Vec<String> = row
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Null => "NULL".to_string(),
+                            other => other.to_string(),
+                        })
+                        .collect();
                     println!("{}", vals.join("\t"));
                 }
             }
@@ -518,7 +537,10 @@ fn handle_sql(conn: &Connection, cli: &Cli, query: &str, fmt: &str, limit: u64) 
         }
     };
 
-    let rows_as_values: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).map(serde_json::Value::Array).collect();
+    let rows_as_values: Vec<serde_json::Value> = rows
+        .filter_map(|r| r.ok())
+        .map(serde_json::Value::Array)
+        .collect();
 
     match out_fmt {
         Format::Table => {
@@ -1048,6 +1070,69 @@ fn handle_tag_disable(
     Ok(ExitCode::Ok)
 }
 
+fn handle_tag_enable(
+    conn: &Connection,
+    cli: &Cli,
+    tag_id_opt: Option<i64>,
+    plc: Option<&str>,
+    name: Option<&str>,
+) -> Result<ExitCode> {
+    if let Some(base) = server_base(cli) {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "tag_enable",
+            "tag_id": tag_id_opt,
+            "plc": plc,
+            "name": name,
+        });
+        return forward_control(&base, &req, timeout);
+    }
+    let tag_id = match (tag_id_opt, plc, name) {
+        (Some(id), _, _) => id,
+        (None, Some(plc), Some(name)) => {
+            match conn.query_row(
+                "SELECT t.id FROM tag t JOIN plc p ON p.id = t.plc_id WHERE p.name = ?1 AND t.name = ?2",
+                rusqlite::params![plc, name],
+                |row| row.get::<_, i64>(0),
+            ) {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!("error: tag '{name}' not found on PLC '{plc}'");
+                    return Ok(ExitCode::BadInput);
+                }
+            }
+        }
+        _ => {
+            eprintln!("error: provide --id or both --plc and --name");
+            return Ok(ExitCode::BadInput);
+        }
+    };
+    conn.execute(
+        "UPDATE tag SET enabled = 1, updated_ts = ?1 WHERE id = ?2",
+        rusqlite::params![now_us(), tag_id],
+    )?;
+
+    if conn.changes() == 0 {
+        eprintln!("tag {tag_id}: not found");
+        return Ok(ExitCode::BadInput);
+    }
+
+    db::config_apply::schedule(
+        conn,
+        ApplyScope::Tag,
+        None,
+        None,
+        None,
+        Some(tag_id),
+        "tag_enabled",
+        db::config_apply::PLAN_COOLDOWN_MS,
+        None,
+    )?;
+
+    println!("success tag_id={tag_id} enabled=1 apply_state=pending");
+    Ok(ExitCode::Ok)
+}
+
 fn handle_tag_revalidate(
     conn: &Connection,
     cli: &Cli,
@@ -1132,25 +1217,29 @@ fn handle_read(
             None,
             timeout,
         )?;
-        let (state, result, ok, err) = cli::remote::wait_command(
-            &base,
-            id,
-            timeout,
-            std::time::Duration::from_millis(200),
-        )?;
+        let (state, result, ok, err) =
+            cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
         if ok {
-            let parsed: serde_json::Value = serde_json::from_str(&result)
-                .unwrap_or(serde_json::Value::String(result));
+            let parsed: serde_json::Value =
+                serde_json::from_str(&result).unwrap_or(serde_json::Value::String(result));
             cli::format::print_json_ok(&parsed);
         } else {
-            cli::format::print_json_error(&state, if err.is_empty() { &result } else { &err }, ExitCode::PlcError as i32);
+            cli::format::print_json_error(
+                &state,
+                if err.is_empty() { &result } else { &err },
+                ExitCode::PlcError as i32,
+            );
             return Ok(ExitCode::PlcError);
         }
         return Ok(ExitCode::Ok);
     }
 
     // Local mode (server required)
-    cli::format::print_json_error("server_required", "read requires a server. Set S7TRACE_SERVER or pass -r.", ExitCode::BadInput as i32);
+    cli::format::print_json_error(
+        "server_required",
+        "read requires a server. Set S7TRACE_SERVER or pass -r.",
+        ExitCode::BadInput as i32,
+    );
     Ok(ExitCode::BadInput)
 }
 
@@ -1165,7 +1254,11 @@ fn handle_read_raw(
     _save_probe: bool,
 ) -> Result<ExitCode> {
     // read-raw requires a server
-    cli::format::print_json_error("server_required", "read-raw requires a server. Set S7TRACE_SERVER or pass -r.", ExitCode::BadInput as i32);
+    cli::format::print_json_error(
+        "server_required",
+        "read-raw requires a server. Set S7TRACE_SERVER or pass -r.",
+        ExitCode::BadInput as i32,
+    );
     Ok(ExitCode::BadInput)
 }
 
@@ -1246,9 +1339,18 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                 .filter_map(|x| x.ok())
                 .collect();
 
+            // Last poll cycle finished timestamp for this PLC
+            let last_poll_cycle_finished_ts: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(finished_ts) FROM poll_cycle WHERE plc_id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(None);
+
             // Metric sets with member counts
             let mut ms_stmt = conn.prepare(
-                "SELECT ms.name, ms.enabled,
+                "SELECT ms.id, ms.name, ms.enabled,
                         (SELECT COUNT(*) FROM metric_set_tag mst WHERE mst.metric_set_id = ms.id),
                         (SELECT COUNT(*) FROM metric_set_tag mst
                          JOIN tag t ON t.id = mst.tag_id
@@ -1257,21 +1359,97 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                  WHERE ms.plc_id = ?1
                  ORDER BY ms.id",
             )?;
-            let metric_sets: Vec<serde_json::Value> = ms_stmt
+            let ms_rows: Vec<(i64, String, bool, i64, i64)> = ms_stmt
                 .query_map(rusqlite::params![id], |r| {
-                    let n: String = r.get(0)?;
-                    let en: bool = r.get::<_, i64>(1)? != 0;
-                    let total: i64 = r.get(2)?;
-                    let healthy: i64 = r.get(3)?;
-                    Ok(serde_json::json!({
-                        "name": n,
-                        "enabled": en,
-                        "tags_total": total,
-                        "tags_healthy": healthy,
-                    }))
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
                 })?
                 .filter_map(|x| x.ok())
                 .collect();
+
+            let mut metric_sets: Vec<serde_json::Value> = Vec::new();
+            for (ms_id, ms_name, ms_enabled, tags_total, tags_healthy) in ms_rows {
+                // Determine effective_poll for this metric set
+                let enabled_in_set: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM metric_set_tag mst
+                     JOIN tag t ON t.id = mst.tag_id
+                     WHERE mst.metric_set_id = ?1 AND t.enabled = 1",
+                        rusqlite::params![ms_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+
+                let effective_poll = if enabled_in_set == 0 {
+                    serde_json::json!({
+                        "mode": "none",
+                        "poll_group_id": null,
+                        "poll_group_name": null,
+                        "period_ms": null,
+                        "rate_hz": null,
+                    })
+                } else {
+                    let mut pg_stmt_eff = conn.prepare(
+                        "SELECT DISTINCT t.poll_group_id, pg.name, pg.period_ms
+                         FROM metric_set_tag mst
+                         JOIN tag t ON t.id = mst.tag_id AND t.enabled = 1
+                         JOIN poll_group pg ON pg.id = t.poll_group_id
+                         WHERE mst.metric_set_id = ?1
+                         ORDER BY t.poll_group_id",
+                    )?;
+                    let groups: Vec<(i64, String, i64)> = pg_stmt_eff
+                        .query_map(rusqlite::params![ms_id], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })?
+                        .filter_map(|x| x.ok())
+                        .collect();
+
+                    if groups.is_empty() {
+                        serde_json::json!({
+                            "mode": "none",
+                            "poll_group_id": null,
+                            "poll_group_name": null,
+                            "period_ms": null,
+                            "rate_hz": null,
+                        })
+                    } else if groups.len() == 1 {
+                        let (pg_id, ref pg_name, period_ms) = groups[0];
+                        let rate_hz = (1000.0 / period_ms as f64 * 10000.0).round() / 10000.0;
+                        serde_json::json!({
+                            "mode": "single",
+                            "poll_group_id": pg_id,
+                            "poll_group_name": pg_name,
+                            "period_ms": period_ms,
+                            "rate_hz": rate_hz,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "mode": "mixed",
+                            "poll_group_id": null,
+                            "poll_group_name": null,
+                            "period_ms": null,
+                            "rate_hz": null,
+                        })
+                    }
+                };
+
+                metric_sets.push(serde_json::json!({
+                    "name": ms_name,
+                    "enabled": ms_enabled,
+                    "tags_total": tags_total,
+                    "tags_healthy": tags_healthy,
+                    "effective_poll": effective_poll,
+                }));
+            }
 
             Ok(serde_json::json!({
                 "name": name,
@@ -1280,6 +1458,7 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                 "last_ok_ts": last_ok_ts,
                 "last_error": last_error,
                 "connectivity": connectivity,
+                "last_poll_cycle_finished_ts": last_poll_cycle_finished_ts,
                 "datasets": datasets,
                 "poll_groups": poll_groups,
                 "metric_sets": metric_sets,
@@ -1366,9 +1545,22 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                     );
                 }
                 for ms in plc["metric_sets"].as_array().unwrap_or(&Vec::new()) {
+                    let poll_str = match ms["effective_poll"]["mode"].as_str() {
+                        Some("single") => {
+                            let ms_pg_name = ms["effective_poll"]["poll_group_name"]
+                                .as_str()
+                                .unwrap_or("?");
+                            let period = ms["effective_poll"]["period_ms"].as_i64().unwrap_or(0);
+                            let hz = ms["effective_poll"]["rate_hz"].as_f64().unwrap_or(0.0);
+                            format!("{ms_pg_name} {period}ms / {hz:.1}Hz")
+                        }
+                        Some("mixed") => "mixed".to_string(),
+                        Some("none") => "none".to_string(),
+                        _ => "?".to_string(),
+                    };
                     println!(
-                        "    metric_set {} enabled={} tags_total={} tags_healthy={}",
-                        ms["name"], ms["enabled"], ms["tags_total"], ms["tags_healthy"]
+                        "    metric_set {} enabled={} tags_total={} tags_healthy={} poll={}",
+                        ms["name"], ms["enabled"], ms["tags_total"], ms["tags_healthy"], poll_str
                     );
                 }
                 for ds in plc["datasets"].as_array().unwrap_or(&Vec::new()) {
@@ -1489,8 +1681,8 @@ fn handle_set_add_tag(
 
         // Resolve from_file client-side into a comma list
         let tag_str = if let Some(path) = from_file {
-            let content =
-                std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
             let names: Vec<&str> = content
                 .lines()
                 .map(|l| l.trim())
@@ -1504,8 +1696,7 @@ fn handle_set_add_tag(
             tag.map(|s| s.to_string())
         };
 
-        let tag_str =
-            tag_str.ok_or_else(|| anyhow::anyhow!("provide --tag or --from-file"))?;
+        let tag_str = tag_str.ok_or_else(|| anyhow::anyhow!("provide --tag or --from-file"))?;
 
         let req = serde_json::json!({
             "action": "set_add_tag",
@@ -1704,20 +1895,16 @@ fn handle_set_remove_tag(
     Ok(ExitCode::Ok)
 }
 
-fn handle_set_enable(
-    conn: &Connection,
-    _cli: &Cli,
-    set_name: &str,
-) -> Result<ExitCode> {
+fn handle_set_enable(conn: &Connection, cli: &Cli, set_name: &str) -> Result<ExitCode> {
     // Remote mode
-    if let Some(base) = &_cli.remote_server {
-        let timeout = std::time::Duration::from_millis(_cli.remote_timeout_ms);
+    if let Some(base) = server_base(cli) {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
         let req = serde_json::json!({
             "action": "set_enable",
             "set_name": set_name,
         });
         let id = cli::remote::enqueue_command(
-            base,
+            &base,
             "control",
             &req.to_string(),
             Some("cli"),
@@ -1726,7 +1913,7 @@ fn handle_set_enable(
         )?;
         println!("queued command_id={id}");
         let (state, result, ok, err) =
-            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+            cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
         if ok {
             println!("success {result}");
         } else {
@@ -1775,16 +1962,16 @@ fn handle_set_enable(
     Ok(ExitCode::Ok)
 }
 
-fn handle_set_disable(conn: &Connection, _cli: &Cli, set_name: &str) -> Result<ExitCode> {
+fn handle_set_disable(conn: &Connection, cli: &Cli, set_name: &str) -> Result<ExitCode> {
     // Remote mode
-    if let Some(base) = &_cli.remote_server {
-        let timeout = std::time::Duration::from_millis(_cli.remote_timeout_ms);
+    if let Some(base) = server_base(cli) {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
         let req = serde_json::json!({
             "action": "set_disable",
             "set_name": set_name,
         });
         let id = cli::remote::enqueue_command(
-            base,
+            &base,
             "control",
             &req.to_string(),
             Some("cli"),
@@ -1793,7 +1980,7 @@ fn handle_set_disable(conn: &Connection, _cli: &Cli, set_name: &str) -> Result<E
         )?;
         println!("queued command_id={id}");
         let (state, result, ok, err) =
-            cli::remote::wait_command(base, id, timeout, std::time::Duration::from_millis(200))?;
+            cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
         if ok {
             println!("success {result}");
         } else {
@@ -2002,7 +2189,11 @@ fn handle_collection_start(
     let base = match server_base(cli) {
         Some(b) => b,
         None => {
-            cli::format::print_json_error("server_required", "collection-start requires a server. Set S7TRACE_SERVER or pass -r.", ExitCode::BadInput as i32);
+            cli::format::print_json_error(
+                "server_required",
+                "collection-start requires a server. Set S7TRACE_SERVER or pass -r.",
+                ExitCode::BadInput as i32,
+            );
             return Ok(ExitCode::BadInput);
         }
     };
@@ -2024,25 +2215,29 @@ fn handle_collection_start(
     let (state, result, ok, err) =
         cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
     if ok {
-        let parsed: serde_json::Value = serde_json::from_str(&result)
-            .unwrap_or(serde_json::Value::String(result));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).unwrap_or(serde_json::Value::String(result));
         cli::format::print_json_ok(&parsed);
         return Ok(ExitCode::Ok);
     }
-    cli::format::print_json_error(&state, if err.is_empty() { &result } else { &err }, ExitCode::PlcError as i32);
+    cli::format::print_json_error(
+        &state,
+        if err.is_empty() { &result } else { &err },
+        ExitCode::PlcError as i32,
+    );
     Ok(ExitCode::PlcError)
 }
 
-fn handle_collection_stop(
-    _conn: &Connection,
-    cli: &Cli,
-    plc: &str,
-) -> Result<ExitCode> {
+fn handle_collection_stop(_conn: &Connection, cli: &Cli, plc: &str) -> Result<ExitCode> {
     // Remote mode only
     let base = match server_base(cli) {
         Some(b) => b,
         None => {
-            cli::format::print_json_error("server_required", "collection-stop requires a server. Set S7TRACE_SERVER or pass -r.", ExitCode::BadInput as i32);
+            cli::format::print_json_error(
+                "server_required",
+                "collection-stop requires a server. Set S7TRACE_SERVER or pass -r.",
+                ExitCode::BadInput as i32,
+            );
             return Ok(ExitCode::BadInput);
         }
     };
@@ -2062,12 +2257,16 @@ fn handle_collection_stop(
     let (state, result, ok, err) =
         cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
     if ok {
-        let parsed: serde_json::Value = serde_json::from_str(&result)
-            .unwrap_or(serde_json::Value::String(result));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).unwrap_or(serde_json::Value::String(result));
         cli::format::print_json_ok(&parsed);
         return Ok(ExitCode::Ok);
     }
-    cli::format::print_json_error(&state, if err.is_empty() { &result } else { &err }, ExitCode::PlcError as i32);
+    cli::format::print_json_error(
+        &state,
+        if err.is_empty() { &result } else { &err },
+        ExitCode::PlcError as i32,
+    );
     Ok(ExitCode::PlcError)
 }
 
@@ -2316,6 +2515,114 @@ fn handle_poll_group_add(
     )?;
 
     println!("success poll_group={name} period_ms={period_ms}");
+    Ok(ExitCode::Ok)
+}
+
+fn handle_poll_group_set_period(
+    cli: &Cli,
+    conn: &Connection,
+    poll_group_id: Option<i64>,
+    poll_group_name: Option<&str>,
+    period_ms: i64,
+) -> Result<ExitCode> {
+    // Validate period
+    if period_ms < 50 {
+        eprintln!("error: --period-ms must be at least 50");
+        return Ok(ExitCode::BadInput);
+    }
+
+    // Remote mode
+    if let Some(base) = server_base(cli) {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let req = serde_json::json!({
+            "action": "poll_group_update_period",
+            "poll_group_id": poll_group_id,
+            "poll_group": poll_group_name,
+            "period_ms": period_ms,
+        });
+        let id = cli::remote::enqueue_command(
+            &base,
+            "control",
+            &req.to_string(),
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+        } else {
+            println!("{state}: {result} {err}");
+            return Ok(ExitCode::BadInput);
+        }
+        return Ok(ExitCode::Ok);
+    }
+
+    // Resolve poll group
+    let pg_id = match (poll_group_id, poll_group_name) {
+        (Some(id), _) => id,
+        (None, Some(name)) => {
+            match conn.query_row(
+                "SELECT id FROM poll_group WHERE name = ?1",
+                rusqlite::params![name],
+                |row| row.get::<_, i64>(0),
+            ) {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!("error: poll group '{name}' not found");
+                    return Ok(ExitCode::BadInput);
+                }
+            }
+        }
+        _ => {
+            eprintln!("error: provide --id or --name");
+            return Ok(ExitCode::BadInput);
+        }
+    };
+
+    // Look up plc_id for this poll group (for ApplyScope::PollGroup)
+    let plc_id: Option<i64> = conn
+        .query_row(
+            "SELECT DISTINCT t.plc_id FROM tag t WHERE t.poll_group_id = ?1 LIMIT 1",
+            rusqlite::params![pg_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok();
+
+    let pg_name: String = conn
+        .query_row(
+            "SELECT name FROM poll_group WHERE id = ?1",
+            rusqlite::params![pg_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| format!("id={}", pg_id));
+
+    conn.execute(
+        "UPDATE poll_group SET period_ms = ?1 WHERE id = ?2",
+        rusqlite::params![period_ms, pg_id],
+    )?;
+
+    if conn.changes() == 0 {
+        eprintln!("error: poll group not found");
+        return Ok(ExitCode::BadInput);
+    }
+
+    // Schedule config apply to restart affected pollers
+    let _ = db::config_apply::schedule(
+        conn,
+        ApplyScope::PollGroup,
+        plc_id,
+        Some(pg_id),
+        None,
+        None,
+        &format!("poll_group_update_period id={pg_id}"),
+        db::config_apply::PLAN_COOLDOWN_MS,
+        None,
+    );
+
+    println!("success poll_group={pg_name} period_ms={period_ms}");
     Ok(ExitCode::Ok)
 }
 
@@ -2694,6 +3001,78 @@ mod tests {
     }
 
     #[test]
+    fn test_tag_enable_by_id() {
+        let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            server_port: 7707,
+            local_db: true,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
+        // Seed a PLC and a disabled tag
+        conn.execute(
+            "INSERT INTO plc (name, host) VALUES ('plc1', '127.0.0.1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO poll_group (name, period_ms) VALUES ('g1', 1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tag (plc_id, name, address, data_type, poll_group_id,
+                              db_num, byte_offset, byte_size, enabled, created_ts, updated_ts)
+             VALUES (1, 'mytag', 'DB1.DBW0', 'i16', 1, 1, 0, 2, 0, 1000000, 1000000)",
+            [],
+        )
+        .unwrap();
+
+        // Enable by id
+        let r = handle_tag_enable(&conn, &cli, Some(1), None, None).unwrap();
+        assert_eq!(r as i32, ExitCode::Ok as i32);
+
+        let enabled: i64 = conn
+            .query_row("SELECT enabled FROM tag WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn test_tag_enable_unknown() {
+        let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            server_port: 7707,
+            local_db: true,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
+        let result = handle_tag_enable(&conn, &cli, Some(999), None, None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
+    }
+
+    #[test]
+    fn test_tag_enable_missing_args() {
+        let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            server_port: 7707,
+            local_db: true,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
+        let result = handle_tag_enable(&conn, &cli, None, None, None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
+    }
+
+    #[test]
     fn test_set_add_tag_bulk_csv() {
         let conn = db::schema::open_memory().unwrap();
         let cli = Cli {
@@ -2866,6 +3245,85 @@ mod tests {
 
         // Duplicate name should fail
         let r = handle_poll_group_add(&cli, &conn, "fast", 100).unwrap();
+        assert_eq!(r as i32, ExitCode::BadInput as i32);
+    }
+
+    #[test]
+    fn test_poll_group_set_period_ok() {
+        let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            server_port: 7707,
+            local_db: true,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
+
+        conn.execute(
+            "INSERT INTO poll_group (name, period_ms) VALUES ('g1', 1000)",
+            [],
+        )
+        .unwrap();
+
+        let r = handle_poll_group_set_period(&cli, &conn, None, Some("g1"), 50).unwrap();
+        assert_eq!(r as i32, ExitCode::Ok as i32);
+
+        let period: i64 = conn
+            .query_row(
+                "SELECT period_ms FROM poll_group WHERE name = 'g1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(period, 50);
+    }
+
+    #[test]
+    fn test_poll_group_set_period_too_low() {
+        let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            server_port: 7707,
+            local_db: true,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
+
+        let r = handle_poll_group_set_period(&cli, &conn, Some(1), None, 49).unwrap();
+        assert_eq!(r as i32, ExitCode::BadInput as i32);
+    }
+
+    #[test]
+    fn test_poll_group_set_period_unknown() {
+        let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            server_port: 7707,
+            local_db: true,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
+
+        let r = handle_poll_group_set_period(&cli, &conn, Some(999), None, 100).unwrap();
+        assert_eq!(r as i32, ExitCode::BadInput as i32);
+    }
+
+    #[test]
+    fn test_poll_group_set_period_missing_args() {
+        let conn = db::schema::open_memory().unwrap();
+        let cli = Cli {
+            db: ":memory:".into(),
+            remote_server: None,
+            server_port: 7707,
+            local_db: true,
+            remote_timeout_ms: 30_000,
+            command: None,
+        };
+
+        let r = handle_poll_group_set_period(&cli, &conn, None, None, 100).unwrap();
         assert_eq!(r as i32, ExitCode::BadInput as i32);
     }
 

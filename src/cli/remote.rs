@@ -288,6 +288,45 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_url_bare_ip_default_port() {
+        assert_eq!(
+            resolve_url("192.0.2.56", 7707),
+            "http://192.0.2.56:7707"
+        );
+    }
+
+    #[test]
+    fn test_resolve_url_bare_host_custom_port() {
+        assert_eq!(resolve_url("plc-host", 7708), "http://plc-host:7708");
+    }
+
+    #[test]
+    fn test_resolve_url_full_url_unchanged() {
+        assert_eq!(
+            resolve_url("http://plc-host:8080", 7707),
+            "http://plc-host:8080"
+        );
+    }
+
+    #[test]
+    fn test_resolve_url_bare_host_default_port() {
+        assert_eq!(resolve_url("my-plc", 7707), "http://my-plc:7707");
+    }
+
+    #[test]
+    fn test_resolve_url_host_with_port() {
+        assert_eq!(resolve_url("plc-host:9090", 7707), "http://plc-host:9090");
+    }
+
+    #[test]
+    fn test_resolve_url_https_unchanged() {
+        assert_eq!(
+            resolve_url("https://secure-host:443", 7707),
+            "https://secure-host:443"
+        );
+    }
+
+    #[test]
     fn test_urlencode() {
         assert_eq!(urlencode("hello world"), "hello%20world");
         assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");

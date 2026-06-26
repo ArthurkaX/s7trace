@@ -348,10 +348,19 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
                     })
                     .unwrap_or_default();
 
-                // Per-PLC: metric sets with tag counts
-                let metric_sets: Vec<serde_json::Value> = conn
+                // Per-PLC: last poll cycle finished timestamp
+                let last_poll_cycle_finished_ts: Option<i64> = conn
+                    .query_row(
+                        "SELECT MAX(finished_ts) FROM poll_cycle WHERE plc_id = ?1",
+                        rusqlite::params![plc_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(None);
+
+                // Per-PLC: metric sets with tag counts and effective poll info
+                let ms_rows: Vec<(i64, String, bool, i64, i64, i64)> = conn
                     .prepare(
-                        "SELECT ms.name, ms.enabled,
+                        "SELECT ms.id, ms.name, ms.enabled,
                             (SELECT COUNT(*) FROM metric_set_tag mst
                              JOIN tag t ON t.id = mst.tag_id
                              WHERE mst.metric_set_id = ms.id) as tags_total,
@@ -366,20 +375,106 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
                          ORDER BY ms.id",
                     )
                     .ok()
-                    .and_then(|mut stmt| {
-                        stmt.query_map(rusqlite::params![plc_id], |row| {
-                            Ok(serde_json::json!({
-                                "name": row.get::<_, String>(0)?,
-                                "enabled": row.get::<_, i64>(1)? != 0,
-                                "tags_total": row.get::<_, i64>(2)?,
-                                "tags_active": row.get::<_, i64>(3)?,
-                                "tags_bad": row.get::<_, i64>(4)?,
-                            }))
+                    .and_then(|mut s| {
+                        s.query_map(rusqlite::params![plc_id], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)? != 0,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, i64>(5)?,
+                            ))
                         })
                         .ok()
                         .map(|it| it.filter_map(|x| x.ok()).collect())
                     })
                     .unwrap_or_default();
+
+                let mut metric_sets: Vec<serde_json::Value> = Vec::new();
+                for (ms_id, ms_name, ms_enabled, tags_total, tags_active, tags_bad) in ms_rows {
+                    // Determine effective_poll for this metric set
+                    let enabled_in_set: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM metric_set_tag mst
+                             JOIN tag t ON t.id = mst.tag_id
+                             WHERE mst.metric_set_id = ?1 AND t.enabled = 1",
+                            rusqlite::params![ms_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+
+                    let effective_poll = if enabled_in_set == 0 {
+                        serde_json::json!({
+                            "mode": "none",
+                            "poll_group_id": null,
+                            "poll_group_name": null,
+                            "period_ms": null,
+                            "rate_hz": null,
+                        })
+                    } else {
+                        let groups: Vec<(i64, String, i64)> = conn
+                            .prepare(
+                                "SELECT DISTINCT t.poll_group_id, pg.name, pg.period_ms
+                                 FROM metric_set_tag mst
+                                 JOIN tag t ON t.id = mst.tag_id AND t.enabled = 1
+                                 JOIN poll_group pg ON pg.id = t.poll_group_id
+                                 WHERE mst.metric_set_id = ?1
+                                 ORDER BY t.poll_group_id",
+                            )
+                            .ok()
+                            .and_then(|mut s| {
+                                s.query_map(rusqlite::params![ms_id], |row| {
+                                    Ok((
+                                        row.get::<_, i64>(0)?,
+                                        row.get::<_, String>(1)?,
+                                        row.get::<_, i64>(2)?,
+                                    ))
+                                })
+                                .ok()
+                                .map(|it| it.filter_map(|x| x.ok()).collect())
+                            })
+                            .unwrap_or_default();
+
+                        if groups.is_empty() {
+                            serde_json::json!({
+                                "mode": "none",
+                                "poll_group_id": null,
+                                "poll_group_name": null,
+                                "period_ms": null,
+                                "rate_hz": null,
+                            })
+                        } else if groups.len() == 1 {
+                            let (pg_id, ref pg_name, period_ms) = groups[0];
+                            let rate_hz =
+                                (1000.0 / period_ms as f64 * 10000.0).round() / 10000.0;
+                            serde_json::json!({
+                                "mode": "single",
+                                "poll_group_id": pg_id,
+                                "poll_group_name": pg_name,
+                                "period_ms": period_ms,
+                                "rate_hz": rate_hz,
+                            })
+                        } else {
+                            serde_json::json!({
+                                "mode": "mixed",
+                                "poll_group_id": null,
+                                "poll_group_name": null,
+                                "period_ms": null,
+                                "rate_hz": null,
+                            })
+                        }
+                    };
+
+                    metric_sets.push(serde_json::json!({
+                        "name": ms_name,
+                        "enabled": ms_enabled,
+                        "tags_total": tags_total,
+                        "tags_active": tags_active,
+                        "tags_bad": tags_bad,
+                        "effective_poll": effective_poll,
+                    }));
+                }
 
                 // Per-PLC: bad tags
                 let bad_tags: Vec<serde_json::Value> = conn
@@ -414,6 +509,7 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
                     "last_ok_ts": r.get::<_, Option<i64>>(4)?,
                     "last_error": r.get::<_, Option<String>>(5)?,
                     "connectivity": r.get::<_, String>(6)?,
+                    "last_poll_cycle_finished_ts": last_poll_cycle_finished_ts,
                     "poll_groups": poll_groups,
                     "metric_sets": metric_sets,
                     "bad_tags": bad_tags,
@@ -1149,5 +1245,117 @@ mod tests {
         let resp2 = http_get(&addr, &format!("/v1/command/{id}"));
         assert!(resp2.contains("200 OK"));
         assert!(resp2.contains(&format!("\"id\": {id}")));
+    }
+
+    /// Seed a database with metric sets and poll cycle data for effective_poll tests.
+    fn seed_effective_poll_db() -> Arc<Mutex<Connection>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "s7trace_api_eff_test_{}_{}_{}.db",
+            std::process::id(),
+            format!("{:?}", std::thread::current().id()).replace(':', "_"),
+            n,
+        ));
+        let path_str = path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+        let conn = schema::open(&path_str).expect("open db");
+        conn.execute_batch(
+            "INSERT INTO plc (name, host) VALUES ('plc1', '127.0.0.1:102');
+             INSERT INTO poll_group (name, period_ms) VALUES ('g1', 1000);
+             INSERT INTO poll_group (name, period_ms) VALUES ('g2', 500);
+             INSERT INTO tag (plc_id, name, address, data_type, poll_group_id,
+                              db_num, byte_offset, byte_size, enabled, created_ts, updated_ts)
+             VALUES (1, 'tagA', 'DB1.DBW0', 'i16', 1, 1, 0, 2, 1, 1000000, 1000000);
+             INSERT INTO tag (plc_id, name, address, data_type, poll_group_id,
+                              db_num, byte_offset, byte_size, enabled, created_ts, updated_ts)
+             VALUES (1, 'tagB', 'DB1.DBW2', 'i16', 1, 1, 2, 2, 1, 1000000, 1000000);
+             INSERT INTO tag (plc_id, name, address, data_type, poll_group_id,
+                              db_num, byte_offset, byte_size, enabled, created_ts, updated_ts)
+             VALUES (1, 'tagC', 'DB1.DBW4', 'i16', 2, 1, 4, 2, 1, 1000000, 1000000);
+             INSERT INTO tag (plc_id, name, address, data_type, poll_group_id,
+                              db_num, byte_offset, byte_size, enabled, created_ts, updated_ts)
+             VALUES (1, 'tagD', 'DB1.DBW6', 'i16', 2, 1, 6, 2, 0, 1000000, 1000000);
+             INSERT INTO metric_set (plc_id, name, enabled, created_ts, updated_ts) VALUES (1, 'set_single', 1, 1000000, 1000000);
+             INSERT INTO metric_set (plc_id, name, enabled, created_ts, updated_ts) VALUES (1, 'set_mixed', 1, 1000000, 1000000);
+             INSERT INTO metric_set (plc_id, name, enabled, created_ts, updated_ts) VALUES (1, 'set_none', 1, 1000000, 1000000);
+             INSERT INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
+             VALUES (1, 1, 1, 1000000), (1, 2, 1, 1000000);
+             INSERT INTO metric_set_tag (metric_set_id, tag_id, plc_id, created_ts)
+             VALUES (2, 1, 1, 1000000), (2, 3, 1, 1000000);
+             INSERT INTO dataset (plc_id, name, state, created_ts, updated_ts)
+             VALUES (1, 'test_ds', 'active', 1000000, 1000000);
+             INSERT INTO poll_cycle (plc_id, poll_group_id, dataset_id, seq, started_ts, finished_ts,
+                                     actual_ms, target_ms, ok)
+             VALUES (1, 1, 1, 1, 1000000, 2000000, 100.0, 1000, 1);",
+        )
+        .expect("seed effective_poll db");
+        Arc::new(Mutex::new(conn))
+    }
+
+    #[test]
+    fn test_status_effective_poll_single() {
+        let db = seed_effective_poll_db();
+        let port = spawn_server(db);
+        let resp = http_get(&format!("127.0.0.1:{port}"), "/v1/status");
+        assert!(resp.contains("200 OK"), "status: {resp}");
+        // set_single has tagA and tagB, both in poll_group g1 (id=1)
+        assert!(resp.contains("set_single"), "set_single not in: {resp}");
+        assert!(
+            resp.contains("\"mode\": \"single\""),
+            "single mode not in: {resp}"
+        );
+        assert!(
+            resp.contains("\"poll_group_name\": \"g1\""),
+            "g1 not in: {resp}"
+        );
+        assert!(
+            resp.contains("\"period_ms\": 1000"),
+            "1000ms not in: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_status_effective_poll_mixed() {
+        let db = seed_effective_poll_db();
+        let port = spawn_server(db);
+        let resp = http_get(&format!("127.0.0.1:{port}"), "/v1/status");
+        assert!(resp.contains("200 OK"), "status: {resp}");
+        // set_mixed has tagA (poll_group g1) and tagC (poll_group g2)
+        assert!(resp.contains("set_mixed"), "set_mixed not in: {resp}");
+        assert!(
+            resp.contains("\"mode\": \"mixed\""),
+            "mixed mode not in: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_status_effective_poll_none() {
+        let db = seed_effective_poll_db();
+        let port = spawn_server(db);
+        let resp = http_get(&format!("127.0.0.1:{port}"), "/v1/status");
+        assert!(resp.contains("200 OK"), "status: {resp}");
+        // set_none has no metric_set_tag rows, so 0 enabled tags
+        assert!(resp.contains("set_none"), "set_none not in: {resp}");
+        assert!(
+            resp.contains("\"mode\": \"none\""),
+            "none mode not in: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_status_last_poll_cycle_finished_ts() {
+        let db = seed_effective_poll_db();
+        let port = spawn_server(db);
+        let resp = http_get(&format!("127.0.0.1:{port}"), "/v1/status");
+        assert!(resp.contains("200 OK"), "status: {resp}");
+        // PLC should have last_poll_cycle_finished_ts from the seeded poll_cycle
+        assert!(
+            resp.contains("last_poll_cycle_finished_ts"),
+            "last_poll_cycle_finished_ts not in: {resp}"
+        );
+        assert!(resp.contains("2000000"), "2000000 timestamp not in: {resp}");
     }
 }

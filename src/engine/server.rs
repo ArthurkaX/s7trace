@@ -1444,7 +1444,73 @@ fn execute_command(
                         "INSERT INTO poll_group (name, period_ms) VALUES (?1, ?2)",
                         rusqlite::params![name, period_ms],
                     )?;
-                    Ok((true, format!("success poll_group={name} period_ms={period_ms}")))
+                    Ok((
+                        true,
+                        format!("success poll_group={name} period_ms={period_ms}"),
+                    ))
+                }
+
+                "poll_group_update_period" => {
+                    let pg_id = if let Some(id) = req["poll_group_id"].as_i64() {
+                        id
+                    } else if let Some(name) = req["poll_group"].as_str() {
+                        conn.query_row(
+                            "SELECT id FROM poll_group WHERE name = ?1",
+                            rusqlite::params![name],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(|_| anyhow::anyhow!("poll group '{name}' not found"))?
+                    } else {
+                        return Err(anyhow::anyhow!("missing poll_group_id or poll_group"));
+                    };
+
+                    let period_ms = req["period_ms"]
+                        .as_i64()
+                        .ok_or_else(|| anyhow::anyhow!("missing period_ms"))?;
+
+                    if period_ms < 50 {
+                        return Ok((false, "period_ms must be at least 50".into()));
+                    }
+
+                    let pg_name: String = conn
+                        .query_row(
+                            "SELECT name FROM poll_group WHERE id = ?1",
+                            rusqlite::params![pg_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or_else(|_| format!("id={}", pg_id));
+
+                    // Look up a plc_id that uses this poll group
+                    let plc_id: Option<i64> = conn
+                        .query_row(
+                            "SELECT DISTINCT t.plc_id FROM tag t WHERE t.poll_group_id = ?1 LIMIT 1",
+                            rusqlite::params![pg_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .ok();
+
+                    conn.execute(
+                        "UPDATE poll_group SET period_ms = ?1 WHERE id = ?2",
+                        rusqlite::params![period_ms, pg_id],
+                    )?;
+
+                    let reason = format!("poll_group_update_period id={pg_id}");
+                    let _ = db::config_apply::schedule(
+                        conn,
+                        ApplyScope::PollGroup,
+                        plc_id,
+                        Some(pg_id),
+                        None,
+                        None,
+                        &reason,
+                        db::config_apply::PLAN_COOLDOWN_MS,
+                        None,
+                    );
+
+                    Ok((
+                        true,
+                        format!("success poll_group={pg_name} period_ms={period_ms}"),
+                    ))
                 }
 
                 "set_create" => {
@@ -1471,7 +1537,10 @@ fn execute_command(
                         rusqlite::params![plc_id, name, description, now],
                     )?;
                     let id = conn.last_insert_rowid();
-                    Ok((true, format!("success set_id={id} name={name} plc={plc_name}")))
+                    Ok((
+                        true,
+                        format!("success set_id={id} name={name} plc={plc_name}"),
+                    ))
                 }
 
                 "set_enable" => {
@@ -1502,7 +1571,10 @@ fn execute_command(
                         db::config_apply::PLAN_COOLDOWN_MS,
                         None,
                     );
-                    Ok((true, format!("success set={set_name} enabled=1 apply_state=pending")))
+                    Ok((
+                        true,
+                        format!("success set={set_name} enabled=1 apply_state=pending"),
+                    ))
                 }
 
                 "set_disable" => {
@@ -1533,7 +1605,10 @@ fn execute_command(
                         db::config_apply::PLAN_COOLDOWN_MS,
                         None,
                     );
-                    Ok((true, format!("success set={set_name} enabled=0 apply_state=pending")))
+                    Ok((
+                        true,
+                        format!("success set={set_name} enabled=0 apply_state=pending"),
+                    ))
                 }
 
                 "set_add_tag" => {
@@ -1553,7 +1628,11 @@ fn execute_command(
                         .map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
 
                     let now = now_us();
-                    let pieces: Vec<&str> = tag_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                    let pieces: Vec<&str> = tag_str
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                     let mut added = 0usize;
                     for piece in &pieces {
                         let tag_id: i64 = conn
@@ -1601,7 +1680,10 @@ fn execute_command(
                             rusqlite::params![set_id, tag_str],
                         )?
                     };
-                    Ok((true, format!("success removed={affected} tags from set '{set_name}'")))
+                    Ok((
+                        true,
+                        format!("success removed={affected} tags from set '{set_name}'"),
+                    ))
                 }
 
                 "tag_import" => {
@@ -2543,8 +2625,11 @@ impl Server {
             // Expire stale pending commands every 12 ticks (60 s)
             if tick.is_multiple_of(12) {
                 let conn = self.db.lock();
-                let expired = db::command_queue::expire_stale_pending(&conn, db::command_queue::PENDING_CMD_TTL_US)
-                    .unwrap_or(0);
+                let expired = db::command_queue::expire_stale_pending(
+                    &conn,
+                    db::command_queue::PENDING_CMD_TTL_US,
+                )
+                .unwrap_or(0);
                 if expired > 0 {
                     info!("expired {expired} stale pending command(s)");
                 }

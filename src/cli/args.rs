@@ -258,6 +258,21 @@ pub enum Command {
         name: Option<String>,
     },
 
+    /// Enable a disabled tag (re-add to plans).
+    TagEnable {
+        /// Tag ID to enable.
+        #[arg(long = "id")]
+        tag_id: Option<i64>,
+
+        /// PLC name (alternative to --id).
+        #[arg(long = "plc")]
+        plc: Option<String>,
+
+        /// Tag name (alternative to --id, requires --plc).
+        #[arg(long = "name")]
+        name: Option<String>,
+    },
+
     /// Revalidate a bad tag.
     TagRevalidate {
         /// Tag ID.
@@ -493,6 +508,21 @@ pub enum Command {
 
         /// Poll period in milliseconds.
         #[arg(long)]
+        period_ms: i64,
+    },
+
+    /// Update a poll group's polling period.
+    PollGroupSetPeriod {
+        /// Poll group ID.
+        #[arg(long = "id")]
+        poll_group_id: Option<i64>,
+
+        /// Poll group name (alternative to --id).
+        #[arg(long = "name")]
+        poll_group_name: Option<String>,
+
+        /// New polling period in milliseconds (minimum 50).
+        #[arg(long = "period-ms")]
         period_ms: i64,
     },
 

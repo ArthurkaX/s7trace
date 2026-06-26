@@ -18,6 +18,12 @@ struct SnapshotInner {
     by_name: HashMap<(i64, String), i64>,  // (plc_id, name) -> tag_id
 }
 
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Snapshot {
     pub fn new() -> Self {
         Snapshot {

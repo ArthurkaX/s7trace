@@ -7,19 +7,17 @@ use clap::{Parser, Subcommand};
     version,
     about = "Read-only data collection service for Siemens S7 PLCs",
     long_about = "s7trace polls and stores data from Siemens S7 PLCs.\n\n\
-        Run `s7trace server` explicitly on a host that has network access to the PLC.\n\
-        Every other subcommand is a client. Client commands require an explicit target:\n\
-        `-r http://HOST:8080` for a server, or `--local-db` for direct local SQLite\n\
-        and command-queue access. The CLI never falls back to local DB implicitly.",
-    after_help = "QUICKSTART  (bare database -> live collection):\n  \
-        s7trace --local-db plc-add --name line1 --host 192.168.0.1:102 --rack 0 --slot 2\n  \
-        s7trace --local-db poll-group-add --name fast --period-ms 1000\n  \
-        s7trace --local-db tag-import --plc line1 --file signals.yaml --set diag --poll-group fast\n  \
-        s7trace --local-db set-enable diag\n  \
-        s7trace --local-db collection-start --plc line1 --dataset run1 --set diag\n  \
-        s7trace --local-db read --plc line1 --address DB1.DBW0 --type i16\n  \
-        s7trace --local-db status --format json\n  \
-        s7trace --local-db collection-stop --plc line1\n\
+        Client commands require a server: `-r HOST` or `S7TRACE_SERVER`.\n\
+        Local operations: `--local-db sql` (read) and `admin-sql` (maintenance).\n\
+        Action commands fail without a server address.",
+    after_help = "QUICKSTART  (local maintenance -> live collection):\n  \
+        s7trace --local-db sql \"SELECT * FROM plc\"\n  \
+        SERVER: Port 7707 by default, override with S7TRACE_PORT.\n  \
+        \n\
+        REMOTE SERVER:\n  \
+        Prefix commands with `-r HOST` or set env S7TRACE_SERVER.\n  \
+        The port is 7707 by default (S7TRACE_PORT to override).\n  \
+        Full URL also accepted (e.g. `-r http://host:7707`).\n\
         \n\
         COMMAND GROUPS:\n  \
         config    plc-add  poll-group-add  tag-add  tag-import  tag-update  tag-disable\n  \
@@ -30,12 +28,9 @@ use clap::{Parser, Subcommand};
         admin     server  admin-sql  tag-revalidate\n\
         \n\
         TARGETS:\n  \
-        Remote server: prefix supported commands with `-r http://HOST:8080`\n  \
-        (or set S7TRACE_REMOTE_SERVER). The CLI then needs no direct PLC access.\n  \
-        Local DB: add `--local-db` to opt into direct SQLite access using --db.\n  \
-        Never omit both: local DB is an explicit target, not fallback.\n  \
-        HTTP is transport only: operators must use `s7trace` commands, not curl.\n  \
-        Remote SQL is only `s7trace -r URL sql`; admin-sql is local-db only.\n\
+        Server: `-r IP` or `-r http://IP:PORT` (or env S7TRACE_SERVER).\n  \
+        Local DB: `--local-db` for sql/admin-sql only (read-only SQL or maintenance).\n  \
+        All other commands require a server address and fail with a clear error.\n\
         \n\
         Run `s7trace <command> --help` for the options of a single command."
 )]
@@ -49,20 +44,32 @@ pub struct Cli {
     )]
     pub db: String,
 
-    /// Route operations through a s7trace server at this URL (e.g.
-    /// http://10.0.0.1:8080). This URL is CLI transport only: do not use curl
-    /// or call HTTP endpoints directly. For SQL, use `s7trace -r URL sql`
-    /// remotely, or `s7trace --local-db sql` / `admin-sql` locally.
+    /// Route operations through a s7trace server at this address.
+    /// Accepts a bare IP/host (e.g. 192.168.0.50) or a full URL
+    /// (e.g. http://192.168.0.50:7707). Default port is 7707;
+    /// override with env S7TRACE_PORT.
     #[arg(
         short = 'r',
         long(None::<&str>),
-        env = "S7TRACE_REMOTE_SERVER",
+        env = "S7TRACE_SERVER",
         global = true
     )]
     pub remote_server: Option<String>,
 
-    /// Explicitly use the local SQLite database selected by --db. Required for
-    /// direct local DB inspection/maintenance. Mutually exclusive with -r.
+    /// Server listening port for the s7trace HTTP transport.
+    /// Only used when -r / S7TRACE_SERVER is a bare host (no port).
+    /// Default: 7707.
+    #[arg(
+        long = "server-port",
+        default_value_t = 7707,
+        env = "S7TRACE_PORT",
+        global = true
+    )]
+    pub server_port: u16,
+
+    /// Explicitly use the local SQLite database selected by --db.
+    /// Only valid with `sql` (read-only) and `admin-sql` (maintenance).
+    /// Action commands (tag-add, plc-add, etc.) reject --local-db.
     #[arg(long = "local-db", global = true, conflicts_with = "remote_server")]
     pub local_db: bool,
 
@@ -199,10 +206,6 @@ pub enum Command {
         /// Metric set to add the tag to.
         #[arg(long = "set")]
         metric_set: Option<String>,
-
-        /// Submit asynchronously.
-        #[arg(long = "async")]
-        async_mode: bool,
     },
 
     /// Revalidate and update an existing tag.
@@ -285,12 +288,8 @@ pub enum Command {
         data_type: String,
 
         /// Output format.
-        #[arg(long = "format", default_value = "text")]
+        #[arg(long = "format", default_value = "json")]
         format: String,
-
-        /// Return immediately after queueing instead of waiting for the result.
-        #[arg(long = "no-wait")]
-        no_wait: bool,
     },
 
     /// One-off raw DB byte read for offset diagnostics.
@@ -318,10 +317,6 @@ pub enum Command {
         /// Save as a diagnostic probe.
         #[arg(long = "save-probe")]
         save_probe: bool,
-
-        /// Return immediately after queueing instead of waiting for the result.
-        #[arg(long = "no-wait")]
-        no_wait: bool,
     },
 
     /// Runtime health, bad tags, current plans.
@@ -387,10 +382,6 @@ pub enum Command {
     SetEnable {
         /// Metric set name.
         set_name: String,
-
-        /// Submit asynchronously.
-        #[arg(long = "async")]
-        async_mode: bool,
     },
 
     /// Disable a metric set.
@@ -429,10 +420,6 @@ pub enum Command {
         /// Metric set(s) to collect.
         #[arg(long = "set")]
         sets: Vec<String>,
-
-        /// Return immediately after queueing instead of waiting for the result.
-        #[arg(long = "no-wait")]
-        no_wait: bool,
     },
 
     /// Stop data collection for a PLC.
@@ -440,10 +427,6 @@ pub enum Command {
         /// PLC name.
         #[arg(long = "plc")]
         plc: String,
-
-        /// Return immediately after queueing instead of waiting for the result.
-        #[arg(long = "no-wait")]
-        no_wait: bool,
     },
 
     /// Clean history by cutoff timestamp.

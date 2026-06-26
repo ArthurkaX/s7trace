@@ -136,7 +136,7 @@ impl PlcClient for Turbo7Client {
             // Transport errors (IO / connection) mean the client is stale.
             // Clear inner so the poller reconnect loop has a chance to
             // re-establish the connection on the next cycle.
-            if res.as_ref().err().map_or(false, |e| {
+            if res.as_ref().err().is_some_and(|e| {
                 matches!(
                     e,
                     turbos7::Error::Io(_) | turbos7::Error::Connection(_) | turbos7::Error::Timeout
@@ -166,8 +166,8 @@ impl PlcClient for Turbo7Client {
         let res: turbos7::Result<Vec<turbos7::ReadResult>> = runtime().block_on(async {
             client.read_multiple(&t_items).await
         });
-        if res.is_err() {
-            if res.as_ref().err().map_or(false, |e| {
+        if res.is_err()
+            && res.as_ref().err().is_some_and(|e| {
                 matches!(
                     e,
                     turbos7::Error::Io(_) | turbos7::Error::Connection(_) | turbos7::Error::Timeout
@@ -175,7 +175,6 @@ impl PlcClient for Turbo7Client {
             }) {
                 self.inner = None;
             }
-        }
         let results = res.map_err(|e| plc_error_from_turbos7(&e))?;
         if results.len() != items.len() {
             return Err(PlcError::ProtocolError(format!(
@@ -194,7 +193,7 @@ impl PlcClient for Turbo7Client {
         }
         let out: Vec<ReadResult> = items
             .iter()
-            .zip(results.into_iter())
+            .zip(results)
             .map(|(item, r)| ReadResult {
                 item: item.clone(),
                 data: r.data,

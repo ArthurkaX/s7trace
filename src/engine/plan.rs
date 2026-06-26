@@ -84,7 +84,7 @@ fn flush_bin(bin: &mut Vec<ReadSpan>, out: &mut Vec<ReadSpan>, poll_group_id: i6
         out.push(make_multi_span(bin, poll_group_id));
         bin.clear();
     } else {
-        out.extend(bin.drain(..));
+        out.append(bin);
     }
 }
 

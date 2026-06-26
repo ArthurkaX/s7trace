@@ -305,9 +305,9 @@ impl PlcPoller {
                             for &tag_id in &span.tag_ids {
                                 if let Some(tag) = self.tags.get(&tag_id).cloned() {
                                     match client.read_db(
-                                        tag.db_num as u16,
-                                        tag.byte_offset as usize,
-                                        tag.byte_size as usize,
+                                        tag.db_num,
+                                        tag.byte_offset,
+                                        tag.byte_size,
                                     ) {
                                         Ok(_) => {
                                             debug!(
@@ -413,9 +413,9 @@ impl PlcPoller {
                         for &tag_id in &span.tag_ids {
                             if let Some(tag) = self.tags.get(&tag_id).cloned() {
                                 match client.read_db(
-                                    tag.db_num as u16,
-                                    tag.byte_offset as usize,
-                                    tag.byte_size as usize,
+                                    tag.db_num,
+                                    tag.byte_offset,
+                                    tag.byte_size,
                                 ) {
                                     Ok(_) => {
                                         debug!(

@@ -366,7 +366,7 @@ fn load_active_tags(
                 hook_params_json: row.get(12)?,
                 enabled: row.get(13)?,
                 bad: row.get(14)?,
-                bad_class: bad_class_str.map(|s| s.parse::<BadClass>().ok()).flatten(),
+                bad_class: bad_class_str.and_then(|s| s.parse::<BadClass>().ok()),
                 bad_detail: row.get(16)?,
             })
         })?
@@ -2155,7 +2155,7 @@ fn update_snapshot_from_batch(
     let plc_id = batch.plc_id;
     for sample in &batch.samples {
         // Lazy-load tag metadata into cache
-        if !tag_cache.contains_key(&sample.tag_id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = tag_cache.entry(sample.tag_id) {
             if let Ok((name, address, dt_str)) = conn.query_row(
                 "SELECT name, address, data_type FROM tag WHERE id = ?1",
                 rusqlite::params![sample.tag_id],
@@ -2168,7 +2168,7 @@ fn update_snapshot_from_batch(
                 },
             ) {
                 if let Ok(dt) = dt_str.parse::<DataType>() {
-                    tag_cache.insert(sample.tag_id, (plc_id, name, address, dt));
+                    e.insert((plc_id, name, address, dt));
                 }
             }
         }
@@ -2505,7 +2505,7 @@ impl Server {
             std::thread::sleep(Duration::from_millis(5000));
             tick += 1;
 
-            if tick % 6 == 0 {
+            if tick.is_multiple_of(6) {
                 let conn = self.db.lock();
                 let tag_count: i64 = conn
                     .query_row(
@@ -2541,7 +2541,7 @@ impl Server {
             }
 
             // Expire stale pending commands every 12 ticks (60 s)
-            if tick % 12 == 0 {
+            if tick.is_multiple_of(12) {
                 let conn = self.db.lock();
                 let expired = db::command_queue::expire_stale_pending(&conn, db::command_queue::PENDING_CMD_TTL_US)
                     .unwrap_or(0);

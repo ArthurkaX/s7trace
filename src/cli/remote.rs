@@ -1,10 +1,24 @@
-//! Remote client: thin HTTP wrapper used by CLI commands when the
-//! s7trace server is on a different host (no direct PLC access).
-//!
-//! Endpoints used:
-//!   POST /v1/command        -> enqueue a command, returns {id}
-//!   GET  /v1/command/{id}   -> poll a single command, returns id+state+result
-//!   GET  /v1/status         -> status snapshot (used by `status` CLI)
+/// Resolve a server address to a base URL.
+///
+/// Accepts:
+/// - A bare IP/host (e.g. `192.168.0.50`) → `http://host:port`
+/// - A full URL (e.g. `http://192.168.0.50:7707`) → used as-is
+/// - A host with embedded port (e.g. `host:7707`) → `http://host:port`
+///
+/// The `default_port` is used when no port is specified (typically 7707).
+pub fn resolve_url(host_or_url: &str, default_port: u16) -> String {
+    let s = host_or_url.trim();
+    // If it already has a scheme, use as-is (strip trailing slash)
+    if s.contains("://") {
+        return s.trim_end_matches('/').to_string();
+    }
+    // Bare host or host:port
+    if let Some((host, port_str)) = s.split_once(':') {
+        let port: u16 = port_str.parse().unwrap_or(default_port);
+        return format!("http://{}:{}", host, port);
+    }
+    format!("http://{}:{}", s, default_port)
+}
 
 use anyhow::{anyhow, Context, Result};
 use std::io::{Read, Write};
@@ -36,7 +50,8 @@ pub fn enqueue_command(
     let resp = http_post(base_url, "/v1/command", &body_str, timeout)?;
     let v: serde_json::Value = serde_json::from_str(&resp)
         .with_context(|| format!("invalid JSON from /v1/command: {resp}"))?;
-    v["id"].as_i64()
+    v["id"]
+        .as_i64()
         .ok_or_else(|| anyhow!("/v1/command did not return id: {resp}"))
 }
 
@@ -57,7 +72,10 @@ pub fn wait_command(
             .with_context(|| format!("invalid JSON from {url}: {resp}"))?;
         // Server returns state as Debug-formatted (e.g. "Pending", "Running",
         // "Ok", "Failed", "Cancelled", "Rejected"). Normalize to lowercase.
-        let state_raw = v["command"]["state"].as_str().unwrap_or("unknown").to_string();
+        let state_raw = v["command"]["state"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
         let state = state_raw.to_lowercase();
         let result_json = v["result"]["result_json"].as_str().unwrap_or("");
         let ok = v["result"]["ok"].as_bool().unwrap_or(false);
@@ -84,8 +102,7 @@ pub fn wait_command(
 /// Fetch /v1/status and return the raw JSON string.
 pub fn get_status(base_url: &str, timeout: Duration) -> Result<serde_json::Value> {
     let resp = http_get(base_url, "/v1/status", timeout)?;
-    serde_json::from_str(&resp)
-        .with_context(|| format!("invalid JSON from /v1/status: {resp}"))
+    serde_json::from_str(&resp).with_context(|| format!("invalid JSON from /v1/status: {resp}"))
 }
 
 /// Fetch /v1/tags?... and return the JSON array.
@@ -97,13 +114,22 @@ pub fn get_tags(
     timeout: Duration,
 ) -> Result<serde_json::Value> {
     let mut q = Vec::new();
-    if let Some(p) = plc { q.push(format!("plc={}", urlencode(p))); }
-    if let Some(e) = enabled { q.push(format!("enabled={e}")); }
-    if let Some(b) = bad { q.push(format!("bad={b}")); }
-    let url = if q.is_empty() { "/v1/tags".to_string() } else { format!("/v1/tags?{}", q.join("&")) };
+    if let Some(p) = plc {
+        q.push(format!("plc={}", urlencode(p)));
+    }
+    if let Some(e) = enabled {
+        q.push(format!("enabled={e}"));
+    }
+    if let Some(b) = bad {
+        q.push(format!("bad={b}"));
+    }
+    let url = if q.is_empty() {
+        "/v1/tags".to_string()
+    } else {
+        format!("/v1/tags?{}", q.join("&"))
+    };
     let resp = http_get(base_url, &url, timeout)?;
-    serde_json::from_str(&resp)
-        .with_context(|| format!("invalid JSON from {url}: {resp}"))
+    serde_json::from_str(&resp).with_context(|| format!("invalid JSON from {url}: {resp}"))
 }
 
 /// Fetch /v1/sets?plc=... and return the JSON array.
@@ -118,8 +144,7 @@ pub fn get_set_list(
         "/v1/sets".to_string()
     };
     let resp = http_get(base_url, &url, timeout)?;
-    serde_json::from_str(&resp)
-        .with_context(|| format!("invalid JSON from {url}: {resp}"))
+    serde_json::from_str(&resp).with_context(|| format!("invalid JSON from {url}: {resp}"))
 }
 
 /// Fetch /v1/set/{name} and return the JSON object.
@@ -130,8 +155,7 @@ pub fn get_set_show(
 ) -> Result<serde_json::Value> {
     let url = format!("/v1/set/{}", urlencode(set_name));
     let resp = http_get(base_url, &url, timeout)?;
-    serde_json::from_str(&resp)
-        .with_context(|| format!("invalid JSON from {url}: {resp}"))
+    serde_json::from_str(&resp).with_context(|| format!("invalid JSON from {url}: {resp}"))
 }
 
 /// POST /v1/command/{id}/cancel to cancel a pending command.
@@ -190,7 +214,8 @@ fn http_post(base_url: &str, path: &str, body: &str, timeout: Duration) -> Resul
 
 fn parse_base(s: &str) -> Result<(String, u16)> {
     let s = s.trim();
-    let s = s.strip_prefix("http://")
+    let s = s
+        .strip_prefix("http://")
         .or_else(|| s.strip_prefix("https://"))
         .ok_or_else(|| anyhow!("URL must start with http:// or https://: {s}"))?;
     // No TLS support yet; warn if https
@@ -200,7 +225,8 @@ fn parse_base(s: &str) -> Result<(String, u16)> {
     // strip trailing slash
     let s = s.trim_end_matches('/');
     if let Some((host_port, _path)) = s.split_once('/') {
-        let (h, p) = host_port.split_once(':')
+        let (h, p) = host_port
+            .split_once(':')
             .ok_or_else(|| anyhow!("missing port in URL: {s}"))?;
         let port: u16 = p.parse().context("invalid port")?;
         Ok((h.to_string(), port))
@@ -219,7 +245,10 @@ fn parse_http_response(buf: &[u8]) -> Result<String> {
     let mut parts = s.split("\r\n\r\n");
     let head = parts.next().ok_or_else(|| anyhow!("empty HTTP response"))?;
     let body = parts.next().unwrap_or("").to_string();
-    let status_line = head.lines().next().ok_or_else(|| anyhow!("missing status line"))?;
+    let status_line = head
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("missing status line"))?;
     if !status_line.contains(" 200 ") && !status_line.contains(" 201 ") {
         return Err(anyhow!("HTTP error: {status_line} body={body}"));
     }
@@ -247,8 +276,14 @@ mod tests {
 
     #[test]
     fn test_parse_base() {
-        assert_eq!(parse_base("http://10.0.0.1:8080").unwrap(), ("10.0.0.1".to_string(), 8080));
-        assert_eq!(parse_base("http://10.0.0.1:8080/").unwrap(), ("10.0.0.1".to_string(), 8080));
+        assert_eq!(
+            parse_base("http://10.0.0.1:8080").unwrap(),
+            ("10.0.0.1".to_string(), 8080)
+        );
+        assert_eq!(
+            parse_base("http://10.0.0.1:8080/").unwrap(),
+            ("10.0.0.1".to_string(), 8080)
+        );
         assert_eq!(parse_base("http://host").unwrap(), ("host".to_string(), 80));
     }
 

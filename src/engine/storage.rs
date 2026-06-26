@@ -512,7 +512,7 @@ fn eval_counter_delta(
         (Some(curr), Some(prev)) => {
             if curr < prev {
                 // Possible wraparound
-                (curr + state.wrap_at - prev) as i64
+                curr + state.wrap_at - prev
             } else {
                 curr - prev
             }

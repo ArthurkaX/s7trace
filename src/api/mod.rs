@@ -269,8 +269,8 @@ fn qparam<'a>(query: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-fn param_owned<'a>(query: &'a [(String, String)], key: &str) -> Option<String> {
-    qparam(query, key).map(|s| urldecode(s))
+fn param_owned(query: &[(String, String)], key: &str) -> Option<String> {
+    qparam(query, key).map(urldecode)
 }
 
 fn urldecode(s: &str) -> String {

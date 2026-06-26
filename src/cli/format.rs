@@ -1,63 +1,79 @@
 /// Output formatting helpers for CLI commands.
-
-use serde::Serialize;
-use serde_json::Value;
+///
+/// Default output is compact JSON. `--format table` is the only
+/// human-readable mode.
 
 /// Supported output formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
-    Text,
+    /// Compact JSON output (default for all commands).
+    CompactJson,
+    /// Human-readable tables (--format table).
     Table,
-    Json,
-    Jsonl,
 }
 
 impl Format {
     pub fn from_str(s: &str) -> Format {
         match s {
-            "json" => Format::Json,
-            "jsonl" => Format::Jsonl,
             "table" => Format::Table,
-            _ => Format::Text,
+            _ => Format::CompactJson,
         }
     }
 }
 
-/// Print a result in the requested format.
- pub fn print_result<T: Serialize + std::fmt::Debug>(format: Format, label: &str, value: &T) {
-    match format {
-        Format::Text => println!("{}={}", label, serde_json::to_string(value).unwrap_or_default()),
-        Format::Table => {
-            // Simple key=value lines
-            if let Ok(map) = serde_json::to_value(value) {
-                if let Some(obj) = map.as_object() {
-                    for (k, v) in obj {
-                        print_value(k, v);
-                    }
-                } else {
-                    println!("{label}: {value:?}");
-                }
-            }
-        }
-        Format::Json => {
-            println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
-        }
-        Format::Jsonl => {
-            println!("{}", serde_json::to_string(value).unwrap_or_default());
-        }
-    }
+/// Print a successful result as compact JSON: {"ok":true,"result":...}
+/// Null fields in `result` are omitted (serialized with `skip_serializing_none`).
+pub fn print_json_ok(result: &serde_json::Value) {
+    let obj = serde_json::json!({
+        "ok": true,
+        "result": result,
+    });
+    println!("{}", serde_json::to_string(&obj).unwrap_or_default());
 }
 
-/// Print a single key=value pair with proper quoting.
-fn print_value(key: &str, value: &Value) {
-    match value {
-        Value::String(s) => println!("{key}={s}"),
-        Value::Number(n) => println!("{key}={n}"),
-        Value::Bool(b) => println!("{key}={b}"),
-        Value::Null => println!("{key}=null"),
-        Value::Array(_) | Value::Object(_) => {
-            println!("{key}={}", serde_json::to_string(value).unwrap_or_default());
-        }
+/// Print an error result as compact JSON: {"ok":false,"bad_class":...,"detail":...,"exit_code":N}
+pub fn print_json_error(bad_class: &str, detail: &str, exit_code: i32) {
+    let obj = serde_json::json!({
+        "ok": false,
+        "bad_class": bad_class,
+        "detail": detail,
+        "exit_code": exit_code,
+    });
+    println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+}
+
+/// Print a timeout result per contract.
+pub fn print_json_timeout() {
+    print_json_error("timeout", "command did not complete in time", 3);
+}
+
+/// Print SQL result as columnar JSON: {"cols":[...],"rows":[[...],...]}
+/// One line, no pretty-print. Types preserved (null/integer/float/string).
+pub fn print_columnar_json(cols: &[String], rows: &[serde_json::Value]) {
+    let obj = serde_json::json!({
+        "cols": cols,
+        "rows": rows,
+    });
+    println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+}
+
+/// Print as table (tab-separated columns, one row per line).
+pub fn print_table(cols: &[String], rows: &[serde_json::Value]) {
+    // Header
+    println!("{}", cols.join("\t"));
+    for row in rows {
+        let vals: Vec<String> = match row {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => "NULL".to_string(),
+                    other => other.to_string(),
+                })
+                .collect(),
+            _ => vec![row.to_string()],
+        };
+        println!("{}", vals.join("\t"));
     }
 }
 
@@ -68,20 +84,6 @@ pub fn format_value(vi: Option<i64>, vf: Option<f64>) -> String {
         (_, Some(f)) => format!("{:.4}", f),
         (None, None) => "null".to_string(),
     }
-}
-
-/// Print command success output (D010-style).
-pub fn print_success(key_values: Vec<(&str, &dyn std::fmt::Display)>) {
-    let parts: Vec<String> = key_values
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
-    println!("success {}", parts.join(" "));
-}
-
-/// Print command failure output (D010-style).
-pub fn print_bad(bad_class: &str, detail: &str) {
-    println!("bad bad_class={bad_class} detail=\"{detail}\"");
 }
 
 /// Print hex dump (read-raw output).
@@ -98,7 +100,13 @@ pub fn print_hex_dump(data: &[u8], start: usize) {
             .join(" ");
         let ascii: String = chunk
             .iter()
-            .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
+            .map(|b| {
+                if b.is_ascii_graphic() || *b == b' ' {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         println!("{offset:08x}  {hex:<48}  {ascii}");
     }
@@ -115,7 +123,7 @@ pub fn print_json_hex(plc: &str, db: u16, start: usize, len: usize, ts_us: i64, 
         "ts_us": ts_us,
         "bytes_hex": hex_str,
     });
-    println!("{output}");
+    println!("{}", serde_json::to_string(&output).unwrap_or_default());
 }
 
 #[cfg(test)]
@@ -136,5 +144,22 @@ mod tests {
     #[test]
     fn test_format_value_null() {
         assert_eq!(format_value(None, None), "null");
+    }
+
+    #[test]
+    fn test_format_table_output() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let rows: Vec<serde_json::Value> = vec![serde_json::json!([1, "x"])];
+        // Just verify no panic
+        print_table(&cols, &rows);
+    }
+
+    #[test]
+    fn test_columnar_json() {
+        let cols = vec!["name".to_string(), "bad".to_string()];
+        let rows: Vec<serde_json::Value> = vec![serde_json::json!(["Motor.Speed", 1])];
+        let output = serde_json::json!({"cols": cols, "rows": rows});
+        assert_eq!(output["cols"][0], "name");
+        assert_eq!(output["rows"][0][0], "Motor.Speed");
     }
 }

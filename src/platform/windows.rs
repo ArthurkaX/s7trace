@@ -148,7 +148,7 @@ pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
             hInstance: hinstance,
             hIcon: LoadIconW(std::ptr::null_mut(), IDI_APPLICATION as *const u16),
             hCursor: std::ptr::null_mut(),
-            hbrBackground: 16 as isize as _, // COLOR_BTNFACE+1
+            hbrBackground: 16_isize as _, // COLOR_BTNFACE+1
             lpszMenuName: std::ptr::null(),
             lpszClassName: CLASS_NAME.as_ptr(),
             cbClsExtra: 0,
@@ -239,7 +239,7 @@ pub fn run_control_window(db: Arc<Mutex<Connection>>) -> Result<()> {
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = st.hwnd;
         nid.uID = ID_TRAYICON;
-        Shell_NotifyIconW(NIM_DELETE, &mut nid);
+        Shell_NotifyIconW(NIM_DELETE, &nid);
         DestroyWindow(st.hwnd);
         let _ = Box::from_raw(state_ptr as *mut AppState);
         APP_STATE.store(0, Ordering::SeqCst);
@@ -371,7 +371,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             for (dst, src) in nid.szTip.iter_mut().zip(tip.iter()) {
                 *dst = *src;
             }
-            Shell_NotifyIconW(NIM_ADD, &mut nid);
+            Shell_NotifyIconW(NIM_ADD, &nid);
 
             // Refresh timer (1s)
             SetTimer(hwnd, IDT_REFRESH, 1000, None);
@@ -761,8 +761,8 @@ fn paint(hwnd: HWND) {
 
         // Fill background with button face color
         let bg_brush = GetSysColorBrush(15); // COLOR_BTNFACE
-        let mut bg_rect = RECT { left: 0, top: 0, right: cx, bottom: cy };
-        FillRect(mem_dc, &mut bg_rect, bg_brush);
+        let bg_rect = RECT { left: 0, top: 0, right: cx, bottom: cy };
+        FillRect(mem_dc, &bg_rect, bg_brush);
 
         // Transparent background for all text
         SetBkMode(mem_dc, 1); // TRANSPARENT
@@ -800,8 +800,8 @@ fn paint(hwnd: HWND) {
         DrawTextW(mem_dc, stats.as_ptr(), -1, &mut sr, DT_LEFT | DT_NOPREFIX);
 
         // -- Divider --
-        let mut div = RECT { left: 10, top: 46, right: cx - 10, bottom: 47 };
-        FillRect(mem_dc, &mut div, GetSysColorBrush(14)); // COLOR_GRAYTEXT
+        let div = RECT { left: 10, top: 46, right: cx - 10, bottom: 47 };
+        FillRect(mem_dc, &div, GetSysColorBrush(14)); // COLOR_GRAYTEXT
 
         // -- Table --
         let body_lh = st.body_line_h;
@@ -1052,7 +1052,7 @@ fn submit_stop(db: &Arc<Mutex<Connection>>) {
                 )
                 .unwrap_or_else(|_| {
                     log::info!("control window: no active dataset to stop");
-                    return (0, String::new());
+                    (0, String::new())
                 })
             }
         }
@@ -1065,7 +1065,7 @@ fn submit_stop(db: &Arc<Mutex<Connection>>) {
         )
         .unwrap_or_else(|_| {
             log::info!("control window: no active dataset to stop");
-            return (0, String::new());
+            (0, String::new())
         })
     };
 

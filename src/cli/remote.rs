@@ -171,6 +171,15 @@ pub fn cancel_command(base_url: &str, command_id: i64, timeout: Duration) -> Res
 // Minimal std::net HTTP client (no external crate)
 // ---------------------------------------------------------------------------
 
+/// Optional `Authorization` header line for outgoing requests, from
+/// `S7TRACE_TOKEN`. Empty when unset (auth disabled). Includes trailing CRLF.
+fn auth_header() -> String {
+    match std::env::var("S7TRACE_TOKEN") {
+        Ok(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
+        _ => String::new(),
+    }
+}
+
 pub fn http_get(base_url: &str, path: &str, timeout: Duration) -> Result<String> {
     let (host, port) = parse_base(base_url)?;
     let addr = format!("{host}:{port}");
@@ -179,8 +188,9 @@ pub fn http_get(base_url: &str, path: &str, timeout: Duration) -> Result<String>
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
+    let auth = auth_header();
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\nAccept: application/json\r\n\r\n"
     );
     stream.write_all(req.as_bytes())?;
     let mut buf = Vec::new();
@@ -196,10 +206,11 @@ fn http_post(base_url: &str, path: &str, body: &str, timeout: Duration) -> Resul
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
+    let auth = auth_header();
     let req = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
-         Connection: close\r\n\
+         {auth}Connection: close\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {len}\r\n\
          Accept: application/json\r\n\

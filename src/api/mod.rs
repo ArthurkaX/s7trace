@@ -81,6 +81,7 @@ fn handle_conn(mut stream: TcpStream, db: Arc<Mutex<Connection>>) -> std::io::Re
 
     // Headers
     let mut content_length: usize = 0;
+    let mut auth_value: Option<String> = None;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
@@ -91,8 +92,12 @@ fn handle_conn(mut stream: TcpStream, db: Arc<Mutex<Connection>>) -> std::io::Re
         if trimmed.is_empty() {
             break;
         }
-        if let Some(rest) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("content-length:") {
             content_length = rest.trim().parse().unwrap_or(0);
+        } else if lower.starts_with("authorization:") {
+            // Keep original case — the token is case-sensitive.
+            auth_value = Some(trimmed["authorization:".len()..].trim().to_string());
         }
     }
 
@@ -102,9 +107,14 @@ fn handle_conn(mut stream: TcpStream, db: Arc<Mutex<Connection>>) -> std::io::Re
         reader.read_exact(&mut body)?;
     }
 
-    // Route
+    // Optional bearer-token auth (S7TRACE_TOKEN). Disabled when the env var is
+    // unset/empty — then the server is open, as before.
     let (path, query) = split_query(&target);
-    let resp = route(&db, &method, &path, &query, &body);
+    let resp = if is_authorized(required_token().as_deref(), auth_value.as_deref()) {
+        route(&db, &method, &path, &query, &body)
+    } else {
+        Response::err(401, "unauthorized: missing or invalid token")
+    };
 
     let body_str = resp.body;
     let status_line = match resp.status {
@@ -112,6 +122,7 @@ fn handle_conn(mut stream: TcpStream, db: Arc<Mutex<Connection>>) -> std::io::Re
         201 => format!("{version} 201 Created"),
         204 => format!("{version} 204 No Content"),
         400 => format!("{version} 400 Bad Request"),
+        401 => format!("{version} 401 Unauthorized"),
         404 => format!("{version} 404 Not Found"),
         405 => format!("{version} 405 Method Not Allowed"),
         500 => format!("{version} 500 Internal Server Error"),
@@ -136,6 +147,30 @@ fn handle_conn(mut stream: TcpStream, db: Arc<Mutex<Connection>>) -> std::io::Re
         peer
     );
     Ok(())
+}
+
+/// The shared bearer token the server requires, from `S7TRACE_TOKEN`.
+/// `None` (unset or empty) disables authentication — the server is open.
+fn required_token() -> Option<String> {
+    std::env::var("S7TRACE_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether a request is authorized. `expected` is the configured token
+/// (`None` => auth disabled => always authorized). `authorization` is the raw
+/// `Authorization` header value, if any.
+fn is_authorized(expected: Option<&str>, authorization: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true; // auth disabled
+    };
+    authorization
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        == Some(expected)
 }
 
 #[derive(Default)]
@@ -547,5 +582,42 @@ mod tests {
             "last_poll_cycle_finished_ts not in: {resp}"
         );
         assert!(resp.contains("2000000"), "2000000 timestamp not in: {resp}");
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_authorized — pure, no env vars, no server, no threads
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn is_authorized_no_token_always_true() {
+        // auth disabled (expected=None) => always authorized
+        assert!(is_authorized(None, None));
+        assert!(is_authorized(None, Some("Bearer anything")));
+    }
+
+    #[test]
+    fn is_authorized_missing_header() {
+        assert!(!is_authorized(Some("s3cret"), None));
+    }
+
+    #[test]
+    fn is_authorized_bearer_exact_match() {
+        assert!(is_authorized(Some("s3cret"), Some("Bearer s3cret")));
+    }
+
+    #[test]
+    fn is_authorized_bearer_lowercase_scheme() {
+        assert!(is_authorized(Some("s3cret"), Some("bearer s3cret")));
+    }
+
+    #[test]
+    fn is_authorized_wrong_token() {
+        assert!(!is_authorized(Some("s3cret"), Some("Bearer wrong")));
+    }
+
+    #[test]
+    fn is_authorized_no_scheme_rejected() {
+        // Token value without "Bearer " prefix is not accepted
+        assert!(!is_authorized(Some("s3cret"), Some("s3cret")));
     }
 }

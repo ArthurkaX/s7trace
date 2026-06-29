@@ -32,6 +32,21 @@ s7trace --db s7trace.db server
 s7trace --db s7trace.db server --noui --http-bind 127.0.0.1:7707
 ```
 
+### Optional bearer-token authentication
+
+Set the `S7TRACE_TOKEN` environment variable to the same value on both server
+and client to require every HTTP request to carry
+`Authorization: Bearer $S7TRACE_TOKEN`. When the variable is unset or empty the
+server is open (default behaviour).
+
+```sh
+# Server side
+S7TRACE_TOKEN=secret s7trace --db s7trace.db server
+
+# Client side (same token)
+S7TRACE_TOKEN=secret s7trace -r 127.0.0.1 status
+```
+
 ## Use the CLI
 
 Action commands are routed to a running server with `-r` (a bare host uses the

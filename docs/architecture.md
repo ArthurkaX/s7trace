@@ -77,6 +77,11 @@ connection so read endpoints (`/status`, `/tags`, …) run concurrently with the
 sample-writer instead of queueing behind it. Latest values for reads come from
 the in-memory `Snapshot` (`engine/snapshot.rs`), not from SQLite.
 
+The HTTP layer supports optional bearer-token authentication via the
+`S7TRACE_TOKEN` environment variable; when unset or empty the server is open
+(default). The CLI client sends the matching `Authorization: Bearer …` header
+automatically when the variable is set.
+
 ## PLC backend (`src/plc/`)
 
 `PlcClient` is a small trait; the default backend is `turbos7` (a vendored

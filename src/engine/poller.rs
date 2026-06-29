@@ -4,6 +4,7 @@
 /// (`skip_missed_ticks` by default per architecture doc).
 use crate::engine::storage::{self, HookState, RollupPayload, WriteDecision};
 use crate::plc::client::PlcClient;
+use crate::plc::PlcHandle;
 use crate::types::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -553,7 +554,7 @@ pub fn spawn_poller(
     period_ms: u64,
     plan: ReadPlan,
     tags: Vec<TagRow>,
-    client: Arc<Mutex<dyn PlcClient + Send>>,
+    client: PlcHandle,
     sample_tx: Sender<PollResult>,
     overrun_mode: OverrunMode,
 ) -> PollerHandle {
@@ -563,7 +564,12 @@ pub fn spawn_poller(
     std::thread::Builder::new()
         .name(format!("poller-{}", plc_name))
         .spawn(move || {
-            let plc_client = client;
+            // Each poller drives its own handle to the per-PLC actor at a
+            // priority equal to its poll period (lower period = more urgent).
+            // The actor serializes the actual reads but interleaves them at
+            // single-read granularity, so a slow group can no longer block a
+            // fast one for a whole cycle (see `plc::actor`).
+            let mut plc_client = client.with_priority(period_ms.max(1) as u32);
             info!("poller started for {} (period={}ms)", plc_name, period_ms);
 
             let mut poller = PlcPoller::new(plc_id, &plc_name, plan, period_ms, overrun_mode);
@@ -574,8 +580,7 @@ pub fn spawn_poller(
 
             while *thread_running.lock() {
                 let cycle_start = Instant::now();
-                let mut inner = plc_client.lock();
-                let result = poller.poll_once(&mut *inner);
+                let result = poller.poll_once(&mut plc_client);
 
                 match result {
                     Ok(r) => {
@@ -603,7 +608,6 @@ pub fn spawn_poller(
                     Err(e) => {
                         error!("PLC {}: poll cycle failed: {}", plc_name, e);
                         if matches!(&e, PlcError::Disconnected(_) | PlcError::Timeout(_)) {
-                            drop(inner);
                             reconnect_attempts = reconnect_attempts.saturating_add(1);
                             // Back off before retrying so an unreachable PLC is
                             // not hammered with a connect() every cycle.
@@ -617,8 +621,7 @@ pub fn spawn_poller(
                             if !*thread_running.lock() {
                                 break;
                             }
-                            let mut guard = plc_client.lock();
-                            match guard.connect() {
+                            match plc_client.connect() {
                                 Ok(()) => {
                                     info!("poller-{}: reconnected OK", plc_name);
                                     reconnect_attempts = 0;
@@ -628,13 +631,10 @@ pub fn spawn_poller(
                                     plc_name, reconnect_attempts, e2
                                 ),
                             }
-                            drop(guard);
                             continue;
                         }
                     }
                 }
-
-                drop(inner);
 
                 let elapsed = cycle_start.elapsed();
                 let target = Duration::from_millis(period_ms);

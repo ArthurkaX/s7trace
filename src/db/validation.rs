@@ -15,13 +15,11 @@
 use crate::plc::client::PlcClient;
 use crate::types::*;
 use anyhow::Result;
-use parking_lot::Mutex;
 use rusqlite::Connection;
-use std::sync::Arc;
 
 pub fn validate_tag(
     conn: &Connection,
-    client_arc: &Arc<Mutex<dyn PlcClient + Send>>,
+    client: &mut dyn PlcClient,
     tag_id: i64,
 ) -> Result<ValidationResult> {
     // Load tag — includes bit_offset for Bool tags
@@ -54,12 +52,10 @@ pub fn validate_tag(
     let bit_off = bit_offset.map(|b| b as u8);
 
     let now = now_us();
-    let mut client = client_arc.lock();
     let read_result = client.read_db(db_num as u16, byte_offset as usize, byte_size as usize);
 
     match read_result {
         Ok(data) => {
-            drop(client);
             let (vi, vf) = crate::codec::decode_value(&data, dt, bit_off);
             conn.execute(
                 "UPDATE tag
@@ -86,7 +82,6 @@ pub fn validate_tag(
             })
         }
         Err(e) => {
-            drop(client);
             let bad_class = e.bad_class();
             let detail = e.detail().to_string();
             conn.execute(
@@ -293,9 +288,8 @@ mod tests {
         let mut mock = MockPlcClient::new("test");
         mock.connect().unwrap();
         mock.seed(1, 0, vec![0x00, 0x2A]);
-        let client: Arc<Mutex<dyn PlcClient + Send>> = Arc::new(Mutex::new(mock));
 
-        let res = validate_tag(&conn, &client, tag_id).unwrap();
+        let res = validate_tag(&conn, &mut mock, tag_id).unwrap();
         assert!(res.ok);
         assert_eq!(res.value_i, Some(42));
         assert!(res.value_f.is_none());
@@ -327,9 +321,8 @@ mod tests {
             address: "DB1@0".into(),
             detail: "out of range".into(),
         });
-        let client: Arc<Mutex<dyn PlcClient + Send>> = Arc::new(Mutex::new(mock));
 
-        let res = validate_tag(&conn, &client, tag_id).unwrap();
+        let res = validate_tag(&conn, &mut mock, tag_id).unwrap();
         assert!(!res.ok);
         assert_eq!(res.bad_class, Some(BadClass::AddressOutOfRange));
         assert_eq!(res.detail.as_deref(), Some("out of range"));

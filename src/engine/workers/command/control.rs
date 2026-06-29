@@ -45,14 +45,14 @@ pub(super) fn execute_control(
             )?;
             let dt: DataType = data_type_str.parse().unwrap_or(DataType::I16);
 
-            let client_arc = {
+            let mut client = {
                 let reg = plcs.lock();
                 reg.get(&plc_id)
-                    .cloned()
+                    .map(|h| h.with_priority(crate::plc::PRIORITY_INTERACTIVE))
                     .ok_or_else(|| anyhow::anyhow!("PLC client not available for {plc_id}"))?
             };
 
-            let result = db::validation::validate_tag(conn, &client_arc, tag_id)?;
+            let result = db::validation::validate_tag(conn, &mut client, tag_id)?;
 
             if result.ok {
                 snapshot.update(
@@ -492,10 +492,13 @@ pub(super) fn execute_control(
 
             // Optionally validate each imported tag synchronously
             if do_validate && !imported_tags.is_empty() {
-                let client_opt = plcs.lock().get(&plc_id).cloned();
-                if let Some(client_arc) = client_opt {
+                let client_opt = plcs
+                    .lock()
+                    .get(&plc_id)
+                    .map(|h| h.with_priority(crate::plc::PRIORITY_INTERACTIVE));
+                if let Some(mut client) = client_opt {
                     for (tag_id, tag_name) in &imported_tags {
-                        match db::validation::validate_tag(conn, &client_arc, *tag_id) {
+                        match db::validation::validate_tag(conn, &mut client, *tag_id) {
                             Ok(result) => {
                                 if result.ok {
                                     info!("tag_import validate ok {tag_name} tag_id={tag_id}");

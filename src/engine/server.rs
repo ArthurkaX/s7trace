@@ -24,14 +24,17 @@ use crate::db;
 use crate::engine::poller::{OverrunMode, PollResult, PollerHandle};
 use crate::engine::snapshot::Snapshot;
 use crate::plc::client::PlcClient;
-use crate::plc::create_plc_client;
+use crate::plc::{create_plc_handle, PlcHandle};
 use crate::types::*;
 
 /// Batch of samples from one poll cycle, sent through the channel.
 pub type SampleBatch = PollResult;
 
-/// Registry of PLC clients, keyed by plc_id.
-pub(crate) type PlcRegistry = Arc<Mutex<HashMap<i64, Arc<Mutex<dyn PlcClient + Send>>>>>;
+/// Registry of PLC connection handles, keyed by plc_id. Each value is a cheap,
+/// cloneable [`PlcHandle`] to a per-PLC actor thread that owns the connection
+/// (see `plc::actor`); cloning a handle per consumer is what lets concurrent
+/// poll groups read the same PLC without blocking each other on a shared mutex.
+pub(crate) type PlcRegistry = Arc<Mutex<HashMap<i64, PlcHandle>>>;
 
 /// Registry of running poller handles, keyed by (plc_id, poll_group_id).
 pub(crate) type PollerRegistry = Arc<Mutex<HashMap<(i64, i64), PollerHandle>>>;
@@ -121,29 +124,26 @@ impl Server {
                 "initializing PLC '{}' (id={}) at {} (rack={}, slot={})",
                 plc_name, plc_id, host, rack, slot
             );
-            let client = create_plc_client(&plc_name, &host, rack as u16, slot as u16);
+            let mut handle = create_plc_handle(&plc_name, &host, rack as u16, slot as u16);
 
             // Try to connect and discover PDU length. Failure is non-fatal
             // (PLC may come online later).
-            {
-                let mut c = client.lock();
-                if c.connect().is_ok() {
-                    match c.pdu_len() {
-                        Ok(n) => {
-                            info!("PLC {}: PDU length = {} bytes", plc_name, n);
-                            pdu.insert(plc_id, n);
-                        }
-                        Err(e) => warn!("PLC {}: pdu_len() failed: {} (using 240)", plc_name, e),
+            if handle.connect().is_ok() {
+                match handle.pdu_len() {
+                    Ok(n) => {
+                        info!("PLC {}: PDU length = {} bytes", plc_name, n);
+                        pdu.insert(plc_id, n);
                     }
-                } else {
-                    warn!(
-                        "PLC {}: connect failed at startup; will retry in poller",
-                        plc_name
-                    );
-                    pdu.insert(plc_id, 240);
+                    Err(e) => warn!("PLC {}: pdu_len() failed: {} (using 240)", plc_name, e),
                 }
+            } else {
+                warn!(
+                    "PLC {}: connect failed at startup; will retry in poller",
+                    plc_name
+                );
+                pdu.insert(plc_id, 240);
             }
-            reg.insert(plc_id, client);
+            reg.insert(plc_id, handle);
         }
 
         info!("initialized {} PLC client(s)", reg.len());
@@ -173,8 +173,9 @@ impl Server {
                 info!("startup: revalidating {} bad tag(s)", bad_tags.len());
                 let reg = self.plcs.lock();
                 for (tag_id, plc_id) in &bad_tags {
-                    if let Some(client_arc) = reg.get(plc_id) {
-                        match db::validation::validate_tag(&conn, client_arc, *tag_id) {
+                    if let Some(handle) = reg.get(plc_id) {
+                        let mut client = handle.with_priority(crate::plc::PRIORITY_INTERACTIVE);
+                        match db::validation::validate_tag(&conn, &mut client, *tag_id) {
                             Ok(result) => {
                                 if result.ok {
                                     info!(
@@ -438,6 +439,10 @@ impl Server {
             h.stop();
         }
         std::thread::sleep(Duration::from_millis(2000));
+        // Stop all PLC actor threads (after pollers, so no in-flight reads).
+        for handle in self.plcs.lock().values() {
+            handle.stop();
+        }
 
         info!("s7trace server stopped");
         Ok(())

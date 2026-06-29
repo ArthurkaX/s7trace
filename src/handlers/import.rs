@@ -177,9 +177,10 @@ pub(crate) fn handle_tag_import(
             .map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
         let (host, plc_name, rack, slot) = plc_row;
         let client = create_plc_client(&plc_name, &host, rack as u16, slot as u16);
+        let mut client = client.lock();
 
         for (tag_id, tag_name) in &imported_tags {
-            let result = db::validation::validate_tag(conn, &client, *tag_id)?;
+            let result = db::validation::validate_tag(conn, &mut *client, *tag_id)?;
             if result.ok {
                 let val_str = if let Some(v) = result.value_i {
                     if let Some(f) = result.value_f {

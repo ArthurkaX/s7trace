@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::engine::server::PlcRegistry;
 use crate::engine::snapshot::Snapshot;
+use crate::plc::client::PlcClient;
 use crate::types::*;
 
 pub(super) fn execute_plc_read(
@@ -26,14 +27,14 @@ pub(super) fn execute_plc_read(
         )
         .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?;
 
-    // Get client from registry
-    let client_arc = {
+    // Get a handle from the registry. Interactive reads preempt pollers so an
+    // ad-hoc `read` doesn't wait behind a polling sweep on the same PLC.
+    let mut client = {
         let reg = plcs.lock();
         reg.get(&plc_id)
-            .cloned()
+            .map(|h| h.with_priority(crate::plc::PRIORITY_INTERACTIVE))
             .ok_or_else(|| anyhow::anyhow!("PLC {plc_id} client not registered"))?
     };
-    let mut client = client_arc.lock();
 
     match action {
         "read_raw" => {

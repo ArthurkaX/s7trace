@@ -29,7 +29,8 @@ use anyhow::anyhow;
 use crate::engine::poller::OverrunMode;
 use crate::engine::server::{PduCache, PlcRegistry, PollerRegistry, SampleBatch};
 use crate::engine::snapshot::Snapshot;
-use crate::plc::create_plc_client;
+use crate::plc::client::PlcClient;
+use crate::plc::{create_plc_handle, PRIORITY_INTERACTIVE};
 use crate::types::*;
 use crate::{cli, db};
 
@@ -406,10 +407,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
 
             // PLC client: from the live registry on the server, or built
             // directly from the PLC row in local CLI mode.
-            let client = if let Some(plcs) = ctx.plcs {
+            let mut client = if let Some(plcs) = ctx.plcs {
                 let reg = plcs.lock();
                 reg.get(&inserted.plc_id)
-                    .cloned()
+                    .map(|h| h.with_priority(PRIORITY_INTERACTIVE))
                     .ok_or_else(|| anyhow!("PLC client not available for {}", inserted.plc_id))?
             } else {
                 let (host, plc_name, rack, slot): (String, String, i64, i64) = conn
@@ -419,10 +420,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .map_err(|_| anyhow!("PLC '{plc}' not found"))?;
-                create_plc_client(&plc_name, &host, rack as u16, slot as u16)
+                create_plc_handle(&plc_name, &host, rack as u16, slot as u16)
             };
 
-            let result = db::validation::validate_tag(conn, &client, tag_id)?;
+            let result = db::validation::validate_tag(conn, &mut client, tag_id)?;
             if result.ok {
                 if let Some(snap) = ctx.snapshot {
                     snap.update(
@@ -635,13 +636,13 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 )?;
             let dt: DataType = data_type_str.parse().unwrap_or(DataType::I16);
 
-            let client_arc = {
+            let mut client = {
                 let reg = plcs.lock();
                 reg.get(&plc_id)
-                    .cloned()
+                    .map(|h| h.with_priority(PRIORITY_INTERACTIVE))
                     .ok_or_else(|| anyhow!("PLC client not available"))?
             };
-            let result = db::validation::validate_tag(conn, &client_arc, tag_id)?;
+            let result = db::validation::validate_tag(conn, &mut client, tag_id)?;
             if result.ok {
                 if let Some(snap) = ctx.snapshot {
                     snap.update(
@@ -971,19 +972,16 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
             // without restarting the server. Mirrors `init_plc_clients`:
             // try to connect (non-fatal) and cache the negotiated PDU length.
             if let Some(plcs) = ctx.plcs {
-                let client = create_plc_client(&name, &host, rack as u16, slot as u16);
-                {
-                    let mut c = client.lock();
-                    let pdu = if c.connect().is_ok() {
-                        c.pdu_len().unwrap_or(240)
-                    } else {
-                        240
-                    };
-                    if let Some(cache) = ctx.pdu_cache {
-                        cache.lock().insert(id, pdu);
-                    }
+                let mut handle = create_plc_handle(&name, &host, rack as u16, slot as u16);
+                let pdu = if handle.connect().is_ok() {
+                    handle.pdu_len().unwrap_or(240)
+                } else {
+                    240
+                };
+                if let Some(cache) = ctx.pdu_cache {
+                    cache.lock().insert(id, pdu);
                 }
-                plcs.lock().insert(id, client);
+                plcs.lock().insert(id, handle);
                 tracing::info!("plc-add: registered live client for PLC {id} ({name})");
             }
 

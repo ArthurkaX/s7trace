@@ -517,6 +517,28 @@ impl PollerHandle {
     }
 }
 
+/// Capped exponential backoff (in milliseconds) for the Nth consecutive
+/// reconnect attempt (1-based). Without this, a poller whose PLC has dropped
+/// re-attempts `connect()` every cycle with no delay, hammering the device and
+/// starving other work. Doubles per attempt up to a 10s ceiling.
+fn reconnect_backoff_ms(attempt: u32) -> u64 {
+    const BASE_MS: u64 = 500;
+    const CAP_MS: u64 = 10_000;
+    let exp = attempt.saturating_sub(1).min(5); // 2^5 = 32x
+    BASE_MS.saturating_mul(1u64 << exp).min(CAP_MS)
+}
+
+/// Small non-negative jitter (0..=base/4 ms) derived from the wall clock, to
+/// avoid synchronized reconnect storms across pollers without pulling in a RNG.
+fn reconnect_jitter_ms(base_ms: u64) -> u64 {
+    let span = base_ms / 4 + 1;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos % span
+}
+
 /// Spawn a polling thread for a PLC.
 pub fn spawn_poller(
     plc_id: i64,
@@ -540,6 +562,9 @@ pub fn spawn_poller(
             let mut poller = PlcPoller::new(plc_id, &plc_name, plan, period_ms, overrun_mode);
             poller.init_tags(&tags);
 
+            // Consecutive reconnect attempts, for capped exponential backoff.
+            let mut reconnect_attempts: u32 = 0;
+
             while *thread_running.lock() {
                 let cycle_start = Instant::now();
                 let mut inner = plc_client.lock();
@@ -547,6 +572,7 @@ pub fn spawn_poller(
 
                 match result {
                     Ok(r) => {
+                        reconnect_attempts = 0;
                         if r.samples.is_empty() && r.spans.is_empty() {
                             warn!(
                                 "poller-{}: cycle {} had empty samples+spans (decision path?)",
@@ -570,12 +596,30 @@ pub fn spawn_poller(
                     Err(e) => {
                         error!("PLC {}: poll cycle failed: {}", plc_name, e);
                         if matches!(&e, PlcError::Disconnected(_) | PlcError::Timeout(_)) {
-                            warn!("poller-{}: attempting reconnect...", plc_name);
                             drop(inner);
+                            reconnect_attempts = reconnect_attempts.saturating_add(1);
+                            // Back off before retrying so an unreachable PLC is
+                            // not hammered with a connect() every cycle.
+                            let base = reconnect_backoff_ms(reconnect_attempts);
+                            let delay = Duration::from_millis(base + reconnect_jitter_ms(base));
+                            warn!(
+                                "poller-{}: reconnect attempt {} in {:?}",
+                                plc_name, reconnect_attempts, delay
+                            );
+                            std::thread::sleep(delay);
+                            if !*thread_running.lock() {
+                                break;
+                            }
                             let mut guard = plc_client.lock();
                             match guard.connect() {
-                                Ok(()) => info!("poller-{}: reconnected OK", plc_name),
-                                Err(e2) => error!("poller-{}: reconnect failed: {}", plc_name, e2),
+                                Ok(()) => {
+                                    info!("poller-{}: reconnected OK", plc_name);
+                                    reconnect_attempts = 0;
+                                }
+                                Err(e2) => error!(
+                                    "poller-{}: reconnect failed (attempt {}): {}",
+                                    plc_name, reconnect_attempts, e2
+                                ),
                             }
                             drop(guard);
                             continue;
@@ -608,6 +652,25 @@ mod tests {
     use super::*;
     use crate::engine::plan::build_plan;
     use crate::plc::snap7::MockPlcClient;
+
+    #[test]
+    fn test_reconnect_backoff_is_capped_and_monotonic() {
+        assert_eq!(reconnect_backoff_ms(1), 500);
+        assert_eq!(reconnect_backoff_ms(2), 1000);
+        assert_eq!(reconnect_backoff_ms(3), 2000);
+        assert_eq!(reconnect_backoff_ms(6), 10_000); // capped
+        assert_eq!(reconnect_backoff_ms(100), 10_000);
+        // non-decreasing
+        let mut prev = 0;
+        for a in 1..20 {
+            let cur = reconnect_backoff_ms(a);
+            assert!(cur >= prev, "backoff decreased at {a}");
+            prev = cur;
+        }
+        // jitter stays within base/4
+        let base = 1000;
+        assert!(reconnect_jitter_ms(base) <= base / 4);
+    }
 
     #[test]
     fn test_poller_basic_cycle() {

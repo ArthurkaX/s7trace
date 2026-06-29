@@ -1110,4 +1110,311 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2);
     }
+
+    fn mem() -> Connection {
+        crate::db::schema::open_memory().unwrap()
+    }
+
+    fn run(conn: &Connection, op: Op) -> anyhow::Result<OpOutput> {
+        execute(&ExecCtx::local(conn), op)
+    }
+
+    /// Seed a PLC, poll group and a single tag with the given enabled flag.
+    fn seed_tag(conn: &Connection, enabled: i64) {
+        conn.execute(
+            "INSERT INTO plc (name, host) VALUES ('plc1','127.0.0.1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO poll_group (name, period_ms) VALUES ('g1',1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tag (plc_id,name,address,data_type,poll_group_id,db_num,byte_offset,byte_size,enabled,created_ts,updated_ts)
+             VALUES (1,'mytag','DB1.DBW0','i16',1,1,0,2,?1,1000000,1000000)",
+            rusqlite::params![enabled],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn op_set_create_inserts_row() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO plc (name, host) VALUES ('test-plc','127.0.0.1')",
+            [],
+        )
+        .unwrap();
+        let out = run(
+            &conn,
+            Op::SetCreate {
+                plc: "test-plc".into(),
+                name: "my_set".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        assert!(out.ok);
+        let id: i64 = conn
+            .query_row("SELECT id FROM metric_set WHERE name='my_set'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn op_tag_disable_unknown_id_fails() {
+        let conn = mem();
+        let out = run(
+            &conn,
+            Op::TagDisable {
+                tag_id: Some(999),
+                plc: None,
+                name: None,
+            },
+        )
+        .unwrap();
+        assert!(!out.ok);
+    }
+
+    #[test]
+    fn op_tag_enable_by_id_and_unknown_and_missing() {
+        let conn = mem();
+        seed_tag(&conn, 0);
+        // enable existing id 1
+        let out = run(
+            &conn,
+            Op::TagEnable {
+                tag_id: Some(1),
+                plc: None,
+                name: None,
+            },
+        )
+        .unwrap();
+        assert!(out.ok);
+        let en: i64 = conn
+            .query_row("SELECT enabled FROM tag WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(en, 1);
+        // unknown id -> not ok
+        assert!(
+            !run(
+                &conn,
+                Op::TagEnable {
+                    tag_id: Some(999),
+                    plc: None,
+                    name: None
+                }
+            )
+            .unwrap()
+            .ok
+        );
+        // missing selectors -> error
+        assert!(run(
+            &conn,
+            Op::TagEnable {
+                tag_id: None,
+                plc: None,
+                name: None
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn op_set_add_tag_csv_and_file() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO plc (name, host) VALUES ('plc1','127.0.0.1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO poll_group (name, period_ms) VALUES ('g1',1000)",
+            [],
+        )
+        .unwrap();
+        for n in ["t1", "t2", "t3"] {
+            conn.execute(
+                "INSERT INTO tag (plc_id,name,address,data_type,poll_group_id,db_num,byte_offset,byte_size,created_ts,updated_ts)
+                 VALUES (1,?1,'DB1.DBW0','i16',1,1,0,2,1000000,1000000)",
+                rusqlite::params![n],
+            )
+            .unwrap();
+        }
+        run(
+            &conn,
+            Op::SetCreate {
+                plc: "plc1".into(),
+                name: "my_set".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        let out = run(
+            &conn,
+            Op::SetAddTag {
+                set_name: "my_set".into(),
+                tag: Some("t1,t2,t3".into()),
+                from_sql: None,
+                from_file: None,
+            },
+        )
+        .unwrap();
+        assert!(out.ok);
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metric_set_tag WHERE metric_set_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+
+        // from_file (comments and blank lines ignored)
+        let path = std::env::temp_dir().join(format!("s7trace_ops_set_{}.txt", std::process::id()));
+        std::fs::write(&path, "# comment\nt1\n\nt2\n").unwrap();
+        run(
+            &conn,
+            Op::SetCreate {
+                plc: "plc1".into(),
+                name: "s2".into(),
+                description: None,
+            },
+        )
+        .unwrap();
+        let out = run(
+            &conn,
+            Op::SetAddTag {
+                set_name: "s2".into(),
+                tag: None,
+                from_sql: None,
+                from_file: Some(path.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+        assert!(out.ok);
+        let set2: i64 = conn
+            .query_row("SELECT id FROM metric_set WHERE name='s2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let n2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metric_set_tag WHERE metric_set_id=?1",
+                rusqlite::params![set2],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n2, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn op_plc_add_and_duplicate() {
+        let conn = mem();
+        let out = run(
+            &conn,
+            Op::PlcAdd {
+                name: "myplc".into(),
+                host: "10.0.0.1".into(),
+                rack: 0,
+                slot: 2,
+                disabled: false,
+            },
+        )
+        .unwrap();
+        assert!(out.ok);
+        let dup = run(
+            &conn,
+            Op::PlcAdd {
+                name: "myplc".into(),
+                host: "10.0.0.2".into(),
+                rack: 0,
+                slot: 2,
+                disabled: false,
+            },
+        )
+        .unwrap();
+        assert!(!dup.ok);
+    }
+
+    #[test]
+    fn op_poll_group_add_and_duplicate() {
+        let conn = mem();
+        assert!(
+            run(
+                &conn,
+                Op::PollGroupAdd {
+                    name: "fast".into(),
+                    period_ms: 40
+                }
+            )
+            .unwrap()
+            .ok
+        );
+        assert!(
+            !run(
+                &conn,
+                Op::PollGroupAdd {
+                    name: "fast".into(),
+                    period_ms: 100
+                }
+            )
+            .unwrap()
+            .ok
+        );
+    }
+
+    #[test]
+    fn op_poll_group_set_period_variants() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO poll_group (name, period_ms) VALUES ('g1',1000)",
+            [],
+        )
+        .unwrap();
+        // ok by name
+        let out = run(
+            &conn,
+            Op::PollGroupSetPeriod {
+                poll_group_id: None,
+                poll_group_name: Some("g1".into()),
+                period_ms: 50,
+            },
+        )
+        .unwrap();
+        assert!(out.ok);
+        let p: i64 = conn
+            .query_row(
+                "SELECT period_ms FROM poll_group WHERE name='g1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p, 50);
+        // too low / unknown id / missing args all -> not ok
+        for op in [
+            Op::PollGroupSetPeriod {
+                poll_group_id: Some(1),
+                poll_group_name: None,
+                period_ms: 49,
+            },
+            Op::PollGroupSetPeriod {
+                poll_group_id: Some(999),
+                poll_group_name: None,
+                period_ms: 100,
+            },
+            Op::PollGroupSetPeriod {
+                poll_group_id: None,
+                poll_group_name: None,
+                period_ms: 100,
+            },
+        ] {
+            assert!(!run(&conn, op).unwrap().ok);
+        }
+    }
 }

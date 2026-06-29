@@ -1476,8 +1476,12 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                     })
                     .collect();
                 println!(
-                    "  {} (host={}, conn={}) last_ok_ts={:?}",
-                    plc["name"], plc["host"], plc["connectivity"], plc["last_ok_ts"]
+                    "  {} (host={}, health={}, conn={}) last_ok_ts={:?}",
+                    plc["name"],
+                    plc["host"],
+                    plc["health"].as_str().unwrap_or("?"),
+                    plc["connectivity"],
+                    plc["last_ok_ts"]
                 );
                 for pg_line in pg_parts {
                     println!("    poll_group: {pg_line}");

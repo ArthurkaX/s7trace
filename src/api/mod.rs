@@ -501,14 +501,38 @@ fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
                     })
                     .unwrap_or_default();
 
+                let enabled = r.get::<_, i64>(3)? != 0;
+                let last_ok_ts = r.get::<_, Option<i64>>(4)?;
+                let last_error = r.get::<_, Option<String>>(5)?;
+                let connectivity = r.get::<_, String>(6)?;
+
+                // Derived health, surfaced so operators can see at a glance
+                // which PLCs are degraded without parsing connectivity/last_ok.
+                // "stale" = nominally online but no successful poll recently.
+                const STALE_AFTER_US: i64 = 60_000_000; // 60s
+                let stale = match last_ok_ts {
+                    Some(ts) => now_us() - ts > STALE_AFTER_US,
+                    None => true,
+                };
+                let health = if !enabled {
+                    "disabled"
+                } else if connectivity != "online" {
+                    "unavailable"
+                } else if stale {
+                    "stale"
+                } else {
+                    "ok"
+                };
+
                 Ok(serde_json::json!({
                     "name": plc_name,
                     "host": r.get::<_, String>(2)?,
-                    "enabled": r.get::<_, i64>(3)? != 0,
-                    "connected": r.get::<_, String>(6)? == "online",
-                    "last_ok_ts": r.get::<_, Option<i64>>(4)?,
-                    "last_error": r.get::<_, Option<String>>(5)?,
-                    "connectivity": r.get::<_, String>(6)?,
+                    "enabled": enabled,
+                    "connected": connectivity == "online",
+                    "health": health,
+                    "last_ok_ts": last_ok_ts,
+                    "last_error": last_error,
+                    "connectivity": connectivity,
                     "last_poll_cycle_finished_ts": last_poll_cycle_finished_ts,
                     "poll_groups": poll_groups,
                     "metric_sets": metric_sets,

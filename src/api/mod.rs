@@ -17,136 +17,123 @@
 //! reads or `s7trace --local-db sql/admin-sql` for local database work;
 //! direct `/sql` calls are a private CLI transport detail.
 //!
-//! Implementation is a tiny self-contained HTTP/1.1 server with a
-//! thread-per-connection model. No external HTTP crate is required to
-//! keep dependencies minimal and avoid pulling in TLS / async runtime.
+//! Transport is `axum` (on the `tokio` runtime). The routing, request
+//! handlers, and auth all live in this module and its siblings
+//! (`handlers`, `status`); the axum layer is a thin adapter that captures the
+//! method/path/query/body/`Authorization` header, enforces the optional bearer
+//! token, and delegates to [`route`] on a blocking task (the DB layer is sync
+//! `rusqlite`). It then maps the resulting [`Response`] back to an HTTP
+//! response. Keeping one fallback handler means the route table is the single
+//! `match` in [`route`], unchanged across the transport swap.
 
 mod handlers;
 mod status;
 
 use crate::version;
+use axum::body::{Body, Bytes};
+use axum::extract::{Request, State};
+use axum::http::{header, StatusCode};
+use axum::response::Response as HttpResponse;
+use axum::Router;
 use parking_lot::Mutex;
 use rusqlite::Connection;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::thread;
+
+/// Max request body we will buffer (1 MiB). Command payloads are tiny JSON.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Start the HTTP API on `bind_addr` (e.g. "127.0.0.1:8080").
 /// Blocks the calling thread; spawn a thread to run in background.
 pub fn serve(db: Arc<Mutex<Connection>>, bind_addr: String) -> std::io::Result<()> {
-    let listener = TcpListener::bind(&bind_addr)?;
-    tracing::info!("HTTP API listening on http://{bind_addr}");
-    serve_with_listener(listener, db)
+    run_on_runtime(async move {
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+        tracing::info!("HTTP API listening on http://{bind_addr}");
+        axum::serve(listener, router(db)).await
+    })
 }
 
-/// Like `serve`, but takes a pre-bound TcpListener (useful for tests
+/// Like `serve`, but takes a pre-bound std `TcpListener` (useful for tests
 /// that want to discover the bound port without a race).
 pub fn serve_with_listener(
-    listener: TcpListener,
+    listener: std::net::TcpListener,
     db: Arc<Mutex<Connection>>,
 ) -> std::io::Result<()> {
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
-                let db = db.clone();
-                thread::Builder::new()
-                    .name("s7trace-http".into())
-                    .spawn(move || {
-                        if let Err(e) = handle_conn(stream, db) {
-                            tracing::debug!("http conn closed: {e}");
-                        }
-                    })
-                    .ok();
-            }
-            Err(e) => tracing::warn!("http accept error: {e}"),
-        }
-    }
-    Ok(())
+    run_on_runtime(async move {
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        axum::serve(listener, router(db)).await
+    })
 }
 
-fn handle_conn(mut stream: TcpStream, db: Arc<Mutex<Connection>>) -> std::io::Result<()> {
-    let peer = stream.peer_addr().ok();
-    let mut reader = BufReader::new(stream.try_clone()?);
+/// Build a fresh single-purpose tokio runtime and block on `fut`. The HTTP API
+/// runs on its own OS thread (spawned by the server, or by the test harness),
+/// so owning a runtime here keeps it self-contained.
+fn run_on_runtime<F>(fut: F) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(fut)
+}
 
-    // Parse request line
-    let mut req_line = String::new();
-    if reader.read_line(&mut req_line)? == 0 {
-        return Ok(());
-    }
-    let mut parts = req_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let target = parts.next().unwrap_or("").to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+/// The axum application: a single fallback handler over all routes, with the
+/// shared DB connection as state.
+fn router(db: Arc<Mutex<Connection>>) -> Router {
+    Router::new().fallback(dispatch).with_state(db)
+}
 
-    // Headers
-    let mut content_length: usize = 0;
-    let mut auth_value: Option<String> = None;
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            content_length = rest.trim().parse().unwrap_or(0);
-        } else if lower.starts_with("authorization:") {
-            // Keep original case — the token is case-sensitive.
-            auth_value = Some(trimmed["authorization:".len()..].trim().to_string());
-        }
-    }
+/// Adapter handler: capture the request, enforce auth, delegate to [`route`]
+/// on a blocking task, and map the [`Response`] back to HTTP.
+async fn dispatch(State(db): State<Arc<Mutex<Connection>>>, req: Request) -> HttpResponse {
+    let method = req.method().as_str().to_string();
+    let uri = req.uri().clone();
+    // Reconstruct the raw request target so `split_query` parses it exactly as
+    // the old transport did (values stay percent-encoded until `param_owned`).
+    let target = match uri.query() {
+        Some(q) => format!("{}?{}", uri.path(), q),
+        None => uri.path().to_string(),
+    };
+    // Keep original case — the token is case-sensitive.
+    let auth_value = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
-    // Body
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
-    }
+    let body = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => return to_http(Response::err(400, "request body too large or unreadable")),
+    };
 
     // Optional bearer-token auth (S7TRACE_TOKEN). Disabled when the env var is
     // unset/empty — then the server is open, as before.
+    if !is_authorized(required_token().as_deref(), auth_value.as_deref()) {
+        return to_http(Response::err(401, "unauthorized: missing or invalid token"));
+    }
+
     let (path, query) = split_query(&target);
-    let resp = if is_authorized(required_token().as_deref(), auth_value.as_deref()) {
-        route(&db, &method, &path, &query, &body)
-    } else {
-        Response::err(401, "unauthorized: missing or invalid token")
-    };
+    // `route` is synchronous and locks the rusqlite connection; run it off the
+    // async worker so a slow query can't stall the runtime.
+    let resp = tokio::task::spawn_blocking(move || route(&db, &method, &path, &query, &body))
+        .await
+        .unwrap_or_else(|e| Response::err(500, &format!("handler task failed: {e}")));
 
-    let body_str = resp.body;
-    let status_line = match resp.status {
-        200 => format!("{version} 200 OK"),
-        201 => format!("{version} 201 Created"),
-        204 => format!("{version} 204 No Content"),
-        400 => format!("{version} 400 Bad Request"),
-        401 => format!("{version} 401 Unauthorized"),
-        404 => format!("{version} 404 Not Found"),
-        405 => format!("{version} 405 Method Not Allowed"),
-        500 => format!("{version} 500 Internal Server Error"),
-        _ => format!("{version} 200 OK"),
-    };
-    let payload = body_str.into_bytes();
-    let response = format!(
-        "{status_line}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
-        resp.content_type, payload.len(),
-    );
-    stream.write_all(response.as_bytes())?;
-    stream.write_all(&payload)?;
-    stream.flush()?;
+    to_http(resp)
+}
 
-    tracing::debug!(
-        "http {} {} {} -> {} ({}b) peer={:?}",
-        method,
-        target,
-        "",
-        resp.status,
-        payload.len(),
-        peer
-    );
-    Ok(())
+/// Map our internal [`Response`] to an axum HTTP response, preserving the
+/// permissive CORS header the old transport sent.
+fn to_http(resp: Response) -> HttpResponse {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
+    let body: Bytes = resp.body.into();
+    HttpResponse::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, resp.content_type)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| HttpResponse::new(Body::empty()))
 }
 
 /// The shared bearer token the server requires, from `S7TRACE_TOKEN`.
@@ -341,7 +328,7 @@ mod tests {
     use super::*;
     use crate::db::schema;
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
 
     fn temp_db() -> Arc<Mutex<Connection>> {

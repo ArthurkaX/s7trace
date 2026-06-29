@@ -734,7 +734,7 @@ fn execute_command(
                     let data = client.read_db(addr.db_num, addr.byte_offset, dt.byte_size())?;
 
                     // Decode
-                    let (vi, vf) = crate::engine::storage::decode_value(&data, dt, None);
+                    let (vi, vf) = crate::codec::decode_value(&data, dt, None);
 
                     // Update snapshot (negative tag_id = ephemeral one-off read)
                     snapshot.update(-cmd_id, plc_id, "", address, dt, vi, vf, now_us());

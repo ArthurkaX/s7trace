@@ -60,7 +60,7 @@ pub fn validate_tag(
     match read_result {
         Ok(data) => {
             drop(client);
-            let (vi, vf) = crate::engine::storage::decode_value(&data, dt, bit_off);
+            let (vi, vf) = crate::codec::decode_value(&data, dt, bit_off);
             conn.execute(
                 "UPDATE tag
                  SET bad = 0,

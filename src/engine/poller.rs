@@ -161,7 +161,7 @@ impl PlcPoller {
         state_intervals: &mut Vec<StateIntervalRecord>,
         event_markers: &mut Vec<EventMarkerRecord>,
     ) {
-        let (vi, vf) = storage::decode_value(tag_data, tag.data_type, tag.bit_offset);
+        let (vi, vf) = crate::codec::decode_value(tag_data, tag.data_type, tag.bit_offset);
         let ts = now_us();
 
         let prev_counter: Option<i64> =

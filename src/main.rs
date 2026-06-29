@@ -18,6 +18,7 @@ fn server_base(cli: &Cli) -> Option<String> {
 
 mod api;
 mod cli;
+mod codec;
 mod db;
 mod engine;
 mod platform;

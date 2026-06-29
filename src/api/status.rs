@@ -278,6 +278,30 @@ pub(crate) fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
         )
         .unwrap_or(0);
 
+    // Lightweight runtime metrics. Totals are cheap COUNTs; the latency/health
+    // summary is over the last hour of poll cycles so it reflects current
+    // behavior rather than all history. (Per-PLC reconnect counts are tracked
+    // separately and surfaced once the plc table carries them.)
+    let samples_written: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sample", [], |r| r.get(0))
+        .unwrap_or(0);
+    let poll_cycles_total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM poll_cycle", [], |r| r.get(0))
+        .unwrap_or(0);
+    let hour_cutoff = now_us() - 3_600_000_000; // 1h in microseconds
+    let (cycles_ok, cycles_failed, lat_avg, lat_max): (i64, i64, f64, f64) = conn
+        .query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(AVG(actual_ms), 0.0),
+                COALESCE(MAX(actual_ms), 0.0)
+             FROM poll_cycle WHERE finished_ts > ?1",
+            rusqlite::params![hour_cutoff],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap_or((0, 0, 0.0, 0.0));
+
     Response::json(serde_json::json!({
         "service": "s7trace",
         "version": version::status_json(&conn),
@@ -285,5 +309,14 @@ pub(crate) fn handle_status(db: &Arc<Mutex<Connection>>) -> Response {
         "tags": { "active": active_tags, "bad": bad_tags_total },
         "command_queue": { "pending": pending_count, "running": running_count },
         "config_apply": { "pending": config_apply_pending },
+        "metrics": {
+            "samples_written": samples_written,
+            "poll_cycles_total": poll_cycles_total,
+            "last_hour": {
+                "cycles_ok": cycles_ok,
+                "cycles_failed": cycles_failed,
+                "poll_latency_ms": { "avg": lat_avg, "max": lat_max },
+            },
+        },
     }))
 }

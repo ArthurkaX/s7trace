@@ -52,8 +52,16 @@ pub(crate) fn spawn_one_poller(
         overrun_mode,
     );
 
-    // Store
-    pollers.lock().insert((plc_id, pg_id), handle);
+    // Store. Stop any existing poller for this key first: a respawn (e.g. from
+    // a config-apply after tag-add) must not leave the previous thread running,
+    // or two pollers would poll the same (plc, group) — doubling PLC load and
+    // colliding on poll_cycle's UNIQUE(dataset_id, poll_group_id, seq).
+    {
+        let mut reg = pollers.lock();
+        if let Some(old) = reg.insert((plc_id, pg_id), handle) {
+            old.stop();
+        }
+    }
     info!(
         "poller started for PLC {} group {} (period={}ms)",
         plc_name, pg_id, period_ms

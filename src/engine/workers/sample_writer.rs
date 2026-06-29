@@ -58,6 +58,20 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
         }
     };
 
+    // The poller's in-memory `seq` resets to 0 whenever it is respawned (e.g.
+    // after a config-apply). poll_cycle has UNIQUE(dataset_id, poll_group_id,
+    // seq), so reusing the poller seq collides across restarts within the same
+    // dataset. Allocate a monotonic seq per (dataset, poll_group) at write time
+    // instead — safe because a single sample-writer thread serializes inserts.
+    let seq: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM poll_cycle
+             WHERE dataset_id = ?1 AND poll_group_id = ?2",
+            rusqlite::params![dataset_id, ci.poll_group_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(ci.seq as i64);
+
     conn.execute(
         "INSERT INTO poll_cycle
             (plc_id, poll_group_id, seq, started_ts, finished_ts,
@@ -66,7 +80,7 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
         rusqlite::params![
             ci.plc_id,
             ci.poll_group_id,
-            ci.seq as i64,
+            seq,
             ci.started_ts,
             ci.finished_ts,
             ci.target_ms as i64,

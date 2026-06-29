@@ -1,5 +1,4 @@
 /// Initial schema and migration runner.
-
 use anyhow::{Context, Result};
 use log::info;
 use rusqlite::Connection;
@@ -10,8 +9,7 @@ const MIGRATION_0001: &str = include_str!("../../migrations/0001_initial.sql");
 
 /// Open or create the database, run pending migrations.
 pub fn open(path: &str) -> Result<Connection> {
-    let conn = Connection::open(path)
-        .with_context(|| format!("opening database at {path}"))?;
+    let conn = Connection::open(path).with_context(|| format!("opening database at {path}"))?;
 
     // Safe defaults per schema.sql
     conn.execute_batch("PRAGMA journal_mode = WAL;")?;
@@ -113,8 +111,7 @@ mod tests {
         // `migrations/0001_initial.sql` and `docs/schema.sql` must stay
         // logically identical so that re-opening a database is always safe.
         // If you change the schema, update both files.
-        let docs_sql = std::fs::read_to_string("docs/schema.sql")
-            .expect("read docs/schema.sql");
+        let docs_sql = std::fs::read_to_string("docs/schema.sql").expect("read docs/schema.sql");
         let docs_sql = docs_sql.replace("\r\n", "\n");
         assert_eq!(
             MIGRATION_0001, docs_sql,

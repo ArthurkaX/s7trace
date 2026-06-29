@@ -14,7 +14,10 @@
 //! `S7TRACE_PLC_BACKEND=turbos7|rust7|mock` selects the implementation
 //! at server startup time. Default: `turbos7`.
 
-use crate::engine::plan::{pad_even, S7_MULTI_REQ_HEADER, S7_MULTI_REQ_PER_ITEM, S7_MULTI_RESP_HEADER, S7_MULTI_RESP_PER_ITEM, S7_PDU_SAFETY_MARGIN};
+use crate::engine::plan::{
+    pad_even, S7_MULTI_REQ_HEADER, S7_MULTI_REQ_PER_ITEM, S7_MULTI_RESP_HEADER,
+    S7_MULTI_RESP_PER_ITEM, S7_PDU_SAFETY_MARGIN,
+};
 use crate::plc::client::PlcClient;
 use crate::types::*;
 use log::info;
@@ -193,8 +196,7 @@ impl PlcClient for Turbo7Client {
                     .inner
                     .as_mut()
                     .ok_or_else(|| PlcError::Disconnected("read_multi: not connected".into()))?;
-                runtime()
-                    .block_on(async { client.read_multiple(&t_items).await })
+                runtime().block_on(async { client.read_multiple(&t_items).await })
             };
 
             // Transport errors mean the TCP connection is dead — clear inner
@@ -202,9 +204,7 @@ impl PlcClient for Turbo7Client {
             if let Err(e) = &res {
                 if matches!(
                     e,
-                    turbos7::Error::Io(_)
-                        | turbos7::Error::Connection(_)
-                        | turbos7::Error::Timeout
+                    turbos7::Error::Io(_) | turbos7::Error::Connection(_) | turbos7::Error::Timeout
                 ) {
                     self.inner = None;
                 }
@@ -282,7 +282,11 @@ pub(crate) fn plan_batches(
     max_items: usize,
 ) -> Vec<Range<usize>> {
     let budget = pdu_bytes.saturating_sub(S7_PDU_SAFETY_MARGIN);
-    let cap = if max_items == 0 { usize::MAX } else { max_items };
+    let cap = if max_items == 0 {
+        usize::MAX
+    } else {
+        max_items
+    };
 
     let mut batches: Vec<Range<usize>> = Vec::new();
     let mut i = 0;

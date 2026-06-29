@@ -2,7 +2,6 @@
 ///
 /// Per D003, commands have leases so a crashed worker cannot leave
 /// commands in `running` forever.
-
 use crate::types::*;
 use anyhow::{Context, Result};
 use log::warn;
@@ -54,7 +53,14 @@ pub fn enqueue(
         "INSERT INTO command_request
             (created_ts, state, kind, request_json, requested_by, idempotency_key, plc_id)
          VALUES (?1, 'pending', ?2, ?3, ?4, ?5, ?6)",
-        params![now, kind_clean, request_json, requested_by, idempotency_key, plc_id],
+        params![
+            now,
+            kind_clean,
+            request_json,
+            requested_by,
+            idempotency_key,
+            plc_id
+        ],
     )
     .context("enqueue command")?;
 
@@ -136,8 +142,10 @@ pub fn claim_next(conn: &Connection) -> Result<Option<CommandRequest>> {
             Ok(CommandRequest {
                 id: row.get(0)?,
                 created_ts: row.get(1)?,
-                state: serde_json::from_str(&format!("\"{state_str}\"")).unwrap_or(CommandState::Pending),
-                kind: serde_json::from_str(&format!("\"{kind_str}\"")).unwrap_or(CommandKind::Query),
+                state: serde_json::from_str(&format!("\"{state_str}\""))
+                    .unwrap_or(CommandState::Pending),
+                kind: serde_json::from_str(&format!("\"{kind_str}\""))
+                    .unwrap_or(CommandKind::Query),
                 request_json: row.get(4)?,
                 plc_id: row.get(5)?,
             })
@@ -213,7 +221,8 @@ pub fn get_request(conn: &Connection, command_id: i64) -> Result<Option<CommandR
         Ok(Some(CommandRequest {
             id: row.get(0)?,
             created_ts: row.get(1)?,
-            state: serde_json::from_str(&format!("\"{state_str}\"")).unwrap_or(CommandState::Pending),
+            state: serde_json::from_str(&format!("\"{state_str}\""))
+                .unwrap_or(CommandState::Pending),
             kind: serde_json::from_str(&format!("\"{kind_str}\"")).unwrap_or(CommandKind::Query),
             request_json: row.get(4)?,
             plc_id: row.get(5)?,
@@ -275,12 +284,16 @@ pub fn get_result(conn: &Connection, command_id: i64) -> Result<Option<CommandRe
 /// List pending commands.
 pub fn list_pending(conn: &Connection, state_filter: Option<&str>) -> Result<Vec<CommandListRow>> {
     let query = match state_filter {
-        Some(_) => "SELECT id, created_ts, finished_ts, state, kind, error
+        Some(_) => {
+            "SELECT id, created_ts, finished_ts, state, kind, error
                      FROM command_request WHERE state = ?1
-                     ORDER BY id DESC LIMIT 100",
-        None => "SELECT id, created_ts, finished_ts, state, kind, error
+                     ORDER BY id DESC LIMIT 100"
+        }
+        None => {
+            "SELECT id, created_ts, finished_ts, state, kind, error
                  FROM command_request
-                 ORDER BY id DESC LIMIT 100",
+                 ORDER BY id DESC LIMIT 100"
+        }
     };
 
     let mut stmt = conn.prepare(query)?;
@@ -292,7 +305,8 @@ pub fn list_pending(conn: &Connection, state_filter: Option<&str>) -> Result<Vec
             id: row.get(0)?,
             created_ts: row.get(1)?,
             finished_ts: row.get(2)?,
-            state: serde_json::from_str(&format!("\"{state_str}\"")).unwrap_or(CommandState::Pending),
+            state: serde_json::from_str(&format!("\"{state_str}\""))
+                .unwrap_or(CommandState::Pending),
             kind: serde_json::from_str(&format!("\"{kind_str}\"")).unwrap_or(CommandKind::Query),
             error: row.get(5)?,
         })
@@ -309,7 +323,6 @@ pub fn list_pending(conn: &Connection, state_filter: Option<&str>) -> Result<Vec
         commands.push(row?);
     }
     Ok(commands)
-
 }
 
 #[cfg(test)]
@@ -320,7 +333,15 @@ mod tests {
     #[test]
     fn test_enqueue_and_claim() {
         let conn = open_memory().unwrap();
-        let id = enqueue(&conn, CommandKind::PlcRead, r#"{"plc":"line1"}"#, None, None, None).unwrap();
+        let id = enqueue(
+            &conn,
+            CommandKind::PlcRead,
+            r#"{"plc":"line1"}"#,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(id > 0);
 
         let claimed = claim_next(&conn).unwrap().unwrap();
@@ -364,7 +385,8 @@ mod tests {
         conn.execute(
             "UPDATE command_request SET lease_expires_ts = 0 WHERE id = ?1",
             params![id],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should reclaim
         let reclaimed = claim_next(&conn).unwrap().unwrap();
@@ -380,7 +402,8 @@ mod tests {
             "INSERT INTO command_request (created_ts, state, kind, request_json)
              VALUES (?1, 'pending', 'PlcRead', '{}')",
             params![old_ts],
-        ).unwrap();
+        )
+        .unwrap();
         // Insert a recent pending command (should NOT be expired)
         let id_recent = crate::db::command_queue::enqueue(
             &conn,
@@ -389,7 +412,8 @@ mod tests {
             None,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Expire with a short TTL that covers the old but not the recent
         let expired = expire_stale_pending(&conn, 500_000_000).unwrap(); // 500s TTL

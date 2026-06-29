@@ -215,7 +215,6 @@ pub fn build_all_plans(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::*;
 
     fn make_tag(id: i64, db: u16, offset: usize, size: usize, pg: i64) -> TagRow {
         TagRow {

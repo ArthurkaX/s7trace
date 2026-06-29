@@ -279,8 +279,7 @@ unsafe fn create_controls(hwnd: HWND) {
         0,
         WC_LISTVIEWW,
         std::ptr::null(),
-        (WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS)
-            as u32,
+        WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         0,
         34,
         WINDOW_W,
@@ -294,7 +293,7 @@ unsafe fn create_controls(hwnd: HWND) {
 
     SendMessageW(
         list,
-        LVM_SETEXTENDEDLISTVIEWSTYLE as u32,
+        LVM_SETEXTENDEDLISTVIEWSTYLE,
         0,
         (LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER) as isize,
     );
@@ -324,7 +323,7 @@ fn add_column(list: HWND, index: i32, title: &str, width: i32) {
     unsafe {
         SendMessageW(
             list,
-            LVM_INSERTCOLUMNW as u32,
+            LVM_INSERTCOLUMNW,
             index as usize,
             &mut col as *mut _ as isize,
         );
@@ -389,10 +388,9 @@ fn render_rows(list: HWND, rows: &[PanelRow]) {
     if list.is_null() {
         return;
     }
-    let selected_key = current_selection_key()
-        .or_else(|| state().selected_key.lock().clone());
+    let selected_key = current_selection_key().or_else(|| state().selected_key.lock().clone());
     unsafe {
-        SendMessageW(list, LVM_DELETEALLITEMS as u32, 0, 0);
+        SendMessageW(list, LVM_DELETEALLITEMS, 0, 0);
     }
     for (i, row) in rows.iter().enumerate() {
         insert_item(list, i as i32, &row.plc_name, i as isize);
@@ -437,7 +435,7 @@ fn insert_item(list: HWND, index: i32, text: &str, param: isize) {
         ..unsafe { std::mem::zeroed() }
     };
     unsafe {
-        SendMessageW(list, LVM_INSERTITEMW as u32, 0, &mut item as *mut _ as isize);
+        SendMessageW(list, LVM_INSERTITEMW, 0, &mut item as *mut _ as isize);
     }
 }
 
@@ -452,7 +450,7 @@ fn set_subitem(list: HWND, index: i32, subitem: i32, text: &str) {
         ..unsafe { std::mem::zeroed() }
     };
     unsafe {
-        SendMessageW(list, LVM_SETITEMW as u32, 0, &mut item as *mut _ as isize);
+        SendMessageW(list, LVM_SETITEMW, 0, &mut item as *mut _ as isize);
     }
 }
 
@@ -476,14 +474,7 @@ fn selected_row() -> Option<PanelRow> {
 }
 
 fn selected_index(list: HWND) -> Option<i32> {
-    let sel = unsafe {
-        SendMessageW(
-            list,
-            LVM_GETNEXTITEM as u32,
-            usize::MAX,
-            LVNI_SELECTED as isize,
-        )
-    };
+    let sel = unsafe { SendMessageW(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) };
     if sel < 0 {
         None
     } else {
@@ -522,8 +513,8 @@ fn select_row_by_key(list: HWND, rows: &[PanelRow], key: &(String, String)) {
             ..unsafe { std::mem::zeroed() }
         };
         unsafe {
-            SendMessageW(list, LVM_SETITEMSTATE as u32, idx, &mut item as *mut _ as isize);
-            SendMessageW(list, LVM_ENSUREVISIBLE as u32, idx, 0);
+            SendMessageW(list, LVM_SETITEMSTATE, idx, &mut item as *mut _ as isize);
+            SendMessageW(list, LVM_ENSUREVISIBLE, idx, 0);
         }
     }
 }
@@ -542,7 +533,11 @@ fn handle_command(hwnd: HWND, id: u32) {
                 start_refresh(hwnd);
                 return;
             };
-            let action = if id == ID_ENABLE { "set_enable" } else { "set_disable" };
+            let action = if id == ID_ENABLE {
+                "set_enable"
+            } else {
+                "set_disable"
+            };
             enqueue_control(serde_json::json!({
                 "action": action,
                 "set_name": set_name,
@@ -608,10 +603,14 @@ fn read_status(db: &Arc<Mutex<Connection>>) -> StatusSnapshot {
     let plc_count = scalar_i64(&conn, "SELECT COUNT(*) FROM plc WHERE enabled = 1");
     let active_dataset_count =
         scalar_i64(&conn, "SELECT COUNT(*) FROM dataset WHERE state = 'active'");
-    let command_queue_pending =
-        scalar_i64(&conn, "SELECT COUNT(*) FROM command_request WHERE state = 'pending'");
-    let command_queue_running =
-        scalar_i64(&conn, "SELECT COUNT(*) FROM command_request WHERE state = 'running'");
+    let command_queue_pending = scalar_i64(
+        &conn,
+        "SELECT COUNT(*) FROM command_request WHERE state = 'pending'",
+    );
+    let command_queue_running = scalar_i64(
+        &conn,
+        "SELECT COUNT(*) FROM command_request WHERE state = 'running'",
+    );
     let config_apply_pending = scalar_i64(
         &conn,
         "SELECT COUNT(*) FROM config_apply WHERE state IN ('pending','debouncing','applying')",
@@ -704,17 +703,16 @@ fn read_status(db: &Arc<Mutex<Connection>>) -> StatusSnapshot {
                 })
                 .unwrap_or_default();
 
-            let (poll_mode, poll_group_id, period_ms, rate_hz) =
-                match groups.as_slice() {
-                    [] => ("none".to_string(), None, None, None),
-                    [(id, _name, period)] => (
-                        "single".to_string(),
-                        Some(*id),
-                        Some(*period),
-                        Some(1000.0 / *period as f64),
-                    ),
-                    _ => ("mixed".to_string(), None, None, None),
-                };
+            let (poll_mode, poll_group_id, period_ms, rate_hz) = match groups.as_slice() {
+                [] => ("none".to_string(), None, None, None),
+                [(id, _name, period)] => (
+                    "single".to_string(),
+                    Some(*id),
+                    Some(*period),
+                    Some(1000.0 / *period as f64),
+                ),
+                _ => ("mixed".to_string(), None, None, None),
+            };
 
             let last_poll_cycle_finished_ts = match poll_group_id {
                 Some(pg_id) => conn
@@ -772,14 +770,18 @@ fn adjust_period(current: i64, delta: i64) -> i64 {
 }
 
 fn age_ms(row: &PanelRow) -> Option<i64> {
-    row.last_poll_cycle_finished_ts.map(|ts| (now_us() - ts) / 1000)
+    row.last_poll_cycle_finished_ts
+        .map(|ts| (now_us() - ts) / 1000)
 }
 
 fn stale(row: &PanelRow) -> bool {
     let Some(age) = age_ms(row) else {
         return row.metric_set_enabled;
     };
-    let threshold = row.period_ms.map(|p| std::cmp::max(p * 5, 5000)).unwrap_or(5000);
+    let threshold = row
+        .period_ms
+        .map(|p| std::cmp::max(p * 5, 5000))
+        .unwrap_or(5000);
     age > threshold
 }
 
@@ -792,7 +794,9 @@ fn period_text(row: &PanelRow) -> String {
 }
 
 fn rate_text(row: &PanelRow) -> String {
-    row.rate_hz.map(|hz| format!("{hz:.1}Hz")).unwrap_or_else(|| "-".to_string())
+    row.rate_hz
+        .map(|hz| format!("{hz:.1}Hz"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn age_text(row: &PanelRow) -> String {

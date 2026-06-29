@@ -798,9 +798,9 @@ fn handle_event(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Resp
         sql.push_str(" AND em.kind = ?");
         params.push(Box::new(k.clone()));
     }
-    if since_ts.is_some() {
+    if let Some(ts) = since_ts {
         sql.push_str(" AND em.ts >= ?");
-        params.push(Box::new(since_ts.unwrap()));
+        params.push(Box::new(ts));
     }
     sql.push_str(" ORDER BY em.ts DESC LIMIT ?");
     params.push(Box::new(limit));
@@ -1178,7 +1178,7 @@ mod tests {
                     Err(_) => continue,
                 };
                 let port = l.local_addr().unwrap().port();
-                let addr = format!("127.0.0.1:{port}");
+                let _addr = format!("127.0.0.1:{port}");
                 // Hand the listener to `serve` via the std TcpListener
                 // we already have, by calling its lower-level accept loop.
                 // Since `serve` takes a String, we re-bind through a custom

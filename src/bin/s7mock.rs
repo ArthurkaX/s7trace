@@ -58,7 +58,12 @@ fn handle_client(mut stream: TcpStream) -> std::io::Result<()> {
         if pkt.len() < 7 || pkt[0] != ISO_ID {
             return Ok(());
         }
-        eprintln!("s7mock: RX #{} ({} bytes): {}", read_count, pkt.len(), hex(pkt));
+        eprintln!(
+            "s7mock: RX #{} ({} bytes): {}",
+            read_count,
+            pkt.len(),
+            hex(pkt)
+        );
         match pkt[5] {
             ISO_CONN_REQ => {
                 let mut cc = [0u8; 22];
@@ -103,16 +108,29 @@ fn handle_s7(pkt: &[u8]) -> Option<Vec<u8>> {
     // PDU negotiation: 25 bytes, function at [17] = 0xF0.
     if pkt.len() == 25 && pkt[17] == 0xF0 {
         let mut resp = vec![0u8; 27];
-        resp[0] = ISO_ID; resp[1] = 0x00;
-        resp[2] = 0x00; resp[3] = 27;
-        resp[4] = 0x02; resp[5] = 0xF0; resp[6] = EOT;
-        resp[7] = S7_ID; resp[8] = 0x03;
-        resp[9] = 0; resp[10] = 0;
-        resp[11] = 0; resp[12] = 8;
-        resp[13] = 0; resp[14] = 0;
-        resp[15] = 0xF0; resp[16] = 0;
-        resp[17] = 0; resp[18] = 1; resp[19] = 0; resp[20] = 1;
-        resp[25] = 0x01; resp[26] = 0xE0; // 480
+        resp[0] = ISO_ID;
+        resp[1] = 0x00;
+        resp[2] = 0x00;
+        resp[3] = 27;
+        resp[4] = 0x02;
+        resp[5] = 0xF0;
+        resp[6] = EOT;
+        resp[7] = S7_ID;
+        resp[8] = 0x03;
+        resp[9] = 0;
+        resp[10] = 0;
+        resp[11] = 0;
+        resp[12] = 8;
+        resp[13] = 0;
+        resp[14] = 0;
+        resp[15] = 0xF0;
+        resp[16] = 0;
+        resp[17] = 0;
+        resp[18] = 1;
+        resp[19] = 0;
+        resp[20] = 1;
+        resp[25] = 0x01;
+        resp[26] = 0xE0; // 480
         return Some(resp);
     }
     // Read: function 0x04.
@@ -131,20 +149,31 @@ fn handle_s7(pkt: &[u8]) -> Option<Vec<u8>> {
     let total = 7 + s7_body;
     let mut resp = vec![0u8; total];
     // TPKT
-    resp[0] = ISO_ID; resp[1] = 0x00;
-    resp[2] = (total >> 8) as u8; resp[3] = (total & 0xFF) as u8;
+    resp[0] = ISO_ID;
+    resp[1] = 0x00;
+    resp[2] = (total >> 8) as u8;
+    resp[3] = (total & 0xFF) as u8;
     // COTP DT
-    resp[4] = 0x02; resp[5] = 0xF0; resp[6] = EOT;
+    resp[4] = 0x02;
+    resp[5] = 0xF0;
+    resp[6] = EOT;
     // S7 AckData header
-    resp[7] = S7_ID; resp[8] = 0x03;
-    resp[9] = pkt[9]; resp[10] = pkt[10]; // echo PDU ref
-    resp[11] = 0; resp[12] = 0; // 2 padding bytes
-    resp[13] = (param_len >> 8) as u8; resp[14] = (param_len & 0xFF) as u8;
-    resp[15] = (data_len >> 8) as u8; resp[16] = (data_len & 0xFF) as u8;
-    resp[17] = 0; resp[18] = 0; // error_code = 0
-    // Param section
-    resp[19] = 0x04; resp[20] = 0x01; // func=Read, items=1
-    // Data section: item header
+    resp[7] = S7_ID;
+    resp[8] = 0x03;
+    resp[9] = pkt[9];
+    resp[10] = pkt[10]; // echo PDU ref
+    resp[11] = 0;
+    resp[12] = 0; // 2 padding bytes
+    resp[13] = (param_len >> 8) as u8;
+    resp[14] = (param_len & 0xFF) as u8;
+    resp[15] = (data_len >> 8) as u8;
+    resp[16] = (data_len & 0xFF) as u8;
+    resp[17] = 0;
+    resp[18] = 0; // error_code = 0
+                  // Param section
+    resp[19] = 0x04;
+    resp[20] = 0x01; // func=Read, items=1
+                     // Data section: item header
     resp[21] = 0xFF; // item return code (success)
     resp[22] = 0x04; // transport size
     resp[23] = (read_len >> 8) as u8;

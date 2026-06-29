@@ -241,7 +241,6 @@ impl PlcPoller {
         self.seq += 1;
         let seq = self.seq;
 
-        let mut span_id_counter: i64 = 0;
         let mut samples = Vec::new();
         let mut spans: Vec<SpanResult> = Vec::with_capacity(self.plan.spans.len());
         let mut rollups: Vec<RollupRecord> = Vec::new();
@@ -252,9 +251,8 @@ impl PlcPoller {
         // Clone spans to avoid borrow conflict with decode_and_store_tag
         let spans_plan = self.plan.spans.clone();
 
-        for span in &spans_plan {
-            span_id_counter += 1;
-            let span_id = span_id_counter;
+        for (idx, span) in spans_plan.iter().enumerate() {
+            let span_id = idx as i64 + 1;
 
             match span.kind {
                 SpanKind::BlockRead => {
@@ -304,11 +302,8 @@ impl PlcPoller {
                             });
                             for &tag_id in &span.tag_ids {
                                 if let Some(tag) = self.tags.get(&tag_id).cloned() {
-                                    match client.read_db(
-                                        tag.db_num,
-                                        tag.byte_offset,
-                                        tag.byte_size,
-                                    ) {
+                                    match client.read_db(tag.db_num, tag.byte_offset, tag.byte_size)
+                                    {
                                         Ok(_) => {
                                             debug!(
                                                 "PLC {}: tag {} ({}) reads OK on its own",
@@ -412,11 +407,7 @@ impl PlcPoller {
                         });
                         for &tag_id in &span.tag_ids {
                             if let Some(tag) = self.tags.get(&tag_id).cloned() {
-                                match client.read_db(
-                                    tag.db_num,
-                                    tag.byte_offset,
-                                    tag.byte_size,
-                                ) {
+                                match client.read_db(tag.db_num, tag.byte_offset, tag.byte_size) {
                                     Ok(_) => {
                                         debug!(
                                             "PLC {}: tag {} ({}) reads OK on its own",

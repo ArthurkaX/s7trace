@@ -1,5 +1,4 @@
 /// Delayed configuration apply with cooldown/debounce support.
-
 use crate::types::*;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -60,8 +59,16 @@ pub fn schedule(
            AND (metric_set_id IS NOT DISTINCT FROM ?9)
            AND (tag_id IS NOT DISTINCT FROM ?10)",
         params![
-            now, apply_after, reason, details_json, cooldown_ms,
-            scope_clean, plc_id, poll_group_id, metric_set_id, tag_id,
+            now,
+            apply_after,
+            reason,
+            details_json,
+            cooldown_ms,
+            scope_clean,
+            plc_id,
+            poll_group_id,
+            metric_set_id,
+            tag_id,
         ],
     )?;
 
@@ -75,9 +82,7 @@ pub fn schedule(
                    AND (metric_set_id IS NOT DISTINCT FROM ?4)
                    AND (tag_id IS NOT DISTINCT FROM ?5)
                  ORDER BY id DESC LIMIT 1",
-                params![
-                    scope_clean, plc_id, poll_group_id, metric_set_id, tag_id,
-                ],
+                params![scope_clean, plc_id, poll_group_id, metric_set_id, tag_id,],
                 |row| row.get(0),
             )
             .unwrap());
@@ -89,9 +94,16 @@ pub fn schedule(
              plc_id, poll_group_id, metric_set_id, tag_id, reason, cooldown_ms, details_json)
          VALUES (?1, ?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
-            now, apply_after, scope_clean,
-            plc_id, poll_group_id, metric_set_id, tag_id,
-            reason, cooldown_ms, details_json,
+            now,
+            apply_after,
+            scope_clean,
+            plc_id,
+            poll_group_id,
+            metric_set_id,
+            tag_id,
+            reason,
+            cooldown_ms,
+            details_json,
         ],
     )
     .context("schedule config apply")?;
@@ -147,7 +159,8 @@ pub fn claim_due(conn: &Connection) -> Result<Option<ConfigApplyRow>> {
                 updated_ts: row.get(2)?,
                 apply_after_ts: row.get(3)?,
                 applied_ts: row.get(4)?,
-                state: serde_json::from_str(&format!("\"{state_str}\"")).unwrap_or(ConfigApplyState::Pending),
+                state: serde_json::from_str(&format!("\"{state_str}\""))
+                    .unwrap_or(ConfigApplyState::Pending),
                 scope: serde_json::from_str(&format!("\"{scope_str}\"")).unwrap_or(ApplyScope::Tag),
                 plc_id: row.get(7)?,
                 poll_group_id: row.get(8)?,
@@ -216,7 +229,8 @@ pub fn list_pending(conn: &Connection) -> Result<Vec<ConfigApplyRow>> {
             updated_ts: row.get(2)?,
             apply_after_ts: row.get(3)?,
             applied_ts: row.get(4)?,
-            state: serde_json::from_str(&format!("\"{state_str}\"")).unwrap_or(ConfigApplyState::Pending),
+            state: serde_json::from_str(&format!("\"{state_str}\""))
+                .unwrap_or(ConfigApplyState::Pending),
             scope: serde_json::from_str(&format!("\"{scope_str}\"")).unwrap_or(ApplyScope::Tag),
             plc_id: row.get(7)?,
             poll_group_id: row.get(8)?,
@@ -244,30 +258,70 @@ mod tests {
     fn test_schedule_and_claim() {
         let conn = open_memory().unwrap();
         // Insert required FK rows
-        conn.execute("INSERT INTO plc (id, name, host) VALUES (1, 'test-plc', '127.0.0.1')", []).unwrap();
-        conn.execute("INSERT INTO poll_group (id, name, period_ms) VALUES (2, 'fast', 40)", []).unwrap();
+        conn.execute(
+            "INSERT INTO plc (id, name, host) VALUES (1, 'test-plc', '127.0.0.1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO poll_group (id, name, period_ms) VALUES (2, 'fast', 40)",
+            [],
+        )
+        .unwrap();
         let id = schedule(
-            &conn, ApplyScope::PollGroup, Some(1), Some(2), None, None,
-            "poll_group_changed", PLAN_COOLDOWN_MS, None,
-        ).unwrap();
+            &conn,
+            ApplyScope::PollGroup,
+            Some(1),
+            Some(2),
+            None,
+            None,
+            "poll_group_changed",
+            PLAN_COOLDOWN_MS,
+            None,
+        )
+        .unwrap();
         assert!(id > 0);
     }
 
     #[test]
     fn test_debounce() {
         let conn = open_memory().unwrap();
-        conn.execute("INSERT INTO plc (id, name, host) VALUES (1, 'test-plc', '127.0.0.1')", []).unwrap();
-        conn.execute("INSERT INTO poll_group (id, name, period_ms) VALUES (2, 'fast', 40)", []).unwrap();
+        conn.execute(
+            "INSERT INTO plc (id, name, host) VALUES (1, 'test-plc', '127.0.0.1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO poll_group (id, name, period_ms) VALUES (2, 'fast', 40)",
+            [],
+        )
+        .unwrap();
 
         let id1 = schedule(
-            &conn, ApplyScope::PollGroup, Some(1), Some(2), None, None,
-            "first", PLAN_COOLDOWN_MS, None,
-        ).unwrap();
+            &conn,
+            ApplyScope::PollGroup,
+            Some(1),
+            Some(2),
+            None,
+            None,
+            "first",
+            PLAN_COOLDOWN_MS,
+            None,
+        )
+        .unwrap();
 
         let id2 = schedule(
-            &conn, ApplyScope::PollGroup, Some(1), Some(2), None, None,
-            "debounced", PLAN_COOLDOWN_MS, None,
-        ).unwrap();
+            &conn,
+            ApplyScope::PollGroup,
+            Some(1),
+            Some(2),
+            None,
+            None,
+            "debounced",
+            PLAN_COOLDOWN_MS,
+            None,
+        )
+        .unwrap();
 
         // Should be same row (debounced)
         assert_eq!(id1, id2);
@@ -278,8 +332,13 @@ mod tests {
         // Simulates what apply_worker does: claim_due + apply + finish_apply
         // should reflect in tag.applied_version == desired_version.
         let conn = open_memory().unwrap();
-        conn.execute("INSERT INTO plc (id, name, host) VALUES (1, 'p', 'h')", []).unwrap();
-        conn.execute("INSERT INTO poll_group (id, name, period_ms) VALUES (1, 'fast', 40)", []).unwrap();
+        conn.execute("INSERT INTO plc (id, name, host) VALUES (1, 'p', 'h')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO poll_group (id, name, period_ms) VALUES (1, 'fast', 40)",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO tag (id, plc_id, name, address, db_num, byte_offset, byte_size,
                               data_type, poll_group_id, store_mode, storage_hook,
@@ -290,9 +349,17 @@ mod tests {
         ).unwrap();
 
         let id = schedule(
-            &conn, ApplyScope::Tag, Some(1), Some(1), None, Some(10),
-            "test", 0, None,
-        ).unwrap();
+            &conn,
+            ApplyScope::Tag,
+            Some(1),
+            Some(1),
+            None,
+            Some(10),
+            "test",
+            0,
+            None,
+        )
+        .unwrap();
         assert!(id > 0);
 
         let row = claim_due(&conn).unwrap().unwrap();
@@ -305,10 +372,13 @@ mod tests {
         ).unwrap();
         finish_apply(&conn, row.id).unwrap();
 
-        let (applied, desired, state): (i64, i64, String) = conn.query_row(
-            "SELECT applied_version, desired_version, apply_state FROM tag WHERE id = 10",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
+        let (applied, desired, state): (i64, i64, String) = conn
+            .query_row(
+                "SELECT applied_version, desired_version, apply_state FROM tag WHERE id = 10",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(applied, 5);
         assert_eq!(desired, 5);
         assert_eq!(state, "applied");

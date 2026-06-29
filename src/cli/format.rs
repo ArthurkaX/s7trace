@@ -2,7 +2,7 @@
 ///
 /// Default output is compact JSON. `--format table` is the only
 /// human-readable mode.
-
+///
 /// Supported output formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -13,6 +13,7 @@ pub enum Format {
 }
 
 impl Format {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Format {
         match s {
             "table" => Format::Table,
@@ -137,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_format_value_f32() {
-        let s = format_value(None, Some(3.1415));
+        let s = format_value(None, Some(std::f64::consts::PI));
         assert!(s.starts_with("3.14"));
     }
 

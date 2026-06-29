@@ -5,7 +5,6 @@
 ///
 /// On connect failure (PLC unreachable) the server logs an error and
 /// the poller will retry on the next cycle.
-
 use crate::plc::client::PlcClient;
 use crate::types::*;
 use log::{debug, error, info};
@@ -163,7 +162,12 @@ impl PlcClient for Snap7Client {
                 let plc_err = Self::map_error(&e, &context);
 
                 // Mark disconnected on transport errors so poller reconnects
-                if matches!(&e, S7Error::ConnectionClosed | S7Error::TcpConnectionFailed | S7Error::NotConnected) {
+                if matches!(
+                    &e,
+                    S7Error::ConnectionClosed
+                        | S7Error::TcpConnectionFailed
+                        | S7Error::NotConnected
+                ) {
                     self.connected = false;
                 }
                 Err(plc_err)

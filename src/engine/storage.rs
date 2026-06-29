@@ -3,7 +3,6 @@
 /// Each hook implements the `StorageHook` trait. The engine calls
 /// `should_write` after each successful poll to decide whether to
 /// insert a sample row.
-
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 
@@ -137,8 +136,7 @@ pub struct CounterParams {
 /// Initialize hook state from tag metadata. Parses `hook_params_json` to
 /// customize hook parameters (e.g. counter wrap, deadband threshold, window).
 pub fn init_hook_state(hook: StorageHook, params: Option<&str>) -> HookState {
-    let parsed: Option<serde_json::Value> = params
-        .and_then(|p| serde_json::from_str(p).ok());
+    let parsed: Option<serde_json::Value> = params.and_then(|p| serde_json::from_str(p).ok());
 
     match hook {
         StorageHook::OnChange => HookState::OnChange(OnChangeState {
@@ -146,7 +144,8 @@ pub fn init_hook_state(hook: StorageHook, params: Option<&str>) -> HookState {
             last_stored_vf: None,
         }),
         StorageHook::Deadband => {
-            let threshold = parsed.as_ref()
+            let threshold = parsed
+                .as_ref()
                 .and_then(|v| v.get("threshold"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
@@ -158,7 +157,8 @@ pub fn init_hook_state(hook: StorageHook, params: Option<&str>) -> HookState {
         }
         StorageHook::Periodic => HookState::Periodic,
         StorageHook::MinMaxRollup => {
-            let window_ms = parsed.as_ref()
+            let window_ms = parsed
+                .as_ref()
                 .and_then(|v| v.get("window_ms"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(1000);
@@ -177,7 +177,8 @@ pub fn init_hook_state(hook: StorageHook, params: Option<&str>) -> HookState {
             })
         }
         StorageHook::DeltaRollup => {
-            let window_ms = parsed.as_ref()
+            let window_ms = parsed
+                .as_ref()
                 .and_then(|v| v.get("window_ms"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(1000);
@@ -196,7 +197,8 @@ pub fn init_hook_state(hook: StorageHook, params: Option<&str>) -> HookState {
             states: Vec::new(),
         }),
         StorageHook::CounterDelta => {
-            let wrap_at = parsed.as_ref()
+            let wrap_at = parsed
+                .as_ref()
                 .and_then(|v| v.get("wrap_at"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(65536); // default u16 wrap
@@ -232,19 +234,13 @@ pub fn evaluate(
     }
 }
 
-fn eval_on_change(
-    state: &mut OnChangeState,
-    vi: Option<i64>,
-    vf: Option<f64>,
-) -> WriteDecision {
+fn eval_on_change(state: &mut OnChangeState, vi: Option<i64>, vf: Option<f64>) -> WriteDecision {
     let changed = match (vi, state.last_stored_vi) {
         (Some(a), Some(b)) => a != b,
-        (None, None) => {
-            match (vf, state.last_stored_vf) {
-                (Some(a), Some(b)) => (a - b).abs() > f64::EPSILON,
-                _ => true,
-            }
-        }
+        (None, None) => match (vf, state.last_stored_vf) {
+            (Some(a), Some(b)) => (a - b).abs() > f64::EPSILON,
+            _ => true,
+        },
         _ => true,
     };
 
@@ -269,20 +265,14 @@ fn eval_on_change(
     }
 }
 
-fn eval_deadband(
-    state: &mut DeadbandState,
-    vi: Option<i64>,
-    vf: Option<f64>,
-) -> WriteDecision {
+fn eval_deadband(state: &mut DeadbandState, vi: Option<i64>, vf: Option<f64>) -> WriteDecision {
     let threshold = state.threshold;
     let changed = match (vf, state.last_stored_vf) {
         (Some(a), Some(b)) => (a - b).abs() >= threshold,
-        _ => {
-            match (vi, state.last_stored_vi) {
-                (Some(a), Some(b)) => (a - b).unsigned_abs() >= threshold as u64,
-                _ => true,
-            }
-        }
+        _ => match (vi, state.last_stored_vi) {
+            (Some(a), Some(b)) => (a - b).unsigned_abs() >= threshold as u64,
+            _ => true,
+        },
     };
 
     if changed {
@@ -504,10 +494,7 @@ pub fn drain_state_durations(state: &mut StateDurationState) -> Vec<StateInterva
     out
 }
 
-fn eval_counter_delta(
-    state: &mut CounterDeltaState,
-    vi: Option<i64>,
-) -> WriteDecision {
+fn eval_counter_delta(state: &mut CounterDeltaState, vi: Option<i64>) -> WriteDecision {
     let delta = match (vi, state.last_value) {
         (Some(curr), Some(prev)) => {
             if curr < prev {
@@ -545,7 +532,11 @@ fn eval_counter_delta(
 ///
 /// `bit_offset` is used for `DataType::Bool` to extract a single bit.
 /// When `None`, any non‑zero byte value is treated as `true`.
-pub fn decode_value(data: &[u8], data_type: DataType, bit_offset: Option<u8>) -> (Option<i64>, Option<f64>) {
+pub fn decode_value(
+    data: &[u8],
+    data_type: DataType,
+    bit_offset: Option<u8>,
+) -> (Option<i64>, Option<f64>) {
     match data_type {
         DataType::Bool => {
             if data.is_empty() {
@@ -661,7 +652,6 @@ mod tests {
         assert_eq!(vi, Some(1));
     }
 
-
     #[test]
     fn test_decode_bool_false() {
         let (vi, _vf) = decode_value(&[0x00], DataType::Bool, None);
@@ -690,7 +680,8 @@ mod tests {
     #[test]
     fn test_counter_delta_wrap_at_from_params() {
         // u32 counter, wraps at 2^32
-        let mut state = init_hook_state(StorageHook::CounterDelta, Some(r#"{"wrap_at":4294967296}"#));
+        let mut state =
+            init_hook_state(StorageHook::CounterDelta, Some(r#"{"wrap_at":4294967296}"#));
         let d1 = evaluate(&mut state, Some(4_000_000_000_u32 as i64), None, 1000);
         assert!(!d1.should_write);
         let d2 = evaluate(&mut state, Some(10), None, 2000);

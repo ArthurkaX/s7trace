@@ -32,13 +32,13 @@ use crate::types::*;
 pub type SampleBatch = PollResult;
 
 /// Registry of PLC clients, keyed by plc_id.
-type PlcRegistry = Arc<Mutex<HashMap<i64, Arc<Mutex<dyn PlcClient + Send>>>>>;
+pub(crate) type PlcRegistry = Arc<Mutex<HashMap<i64, Arc<Mutex<dyn PlcClient + Send>>>>>;
 
 /// Registry of running poller handles, keyed by (plc_id, poll_group_id).
-type PollerRegistry = Arc<Mutex<HashMap<(i64, i64), PollerHandle>>>;
+pub(crate) type PollerRegistry = Arc<Mutex<HashMap<(i64, i64), PollerHandle>>>;
 
 /// Per-PLC PDU length cache. Populated on first successful connect.
-type PduCache = Arc<Mutex<HashMap<i64, usize>>>;
+pub(crate) type PduCache = Arc<Mutex<HashMap<i64, usize>>>;
 
 // ---------------------------------------------------------------------------
 // Config apply worker
@@ -412,6 +412,24 @@ fn execute_command(
     use CommandKind::*;
 
     let req: serde_json::Value = serde_json::from_str(request_json)?;
+
+    // Unified core: actions migrated to `ops::execute` are handled here,
+    // bypassing the legacy match below. The CLI sends a serialized `Op`.
+    let migrated_action = req["action"].as_str().unwrap_or("");
+    if crate::engine::ops::MIGRATED_ACTIONS.contains(&migrated_action) {
+        let op: crate::engine::ops::Op = serde_json::from_str(request_json)?;
+        let ctx = crate::engine::ops::ExecCtx::server(
+            conn,
+            plcs,
+            pollers,
+            pdu_cache,
+            snapshot,
+            sample_tx,
+            overrun_mode,
+        );
+        let out = crate::engine::ops::execute(&ctx, op)?;
+        return Ok((out.ok, out.message));
+    }
 
     match kind {
         Admin => {
@@ -1623,18 +1641,14 @@ fn execute_command(
                         Ok(id) => id,
                         Err(_) => return Ok((false, format!("metric set '{set_name}' not found"))),
                     };
-                    // Delete dependent rows before the set itself
-                    // dataset_metric_set has FK without ON DELETE CASCADE
                     conn.execute(
                         "DELETE FROM dataset_metric_set WHERE metric_set_id = ?1",
                         rusqlite::params![set_id],
                     )?;
-                    // config_apply may reference the set
                     conn.execute(
-                        "DELETE FROM config_apply WHERE metric_set_id = ?1 AND state IN ('pending', 'applying')",
+                        "DELETE FROM config_apply WHERE metric_set_id = ?1",
                         rusqlite::params![set_id],
                     )?;
-                    // metric_set_tag cascades, but delete explicitly to be safe
                     conn.execute(
                         "DELETE FROM metric_set_tag WHERE metric_set_id = ?1",
                         rusqlite::params![set_id],

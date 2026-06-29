@@ -1,4 +1,8 @@
 #![allow(dead_code)]
+// TODO(reboot): remove these once Block 1/2 replace the multi-arg handlers
+// (typed `Op` structs) and simplify `CommandKind`.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::enum_variant_names)]
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -259,18 +263,20 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             storage_hook,
             value_role,
             metric_set,
-        } => handle_tag_add(
+        } => run_op(
             cli,
             conn,
-            plc,
-            name,
-            address,
-            data_type,
-            poll_group,
-            store_mode,
-            storage_hook,
-            value_role,
-            metric_set.as_deref(),
+            engine::ops::Op::TagAddFull {
+                plc: plc.clone(),
+                name: name.clone(),
+                address: address.clone(),
+                data_type: data_type.clone(),
+                poll_group: poll_group.clone(),
+                store_mode: store_mode.clone(),
+                storage_hook: storage_hook.clone(),
+                value_role: value_role.clone(),
+                metric_set: metric_set.clone(),
+            },
         ),
         Command::TagUpdate {
             tag_id,
@@ -281,27 +287,47 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             poll_group,
             store_mode,
             storage_hook,
-        } => handle_tag_update(
-            conn,
+        } => run_op(
             cli,
-            *tag_id,
-            plc.as_deref(),
-            name.as_deref(),
-            address.as_deref(),
-            data_type.as_deref(),
-            poll_group.as_deref(),
-            store_mode.as_deref(),
-            storage_hook.as_deref(),
+            conn,
+            engine::ops::Op::TagUpdate {
+                tag_id: *tag_id,
+                plc: plc.clone(),
+                name: name.clone(),
+                address: address.clone(),
+                data_type: data_type.clone(),
+                poll_group: poll_group.clone(),
+                store_mode: store_mode.clone(),
+                storage_hook: storage_hook.clone(),
+            },
         ),
-        Command::TagDisable { tag_id, plc, name } => {
-            handle_tag_disable(conn, cli, *tag_id, plc.as_deref(), name.as_deref())
-        }
-        Command::TagEnable { tag_id, plc, name } => {
-            handle_tag_enable(conn, cli, *tag_id, plc.as_deref(), name.as_deref())
-        }
-        Command::TagRevalidate { tag_id, plc, name } => {
-            handle_tag_revalidate(conn, cli, *tag_id, plc.as_deref(), name.as_deref())
-        }
+        Command::TagDisable { tag_id, plc, name } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::TagDisable {
+                tag_id: *tag_id,
+                plc: plc.clone(),
+                name: name.clone(),
+            },
+        ),
+        Command::TagEnable { tag_id, plc, name } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::TagEnable {
+                tag_id: *tag_id,
+                plc: plc.clone(),
+                name: name.clone(),
+            },
+        ),
+        Command::TagRevalidate { tag_id, plc, name } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::TagRevalidate {
+                tag_id: *tag_id,
+                plc: plc.clone(),
+                name: name.clone(),
+            },
+        ),
         Command::Read {
             plc,
             address,
@@ -321,32 +347,95 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             plc,
             name,
             description,
-        } => handle_set_create(cli, conn, plc, name, description.as_deref()),
+        } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::SetCreate {
+                plc: plc.clone(),
+                name: name.clone(),
+                description: description.clone(),
+            },
+        ),
         Command::SetAddTag {
             set_name,
             tag,
             from_sql,
             from_file,
-        } => handle_set_add_tag(
-            conn,
-            cli,
-            set_name,
-            tag.as_deref(),
-            from_sql.as_deref(),
-            from_file.as_deref(),
-        ),
+        } => {
+            // `--from-file` lives on the CLI host: resolve it to a tag-name list
+            // here so the operation carries data the server can act on.
+            let (tag_field, from_sql_field) = if let Some(path) = from_file {
+                let content = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let names: Vec<&str> = content
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect();
+                if names.is_empty() {
+                    return Err(anyhow::anyhow!("no tag names found in {path}"));
+                }
+                (Some(names.join(",")), None)
+            } else {
+                (tag.clone(), from_sql.clone())
+            };
+            if server_base(cli).is_some() && from_sql_field.is_some() {
+                return Err(anyhow::anyhow!("--from-sql not supported in remote mode"));
+            }
+            run_op(
+                cli,
+                conn,
+                engine::ops::Op::SetAddTag {
+                    set_name: set_name.clone(),
+                    tag: tag_field,
+                    from_sql: from_sql_field,
+                    from_file: None,
+                },
+            )
+        }
         Command::SetRemoveTag {
             set_name,
             tag,
             from_sql,
-        } => handle_set_remove_tag(conn, cli, set_name, tag.as_deref(), from_sql.as_deref()),
-        Command::SetEnable { set_name } => handle_set_enable(conn, cli, set_name),
-        Command::SetDisable { set_name } => handle_set_disable(conn, cli, set_name),
+        } => {
+            if server_base(cli).is_some() && from_sql.is_some() {
+                return Err(anyhow::anyhow!("--from-sql not supported in remote mode"));
+            }
+            run_op(
+                cli,
+                conn,
+                engine::ops::Op::SetRemoveTag {
+                    set_name: set_name.clone(),
+                    tag: tag.clone(),
+                    from_sql: from_sql.clone(),
+                },
+            )
+        }
+        Command::SetEnable { set_name } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::SetEnable {
+                set_name: set_name.clone(),
+            },
+        ),
+        Command::SetDisable { set_name } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::SetDisable {
+                set_name: set_name.clone(),
+            },
+        ),
         Command::SetList { plc } => handle_set_list(cli, conn, plc.as_deref()),
         Command::SetShow { set_name, set_flag } => {
             handle_set_show(conn, cli, set_name.as_deref(), set_flag.as_deref())
         }
-        Command::SetDelete { set_name } => handle_set_delete(conn, cli, set_name),
+        Command::SetDelete { set_name } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::SetDelete {
+                set_name: set_name.clone(),
+            },
+        ),
         Command::CollectionStart { plc, dataset, sets } => {
             handle_collection_start(conn, cli, plc, dataset, sets)
         }
@@ -367,20 +456,37 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             rack,
             slot,
             disabled,
-        } => handle_plc_add(cli, conn, name, host, *rack, *slot, *disabled),
-        Command::PollGroupAdd { name, period_ms } => {
-            handle_poll_group_add(cli, conn, name, *period_ms)
-        }
+        } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::PlcAdd {
+                name: name.clone(),
+                host: host.clone(),
+                rack: *rack,
+                slot: *slot,
+                disabled: *disabled,
+            },
+        ),
+        Command::PollGroupAdd { name, period_ms } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::PollGroupAdd {
+                name: name.clone(),
+                period_ms: *period_ms,
+            },
+        ),
         Command::PollGroupSetPeriod {
             poll_group_id,
             poll_group_name,
             period_ms,
-        } => handle_poll_group_set_period(
+        } => run_op(
             cli,
             conn,
-            *poll_group_id,
-            poll_group_name.as_deref(),
-            *period_ms,
+            engine::ops::Op::PollGroupSetPeriod {
+                poll_group_id: *poll_group_id,
+                poll_group_name: poll_group_name.clone(),
+                period_ms: *period_ms,
+            },
         ),
         Command::Event { action } => handle_event_add(conn, cli, action),
         Command::Note { text, plc, dataset } => handle_event_add(
@@ -683,6 +789,49 @@ fn forward_control(
     } else {
         println!("{state}: {result} {err}");
         Ok(ExitCode::BadInput)
+    }
+}
+
+/// Run a mutating operation through the unified core ([`engine::ops::execute`]).
+///
+/// Remote mode serializes the `Op` and enqueues it on the server; local mode
+/// executes it directly against the local database. This single helper
+/// replaces the per-command "if remote { build JSON; enqueue; wait } else
+/// { local work }" boilerplate that used to be copy-pasted into every handler.
+fn run_op(cli: &Cli, conn: &Connection, op: engine::ops::Op) -> Result<ExitCode> {
+    if let Some(base) = server_base(cli) {
+        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let id = cli::remote::enqueue_command(
+            &base,
+            "control",
+            &serde_json::to_string(&op)?,
+            Some("cli"),
+            None,
+            timeout,
+        )?;
+        println!("queued command_id={id}");
+        let (state, result, ok, err) =
+            cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
+        if ok {
+            println!("success {result}");
+            Ok(ExitCode::Ok)
+        } else {
+            println!("{state}: {result} {err}");
+            Ok(ExitCode::BadInput)
+        }
+    } else {
+        let out = engine::ops::execute(&engine::ops::ExecCtx::local(conn), op)?;
+        if out.ok {
+            if out.data.is_null() {
+                println!("success {}", out.message);
+            } else {
+                cli::format::print_json_ok(&out.data);
+            }
+            Ok(ExitCode::Ok)
+        } else {
+            println!("{}", out.message);
+            Ok(ExitCode::BadInput)
+        }
     }
 }
 
@@ -1279,10 +1428,82 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
         if fmt == "json" || fmt == "jsonl" {
             println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
-            // text mode: try to read the same text format we produce locally
-            // by reading the local DB. If that's unavailable, fall back to JSON.
+            // text mode: human-readable summary from the API JSON.
             println!("(remote server: {base})");
-            println!("{}", serde_json::to_string_pretty(&v)?);
+            println!(
+                "s7trace version={} schema={} api={}",
+                v["version"]["package"].as_str().unwrap_or("?"),
+                v["version"]["schema"].as_str().unwrap_or("?"),
+                v["version"]["api"].as_i64().unwrap_or(0)
+            );
+            println!(
+                "tags: active={} bad={}",
+                v["tags"]["active"], v["tags"]["bad"]
+            );
+            println!(
+                "command_queue: pending={} running={}",
+                v["command_queue"]["pending"], v["command_queue"]["running"]
+            );
+            println!("PLCs:");
+            for plc in v["plcs"].as_array().unwrap_or(&Vec::new()) {
+                let pg_array = plc["poll_groups"].as_array().cloned().unwrap_or_default();
+                let pg_parts: Vec<String> = pg_array
+                    .iter()
+                    .map(|pg| {
+                        let target = pg["target_ms"].as_i64().unwrap_or(0);
+                        let act = pg["actual_ms"].as_f64().unwrap_or(-1.0);
+                        let actual = if act >= 0.0 {
+                            format!("{act:.2}")
+                        } else {
+                            "-".into()
+                        };
+                        let utilization = if act > 0.0 && target > 0 {
+                            let pct = (act / target as f64) * 100.0;
+                            if pct > 90.0 {
+                                format!(" {pct:.0}% HIGH")
+                            } else if pct > 50.0 {
+                                format!(" {pct:.0}% mod")
+                            } else {
+                                format!(" {pct:.0}% low")
+                            }
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "{} target={}ms actual={}ms{utilization} overruns={}",
+                            pg["name"], target, actual, pg["overrun_count"]
+                        )
+                    })
+                    .collect();
+                println!(
+                    "  {} (host={}, conn={}) last_ok_ts={:?}",
+                    plc["name"], plc["host"], plc["connectivity"], plc["last_ok_ts"]
+                );
+                for pg_line in pg_parts {
+                    println!("    poll_group: {pg_line}");
+                }
+                if let Some(err) = plc["last_error"].as_str() {
+                    if !err.is_empty() {
+                        println!("    last_error: {err}");
+                    }
+                }
+                for ms in plc["metric_sets"].as_array().unwrap_or(&Vec::new()) {
+                    let ep = &ms["effective_poll"];
+                    let poll_desc = match ep["mode"].as_str() {
+                        Some("single") => {
+                            let pgn = ep["poll_group_name"].as_str().unwrap_or("?");
+                            let per = ep["period_ms"].as_i64().unwrap_or(0);
+                            let hz = ep["rate_hz"].as_f64().unwrap_or(0.0);
+                            format!("{pgn} {per}ms / {hz:.1}Hz")
+                        }
+                        _ => "off".into(),
+                    };
+                    println!(
+                        "    set {} enabled={} tags={}/{} poll={}",
+                        ms["name"], ms["enabled"], ms["tags_healthy"], ms["tags_total"], poll_desc
+                    );
+                }
+            }
         }
         return Ok(ExitCode::Ok);
     }
@@ -1540,13 +1761,28 @@ fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
                     }
                 }
                 for pg in plc["poll_groups"].as_array().unwrap_or(&Vec::new()) {
-                    let actual = pg["actual_ms"]
-                        .as_f64()
-                        .map(|f| format!("{f:.1}"))
-                        .unwrap_or_else(|| "-".into());
+                    let act = pg["actual_ms"].as_f64().unwrap_or(-1.0);
+                    let target = pg["target_ms"].as_i64().unwrap_or(0);
+                    let actual = if act >= 0.0 {
+                        format!("{act:.2}")
+                    } else {
+                        "-".into()
+                    };
+                    let utilization = if act > 0.0 && target > 0 {
+                        let pct = (act / target as f64) * 100.0;
+                        if pct > 90.0 {
+                            format!(" {pct:.0}% HIGH")
+                        } else if pct > 50.0 {
+                            format!(" {pct:.0}% mod")
+                        } else {
+                            format!(" {pct:.0}% low")
+                        }
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "    poll_group {} target={}ms actual={}ms overruns={}",
-                        pg["name"], pg["target_ms"], actual, pg["overrun_count"]
+                        "    poll_group {}: target={}ms actual={}ms{utilization} overruns={}",
+                        pg["name"], target, actual, pg["overrun_count"]
                     );
                 }
                 for ms in plc["metric_sets"].as_array().unwrap_or(&Vec::new()) {
@@ -2052,10 +2288,10 @@ fn handle_set_list(cli: &Cli, conn: &Connection, plc: Option<&str>) -> Result<Ex
         return Ok(ExitCode::Ok);
     }
 
-    let (query, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if plc.is_some() {
+    let (query, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(p) = plc {
         ("SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
           FROM v_metric_set_status vms WHERE vms.plc = ?1 ORDER BY vms.plc, vms.metric_set",
-         vec![Box::new(plc.unwrap().to_string())])
+         vec![Box::new(p.to_string())])
     } else {
         ("SELECT vms.plc, vms.metric_set, vms.enabled, vms.tags_total, vms.tags_healthy, vms.tags_bad
           FROM v_metric_set_status vms ORDER BY vms.plc, vms.metric_set",
@@ -2225,7 +2461,7 @@ fn handle_set_delete(conn: &Connection, cli: &Cli, set_name: &str) -> Result<Exi
         rusqlite::params![set_id],
     )?;
     conn.execute(
-        "DELETE FROM config_apply WHERE metric_set_id = ?1 AND state IN ('pending', 'applying')",
+        "DELETE FROM config_apply WHERE metric_set_id = ?1",
         rusqlite::params![set_id],
     )?;
     conn.execute(

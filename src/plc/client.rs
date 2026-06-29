@@ -1,5 +1,4 @@
 /// PLC client abstraction — trait and core types.
-
 use crate::types::*;
 
 /// Trait for PLC communication.

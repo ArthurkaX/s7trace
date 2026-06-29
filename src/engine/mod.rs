@@ -4,3 +4,4 @@ pub mod poller;
 pub mod server;
 pub mod snapshot;
 pub mod storage;
+pub mod workers;

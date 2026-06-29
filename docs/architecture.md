@@ -55,7 +55,18 @@ thin validate-and-enqueue client.
 - **poller** (`engine/poller.rs`): one thread per `(plc, poll_group)`. Builds a
   read plan, reads the PLC, and sends a `PollResult` batch down a channel.
   Reconnects use capped exponential backoff + jitter to avoid hammering an
-  offline PLC.
+  offline PLC. A poller does not touch the socket directly — it drives a
+  [`PlcHandle`] to the per-PLC actor (below) at a priority equal to its poll
+  period.
+- **PLC actor** (`plc/actor.rs`): one connection-owning thread per PLC, serving
+  reads from a **priority mailbox**. A single S7 connection serializes reads on
+  the wire regardless; the actor makes that serialization *fair*. Previously
+  every poll-group thread shared an `Arc<Mutex<dyn PlcClient>>` and held it for
+  its whole poll cycle, so a slow group (long multi-read sweep) starved a fast
+  group sharing the PLC. Now each consumer holds a cheap, cloneable handle with
+  its own priority (lower poll period = higher priority; interactive one-off
+  reads preempt all pollers), the lock is held for only one read at a time, and
+  a fast group waits at most one in-flight read instead of a whole slow cycle.
 - **command** (`workers/command/`): claims pending queue entries (lease-based),
   dispatches each by `CommandKind`, and writes the result.
 - **apply** (`workers/apply.rs`): applies pending configuration changes
@@ -106,5 +117,6 @@ a value the device honours.
 | `src/api/` | HTTP transport (`mod.rs`) + handlers (`handlers.rs`, `status.rs`) |
 | `src/db/` | schema/migrations, command_queue, validation, config_apply |
 | `src/plc/` | `PlcClient` trait, `turbos7` backend, mock |
+| `src/plc/actor.rs` | Per-PLC connection actor + priority mailbox (`PlcHandle`) |
 | `src/codec.rs` | Raw-bytes ↔ typed-value decoding |
 | `src/types.rs` | Shared types (`Op` field shapes, `CommandKind`, `ExitCode`, …) |

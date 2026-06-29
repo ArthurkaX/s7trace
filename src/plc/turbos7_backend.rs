@@ -20,7 +20,7 @@ use crate::engine::plan::{
 };
 use crate::plc::client::PlcClient;
 use crate::types::*;
-use log::info;
+use log::{info, warn};
 use std::ops::Range;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -50,11 +50,20 @@ pub struct Turbo7Client {
     /// Cached PDU length, set after connect, used by `pdu_len` to avoid
     /// the round-trip when no inner client is available.
     pdu_length: usize,
+    /// Adaptive per-batch item cap for multi-reads. Starts at the configured
+    /// value and is lowered automatically when the PLC truncates a response
+    /// (S7-300s answer fewer items than requested); sticky-down, so it
+    /// converges to a cap the device actually honours. See `read_multi`.
+    multi_cap: usize,
 }
 
 impl Turbo7Client {
     pub fn new(host: &str, rack: u16, slot: u16) -> Self {
         let (host_clean, port) = Self::parse_host(host);
+        let multi_cap = match Self::max_batch_items() {
+            0 => 3, // 0 (legacy "no cap") -> start at the default and adapt
+            n => n,
+        };
         Turbo7Client {
             host: host_clean,
             port,
@@ -62,6 +71,7 @@ impl Turbo7Client {
             slot,
             inner: None,
             pdu_length: 240, // S7-300 default
+            multi_cap,
         }
     }
 
@@ -74,12 +84,13 @@ impl Turbo7Client {
         (s.to_string(), 102)
     }
 
-    /// Maximum items per multi-read batch, controlled by the
+    /// Initial maximum items per multi-read batch, controlled by the
     /// `S7TRACE_MULTI_BATCH_MAX` env var (default 3).
     ///
-    /// Set to 0 to disable the item-count cap (rely on PDU byte budget alone
-    /// for batch splitting). This is the main knob for the
-    /// multi-read-chunking spike — sweep 3 -> 2 -> 1 without recompiling.
+    /// This is only the *starting* cap: `read_multi` lowers a client's cap
+    /// automatically when the PLC truncates a response, so a too-optimistic
+    /// value self-corrects. A value of 0 (legacy "no cap") starts at the
+    /// default of 3.
     pub fn max_batch_items() -> usize {
         match std::env::var("S7TRACE_MULTI_BATCH_MAX") {
             Ok(v) => v.parse().unwrap_or_else(|_| {
@@ -172,68 +183,105 @@ impl PlcClient for Turbo7Client {
     fn read_multi(&mut self, items: &[ReadItem]) -> Result<Vec<ReadResult>, PlcError> {
         const S7_AREA_DB: u8 = 0x84;
         let pdu = self.pdu_length;
-        let max_items = Self::max_batch_items();
-        let batches = plan_batches(items, pdu, max_items);
 
-        let mut all_results: Vec<ReadResult> = Vec::with_capacity(items.len());
+        // Adaptive multi-read: some PLCs (notably S7-300) answer a multi-read
+        // with fewer items than requested even when the request fits the PDU.
+        // Rather than fail the whole cycle, halve this client's per-batch cap
+        // and retry the entire read; the cap is sticky-down so it converges to
+        // a value the device honours. The loop terminates because the cap
+        // strictly decreases and bottoms out at 1.
+        loop {
+            let cap = self.multi_cap;
+            let batches = plan_batches(items, pdu, cap);
+            let mut all_results: Vec<ReadResult> = Vec::with_capacity(items.len());
+            let mut retry = false;
 
-        for (batch_idx, range) in batches.iter().enumerate() {
-            let batch = &items[range.start..range.end];
-            let t_items: Vec<turbos7::ReadItem> = batch
-                .iter()
-                .map(|it| turbos7::ReadItem {
-                    area: S7_AREA_DB,
-                    db_number: it.db_num,
-                    start: it.start as u32,
-                    size: it.len as u16,
-                })
-                .collect();
+            for (batch_idx, range) in batches.iter().enumerate() {
+                let batch = &items[range.start..range.end];
+                let t_items: Vec<turbos7::ReadItem> = batch
+                    .iter()
+                    .map(|it| turbos7::ReadItem {
+                        area: S7_AREA_DB,
+                        db_number: it.db_num,
+                        start: it.start as u32,
+                        size: it.len as u16,
+                    })
+                    .collect();
 
-            // Isolate the client borrow so NLL releases it before
-            // we potentially mutate self.inner on transport error.
-            let res = {
-                let client = self
-                    .inner
-                    .as_mut()
-                    .ok_or_else(|| PlcError::Disconnected("read_multi: not connected".into()))?;
-                runtime().block_on(async { client.read_multiple(&t_items).await })
-            };
+                // Isolate the client borrow so NLL releases it before
+                // we potentially mutate self.inner on transport error.
+                let res = {
+                    let client = self.inner.as_mut().ok_or_else(|| {
+                        PlcError::Disconnected("read_multi: not connected".into())
+                    })?;
+                    runtime().block_on(async { client.read_multiple(&t_items).await })
+                };
 
-            // Transport errors mean the TCP connection is dead — clear inner
-            // so the poller reconnect loop re-establishes it on the next cycle.
-            if let Err(e) = &res {
-                if matches!(
-                    e,
-                    turbos7::Error::Io(_) | turbos7::Error::Connection(_) | turbos7::Error::Timeout
-                ) {
-                    self.inner = None;
+                // Transport errors mean the TCP connection is dead — clear inner
+                // so the poller reconnect loop re-establishes it next cycle.
+                if let Err(e) = &res {
+                    if matches!(
+                        e,
+                        turbos7::Error::Io(_)
+                            | turbos7::Error::Connection(_)
+                            | turbos7::Error::Timeout
+                    ) {
+                        self.inner = None;
+                    }
                 }
-            }
-            let results = res.map_err(|e| plc_error_from_turbos7(&e))?;
+                let results = res.map_err(|e| plc_error_from_turbos7(&e))?;
 
-            if results.len() != batch.len() {
-                return Err(PlcError::ProtocolError(format!(
-                    "read_multi batch {}: expected {} results, got {}",
-                    batch_idx,
-                    batch.len(),
-                    results.len()
-                )));
-            }
-            for (item, r) in batch.iter().zip(results.iter()) {
-                if !r.success {
+                // Truncation: fewer items came back than we asked for. Lower the
+                // cap and retry the whole read (unless we are already at 1).
+                if results.len() < batch.len() {
+                    if cap > 1 {
+                        let new_cap = (cap / 2).max(1);
+                        warn!(
+                            "read_multi: response truncated ({} of {} items); \
+                             lowering multi-read cap {} -> {}",
+                            results.len(),
+                            batch.len(),
+                            cap,
+                            new_cap
+                        );
+                        self.multi_cap = new_cap;
+                        retry = true;
+                        break;
+                    }
                     return Err(PlcError::ProtocolError(format!(
-                        "read_multi batch {}: item DB{} @{} failed (error_code={:?})",
-                        batch_idx, item.db_num, item.start, r.error_code
+                        "read_multi batch {}: response truncated ({} of {}) at minimum cap",
+                        batch_idx,
+                        results.len(),
+                        batch.len()
                     )));
                 }
+                if results.len() != batch.len() {
+                    return Err(PlcError::ProtocolError(format!(
+                        "read_multi batch {}: expected {} results, got {}",
+                        batch_idx,
+                        batch.len(),
+                        results.len()
+                    )));
+                }
+                for (item, r) in batch.iter().zip(results.iter()) {
+                    if !r.success {
+                        return Err(PlcError::ProtocolError(format!(
+                            "read_multi batch {}: item DB{} @{} failed (error_code={:?})",
+                            batch_idx, item.db_num, item.start, r.error_code
+                        )));
+                    }
+                }
+                all_results.extend(batch.iter().zip(results).map(|(item, r)| ReadResult {
+                    item: item.clone(),
+                    data: r.data,
+                }));
             }
-            all_results.extend(batch.iter().zip(results).map(|(item, r)| ReadResult {
-                item: item.clone(),
-                data: r.data,
-            }));
-        }
 
-        Ok(all_results)
+            if retry {
+                continue;
+            }
+            return Ok(all_results);
+        }
     }
 
     fn label(&self) -> String {

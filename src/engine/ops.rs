@@ -965,6 +965,28 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 rusqlite::params![name, host, rack, slot, enabled],
             )?;
             let id = conn.last_insert_rowid();
+
+            // On the server, register the client in the live registry so the
+            // PLC is usable immediately (pollers, reads, tag validation)
+            // without restarting the server. Mirrors `init_plc_clients`:
+            // try to connect (non-fatal) and cache the negotiated PDU length.
+            if let Some(plcs) = ctx.plcs {
+                let client = create_plc_client(&name, &host, rack as u16, slot as u16);
+                {
+                    let mut c = client.lock();
+                    let pdu = if c.connect().is_ok() {
+                        c.pdu_len().unwrap_or(240)
+                    } else {
+                        240
+                    };
+                    if let Some(cache) = ctx.pdu_cache {
+                        cache.lock().insert(id, pdu);
+                    }
+                }
+                plcs.lock().insert(id, client);
+                tracing::info!("plc-add: registered live client for PLC {id} ({name})");
+            }
+
             Ok(OpOutput::ok_data(
                 format!("plc_id={id} name={name} host={host}"),
                 serde_json::json!({"plc_id": id, "name": name, "host": host}),

@@ -1,7 +1,6 @@
 //! Sample-writer worker: drains the poll-result channel, persists samples,
 //! and updates the in-memory snapshot.
 
-use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -9,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 use crate::engine::server::SampleBatch;
 use crate::engine::snapshot::Snapshot;

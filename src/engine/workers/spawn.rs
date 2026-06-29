@@ -1,8 +1,8 @@
 //! Poller spawn helpers: plan-building and per-(plc,poll_group) poller launch.
 
-use log::{debug, info};
 use rusqlite::Connection;
 use std::sync::mpsc::Sender;
+use tracing::{debug, info};
 
 use crate::engine::plan::build_plan;
 use crate::engine::poller::{spawn_poller, OverrunMode};

@@ -4,8 +4,8 @@
 /// commands in `running` forever.
 use crate::types::*;
 use anyhow::{Context, Result};
-use log::warn;
 use rusqlite::{params, Connection};
+use tracing::warn;
 
 pub use crate::types::CommandKind;
 pub use crate::types::CommandRequest;

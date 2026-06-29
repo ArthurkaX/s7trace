@@ -5,12 +5,12 @@
 use crate::engine::storage::{self, HookState, RollupPayload, WriteDecision};
 use crate::plc::client::PlcClient;
 use crate::types::*;
-use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 
 /// Overrun behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +240,13 @@ impl PlcPoller {
 
         self.seq += 1;
         let seq = self.seq;
+        let _span = tracing::info_span!(
+            "poll_cycle",
+            plc = %self.plc_name,
+            group = self.period_ms,
+            seq
+        )
+        .entered();
 
         let mut samples = Vec::new();
         let mut spans: Vec<SpanResult> = Vec::with_capacity(self.plan.spans.len());

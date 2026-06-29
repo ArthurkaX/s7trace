@@ -1,3 +1,10 @@
+use parking_lot::Mutex;
+use rusqlite::Connection;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::Duration;
 /// s7trace server/daemon mode.
 ///
 /// Orchestrates poller threads, command queue worker, config apply worker,
@@ -10,14 +17,7 @@
 ///                                          +---> command_result
 /// Poller --send--> sample-writer --batch--> SQLite
 /// ```
-use log::{error, info, warn};
-use parking_lot::Mutex;
-use rusqlite::Connection;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::Arc;
-use std::time::Duration;
+use tracing::{error, info, warn};
 
 use crate::api;
 use crate::db;

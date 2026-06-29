@@ -1,7 +1,7 @@
 /// Initial schema and migration runner.
 use anyhow::{Context, Result};
-use log::info;
 use rusqlite::Connection;
+use tracing::info;
 
 /// Migration file 0001 — must be byte-identical to the SQL kept in
 /// `docs/schema.sql` (used by out-of-band tools and CI).

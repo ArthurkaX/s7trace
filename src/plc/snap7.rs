@@ -7,9 +7,9 @@
 /// the poller will retry on the next cycle.
 use crate::plc::client::PlcClient;
 use crate::types::*;
-use log::{debug, error, info};
 use rust7::client::{S7Client as Rust7Inner, S7Error};
 use std::collections::HashMap;
+use tracing::{debug, error, info};
 
 // ---------------------------------------------------------------------------
 // Snap7Client — wraps rust7::client::S7Client

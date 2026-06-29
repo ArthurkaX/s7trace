@@ -1,12 +1,12 @@
 //! Config-apply worker: claims pending apply rows and rebuilds running pollers.
 
-use log::{error, info};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{error, info};
 
 use crate::db;
 use crate::engine::poller::OverrunMode;

@@ -4,13 +4,13 @@ mod admin;
 mod control;
 mod plc_read;
 
-use log::{debug, error, info};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, error, info};
 
 use crate::db;
 use crate::engine::poller::OverrunMode;
@@ -110,6 +110,10 @@ pub(crate) fn command_worker(
             "cmd-worker: claimed command id={} kind={:?}",
             cmd.id, cmd.kind
         );
+
+        let cmd_id = cmd.id;
+        let kind = cmd.kind;
+        let _span = tracing::info_span!("command", cmd_id, kind = ?kind).entered();
 
         // Execute under catch_unwind so a panic in one command (decode bug,
         // backend assertion, etc.) is converted to a failed command instead of

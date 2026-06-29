@@ -20,10 +20,10 @@ use crate::engine::plan::{
 };
 use crate::plc::client::PlcClient;
 use crate::types::*;
-use log::{info, warn};
 use std::ops::Range;
 use std::sync::OnceLock;
 use std::time::Duration;
+use tracing::{info, warn};
 use turbos7::S7Client;
 
 /// One global runtime. Created on first call, never torn down.
@@ -94,7 +94,9 @@ impl Turbo7Client {
     pub fn max_batch_items() -> usize {
         match std::env::var("S7TRACE_MULTI_BATCH_MAX") {
             Ok(v) => v.parse().unwrap_or_else(|_| {
-                log::warn!("S7TRACE_MULTI_BATCH_MAX='{v}' is not a valid usize; using default 3");
+                tracing::warn!(
+                    "S7TRACE_MULTI_BATCH_MAX='{v}' is not a valid usize; using default 3"
+                );
                 3
             }),
             Err(_) => 3,
@@ -399,7 +401,7 @@ pub fn create_plc_client(
             std::sync::Arc::new(parking_lot::Mutex::new(client))
         }
         other => {
-            log::warn!("unknown S7TRACE_PLC_BACKEND='{other}', falling back to turbos7");
+            tracing::warn!("unknown S7TRACE_PLC_BACKEND='{other}', falling back to turbos7");
             let client = Turbo7Client::new(host, rack, slot);
             std::sync::Arc::new(parking_lot::Mutex::new(client))
         }

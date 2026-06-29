@@ -1,9 +1,9 @@
 //! Control command handler.
 
-use log::{info, warn};
 use rusqlite::Connection;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use tracing::{info, warn};
 
 use crate::db;
 use crate::engine::poller::OverrunMode;

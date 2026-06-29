@@ -36,7 +36,7 @@ use std::thread;
 /// Blocks the calling thread; spawn a thread to run in background.
 pub fn serve(db: Arc<Mutex<Connection>>, bind_addr: String) -> std::io::Result<()> {
     let listener = TcpListener::bind(&bind_addr)?;
-    log::info!("HTTP API listening on http://{bind_addr}");
+    tracing::info!("HTTP API listening on http://{bind_addr}");
     serve_with_listener(listener, db)
 }
 
@@ -54,12 +54,12 @@ pub fn serve_with_listener(
                     .name("s7trace-http".into())
                     .spawn(move || {
                         if let Err(e) = handle_conn(stream, db) {
-                            log::debug!("http conn closed: {e}");
+                            tracing::debug!("http conn closed: {e}");
                         }
                     })
                     .ok();
             }
-            Err(e) => log::warn!("http accept error: {e}"),
+            Err(e) => tracing::warn!("http accept error: {e}"),
         }
     }
     Ok(())
@@ -126,7 +126,7 @@ fn handle_conn(mut stream: TcpStream, db: Arc<Mutex<Connection>>) -> std::io::Re
     stream.write_all(&payload)?;
     stream.flush()?;
 
-    log::debug!(
+    tracing::debug!(
         "http {} {} {} -> {} ({}b) peer={:?}",
         method,
         target,

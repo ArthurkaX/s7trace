@@ -475,10 +475,23 @@ impl PlcPoller {
         if actual_ms > self.period_ms as f64 {
             self.overrun_count += 1;
             self.degraded = true;
-            warn!(
-                "PLC {}: poll overrun (actual={:.1}ms, target={}ms, seq={})",
-                self.plc_name, actual_ms, self.period_ms, seq,
-            );
+            // A marginal overrun (a few ms over) on a sub-second period would
+            // WARN every single cycle and drown the log. Warn on the first one,
+            // then only periodically (~every 60th cycle), or immediately when a
+            // cycle runs long enough (>2x target) to actually skip a tick.
+            // Everything in between is DEBUG. The running total is in /status.
+            let severe = actual_ms > self.period_ms as f64 * 2.0;
+            if severe || self.overrun_count == 1 || self.overrun_count.is_multiple_of(60) {
+                warn!(
+                    "PLC {}: poll overrun (actual={:.1}ms, target={}ms, seq={}, total_overruns={})",
+                    self.plc_name, actual_ms, self.period_ms, seq, self.overrun_count,
+                );
+            } else {
+                debug!(
+                    "PLC {}: poll overrun (actual={:.1}ms, target={}ms, seq={})",
+                    self.plc_name, actual_ms, self.period_ms, seq,
+                );
+            }
         } else {
             self.degraded = false;
         }

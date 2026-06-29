@@ -1719,6 +1719,11 @@ pub struct ServerConfig {
 /// The main s7trace server. Orchestrates all workers and pollers.
 pub struct Server {
     db: Arc<Mutex<Connection>>,
+    /// Database path, kept so read-mostly subsystems (the HTTP API) can open
+    /// their *own* connection instead of sharing the writer's mutex. Under WAL
+    /// that lets `/status` & friends read concurrently with the sample-writer
+    /// rather than queueing behind every poll-cycle write.
+    db_path: String,
     snapshot: Arc<Snapshot>,
     running: Arc<AtomicBool>,
     plcs: PlcRegistry,
@@ -1740,6 +1745,7 @@ impl Server {
 
         Ok(Server {
             db,
+            db_path: config.db_path,
             snapshot,
             running,
             plcs: Arc::new(Mutex::new(HashMap::new())),
@@ -1983,12 +1989,22 @@ impl Server {
             info!("resumed {count} poller(s) for active dataset(s)");
         }
 
-        // Optionally start HTTP API
+        // Optionally start HTTP API on a dedicated connection (see `db_path`):
+        // the API is read-mostly, so giving it its own WAL connection keeps
+        // `/status` responsive while the sample-writer holds the writer mutex.
         if let Some(bind) = self.http_bind.clone() {
-            let db_http = self.db.clone();
+            let db_path = self.db_path.clone();
             std::thread::Builder::new()
                 .name("http-api".into())
                 .spawn(move || {
+                    let conn = match db::schema::open(&db_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("HTTP API: opening read connection at {db_path}: {e}");
+                            return;
+                        }
+                    };
+                    let db_http = Arc::new(Mutex::new(conn));
                     if let Err(e) = api::serve(db_http, bind) {
                         error!("HTTP API server failed: {e}");
                     }

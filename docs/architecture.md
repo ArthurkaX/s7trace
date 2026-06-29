@@ -114,7 +114,7 @@ a value the device honours.
 | `src/engine/workers/` | poller spawn, command, apply, sample_writer |
 | `src/engine/poller.rs` | Polling loop + reconnect backoff |
 | `src/engine/snapshot.rs` | In-memory latest-value cache |
-| `src/api/` | HTTP transport (`mod.rs`) + handlers (`handlers.rs`, `status.rs`) |
+| `src/api/` | HTTP transport on `axum`/`tokio` (`mod.rs`) + handlers (`handlers.rs`, `status.rs`) |
 | `src/db/` | schema/migrations, command_queue, validation, config_apply |
 | `src/plc/` | `PlcClient` trait, `turbos7` backend, mock |
 | `src/plc/actor.rs` | Per-PLC connection actor + priority mailbox (`PlcHandle`) |

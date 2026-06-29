@@ -41,6 +41,7 @@ pub const MIGRATED_ACTIONS: &[&str] = &[
     "tag_add_full",
     "tag_update",
     "tag_disable",
+    "tag_delete",
     "tag_enable",
     "tag_revalidate",
     "set_create",
@@ -82,6 +83,11 @@ pub enum Op {
         storage_hook: Option<String>,
     },
     TagDisable {
+        tag_id: Option<i64>,
+        plc: Option<String>,
+        name: Option<String>,
+    },
+    TagDelete {
         tag_id: Option<i64>,
         plc: Option<String>,
         name: Option<String>,
@@ -207,6 +213,7 @@ impl Op {
             Op::TagAddFull { .. } => "tag_add_full",
             Op::TagUpdate { .. } => "tag_update",
             Op::TagDisable { .. } => "tag_disable",
+            Op::TagDelete { .. } => "tag_delete",
             Op::TagEnable { .. } => "tag_enable",
             Op::TagRevalidate { .. } => "tag_revalidate",
             Op::SetCreate { .. } => "set_create",
@@ -564,6 +571,64 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
             Ok(OpOutput::ok_data(
                 format!("tag_id={tag_id} enabled=0 apply_state=pending"),
                 serde_json::json!({"tag_id": tag_id, "enabled": 0, "apply_state": "pending"}),
+            ))
+        }
+
+        Op::TagDelete { tag_id, plc, name } => {
+            let tag_id = resolve_tag_id(conn, tag_id, plc.as_deref(), name.as_deref())?;
+            let plc_id: Option<i64> = conn
+                .query_row(
+                    "SELECT plc_id FROM tag WHERE id = ?1",
+                    rusqlite::params![tag_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            if plc_id.is_none() {
+                return Ok(OpOutput::fail(format!("tag {tag_id}: not found")));
+            }
+            // Remove the tag and every row that references it. `metric_set_tag`
+            // is ON DELETE CASCADE, but `sample`, `sample_rollup`,
+            // `event_marker`, and `config_apply` are not, so clear them first
+            // (in one transaction) or the foreign-key check would block the
+            // delete.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM sample WHERE tag_id = ?1",
+                rusqlite::params![tag_id],
+            )?;
+            tx.execute(
+                "DELETE FROM sample_rollup WHERE tag_id = ?1",
+                rusqlite::params![tag_id],
+            )?;
+            tx.execute(
+                "DELETE FROM event_marker WHERE tag_id = ?1",
+                rusqlite::params![tag_id],
+            )?;
+            tx.execute(
+                "DELETE FROM config_apply WHERE tag_id = ?1",
+                rusqlite::params![tag_id],
+            )?;
+            tx.execute("DELETE FROM tag WHERE id = ?1", rusqlite::params![tag_id])?;
+            tx.commit()?;
+            // Rebuild this PLC's plans so a deleted *active* tag leaves the poll
+            // set (no-op for already-disabled tags). Scoped to the PLC because
+            // the tag row — and any Tag-scoped apply referencing it — is gone.
+            if let Some(pid) = plc_id {
+                let _ = db::config_apply::schedule(
+                    conn,
+                    ApplyScope::Plc,
+                    Some(pid),
+                    None,
+                    None,
+                    None,
+                    &format!("tag_delete id={tag_id}"),
+                    db::config_apply::PLAN_COOLDOWN_MS,
+                    None,
+                );
+            }
+            Ok(OpOutput::ok_data(
+                format!("tag_id={tag_id} deleted"),
+                serde_json::json!({"tag_id": tag_id, "deleted": true}),
             ))
         }
 
@@ -1242,6 +1307,70 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn op_tag_delete_removes_tag_and_non_cascade_children() {
+        let conn = mem();
+        seed_tag(&conn, 1);
+        // Disabling schedules a `config_apply` row referencing the tag.
+        // `config_apply` has no ON DELETE CASCADE, so deleting the tag must
+        // clear it first or the FK check blocks the delete.
+        run(
+            &conn,
+            Op::TagDisable {
+                tag_id: Some(1),
+                plc: None,
+                name: None,
+            },
+        )
+        .unwrap();
+        let ca_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config_apply WHERE tag_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ca_before >= 1, "expected a config_apply row for the tag");
+
+        let out = run(
+            &conn,
+            Op::TagDelete {
+                tag_id: Some(1),
+                plc: None,
+                name: None,
+            },
+        )
+        .unwrap();
+        assert!(out.ok);
+
+        let tags: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tag WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        let ca_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config_apply WHERE tag_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags, 0, "tag row should be gone");
+        assert_eq!(ca_after, 0, "config_apply rows should be gone");
+
+        // Unknown id -> not ok (no panic, no FK error).
+        assert!(
+            !run(
+                &conn,
+                Op::TagDelete {
+                    tag_id: Some(999),
+                    plc: None,
+                    name: None
+                }
+            )
+            .unwrap()
+            .ok
+        );
     }
 
     #[test]

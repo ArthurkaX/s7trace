@@ -134,6 +134,7 @@ fn supports_remote(cmd: &Command) -> bool {
             | Command::TagAdd { .. }
             | Command::TagUpdate { .. }
             | Command::TagDisable { .. }
+            | Command::TagDelete { .. }
             | Command::TagEnable { .. }
             | Command::TagRevalidate { .. }
             | Command::Read { .. }
@@ -167,6 +168,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::TagAdd { .. } => "tag-add",
         Command::TagUpdate { .. } => "tag-update",
         Command::TagDisable { .. } => "tag-disable",
+        Command::TagDelete { .. } => "tag-delete",
         Command::TagEnable { .. } => "tag-enable",
         Command::TagRevalidate { .. } => "tag-revalidate",
         Command::Read { .. } => "read",
@@ -311,6 +313,15 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             cli,
             conn,
             engine::ops::Op::TagDisable {
+                tag_id: *tag_id,
+                plc: plc.clone(),
+                name: name.clone(),
+            },
+        ),
+        Command::TagDelete { tag_id, plc, name } => run_op(
+            cli,
+            conn,
+            engine::ops::Op::TagDelete {
                 tag_id: *tag_id,
                 plc: plc.clone(),
                 name: name.clone(),

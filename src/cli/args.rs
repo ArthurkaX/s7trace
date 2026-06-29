@@ -258,6 +258,23 @@ pub enum Command {
         name: Option<String>,
     },
 
+    /// Delete a tag entirely (removes the row and its samples/rollups/events;
+    /// metric-set membership cascades). Use for tags that are wrong for this
+    /// PLC (e.g. a DB that does not exist). Routed to the server with `-r`.
+    TagDelete {
+        /// Tag ID to delete.
+        #[arg(long = "id")]
+        tag_id: Option<i64>,
+
+        /// PLC name (alternative to --id).
+        #[arg(long = "plc")]
+        plc: Option<String>,
+
+        /// Tag name (alternative to --id, requires --plc).
+        #[arg(long = "name")]
+        name: Option<String>,
+    },
+
     /// Enable a disabled tag (re-add to plans).
     TagEnable {
         /// Tag ID to enable.

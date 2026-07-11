@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="300" viewBox="0 0 1000 300" role="img" aria-labelledby="title desc">
+  <title id="title">s7trace architecture data flow</title>
+  <desc id="desc">The PLC is read by pollers into a current-value snapshot that is persisted to SQLite. The server and its durable queue update the snapshot, while the CLI and read-only SQL read history back out of SQLite.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57534e"/>
+    </marker>
+    <style>
+      .name { font: 600 16px 'Segoe UI', Arial, sans-serif; fill: #1c1917; }
+      .sub { font: 400 12px Consolas, 'Courier New', monospace; fill: #57534e; }
+      .label { font: 400 11px Consolas, 'Courier New', monospace; fill: #57534e; }
+      .node { fill: #ffffff; stroke: #1c1917; stroke-width: 1.2; }
+      .external { fill: rgba(28,25,23,0.03); stroke: rgba(28,25,23,0.35); stroke-width: 1; }
+      .store { fill: rgba(28,25,23,0.05); stroke: #57534e; stroke-width: 1.2; }
+      .focal { fill: rgba(181,82,58,0.08); stroke: #b5523a; stroke-width: 2; }
+      .line { fill: none; stroke: #57534e; stroke-width: 1.4; marker-end: url(#arrow); }
+      .mask { fill: #faf7f2; }
+    </style>
+  </defs>
+
+  <rect width="1000" height="300" fill="#faf7f2"/>
+
+  <!-- Top row: acquisition path -->
+  <rect x="40" y="64" width="120" height="72" rx="6" class="external"/>
+  <text x="72" y="98" class="name">PLC</text>
+  <text x="60" y="120" class="sub">S7-300 / 400</text>
+
+  <rect x="232" y="64" width="140" height="72" rx="6" class="node"/>
+  <text x="266" y="98" class="name">pollers</text>
+  <text x="252" y="120" class="sub">serialized reads</text>
+
+  <rect x="444" y="56" width="180" height="88" rx="6" class="node"/>
+  <text x="466" y="90" class="name">current-value</text>
+  <text x="466" y="110" class="name">snapshot</text>
+
+  <!-- Store -->
+  <path d="M 760 76 C 760 60, 900 60, 900 76 L 900 168 C 900 184, 760 184, 760 168 Z" class="store"/>
+  <ellipse cx="830" cy="76" rx="70" ry="18" class="store"/>
+  <text x="806" y="120" class="name">SQLite</text>
+  <text x="772" y="150" class="sub">history · events</text>
+  <text x="772" y="168" class="sub">configuration</text>
+
+  <!-- Bottom row: control / read path -->
+  <rect x="232" y="204" width="180" height="72" rx="6" class="focal"/>
+  <text x="254" y="238" class="name">server / queue</text>
+  <text x="254" y="260" class="sub">durable command state</text>
+
+  <rect x="500" y="204" width="220" height="72" rx="6" class="node"/>
+  <text x="522" y="238" class="name">CLI / read-only SQL</text>
+  <text x="522" y="260" class="sub">engineers · LLM agents</text>
+
+  <!-- Connectors: acquisition -->
+  <path d="M 160 100 L 232 100" class="line"/>
+  <rect x="168" y="82" width="52" height="16" class="mask"/>
+  <text x="172" y="93" class="label">poll</text>
+
+  <path d="M 372 100 L 444 100" class="line"/>
+
+  <path d="M 624 100 L 760 100" class="line"/>
+  <rect x="648" y="82" width="72" height="16" class="mask"/>
+  <text x="652" y="93" class="label">persist</text>
+
+  <!-- server updates snapshot (up) -->
+  <path d="M 322 204 L 322 170 L 500 170 L 500 144" class="line"/>
+  <rect x="356" y="162" width="66" height="16" class="mask"/>
+  <text x="360" y="173" class="label">update</text>
+
+  <!-- SQLite read back to CLI (down) -->
+  <path d="M 812 184 L 812 240 L 720 240" class="line"/>
+  <rect x="744" y="222" width="60" height="16" class="mask"/>
+  <text x="748" y="233" class="label">read</text>
+
+  <!-- CLI drives server queue -->
+  <path d="M 500 240 L 412 240" class="line"/>
+  <rect x="430" y="222" width="66" height="16" class="mask"/>
+  <text x="434" y="233" class="label">commands</text>
+</svg>

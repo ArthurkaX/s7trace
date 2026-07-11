@@ -173,18 +173,9 @@ through its durable queue.
 
 ### Work remotely through the CLI
 
-The two roles are intentionally separated:
-
-```text
-SITE                                               ENGINEER
-
-S7-300/400 ← s7trace server ← VPN/private network → s7trace CLI
-                  ↓                                      ↓
-              SQLite file                         human or LLM agent
-```
-
-Only `s7trace server` must remain on site. The engineer needs the same executable
-and uses `-r` to route commands to that server:
+The two roles are intentionally separated. Only `s7trace server` must remain on
+site. The engineer needs the same executable and uses `-r` to route commands to
+that server:
 
 ```sh
 # Check the recorder from another city
@@ -303,17 +294,20 @@ program structure, PLC addresses, timestamps, and process data.
 
 ## Architecture
 
-```text
-PLC → pollers → current-value snapshot → SQLite
-                         ↑                 ↓
-                    server/queue ← CLI / read-only SQL
-```
+![Data flow: the PLC is read by pollers into a current-value snapshot that is persisted to SQLite; the server and its durable queue update the snapshot, while the CLI and read-only SQL read history back out](img/architecture-dataflow.svg)
 
 - The per-PLC actor owns the PLC connection and serializes all reads.
 - SQLite stores configuration, history, events, and command state.
 - The CLI is the interface for both engineers and LLM agents.
 - Metric sets define focused groups of signals.
 - Datasets separate one investigation from another.
+
+A single SQLite file holds every domain: the topology and configuration that
+define what is recorded, the recorded history and events, and the durable
+command queue. The read-only views along the bottom are the practical entry
+points for the `sql` command.
+
+![Map of the s7trace SQLite schema grouped by domain: topology and configuration tables define what is recorded, history and event tables hold the evidence with sample as the core change history, and command-queue tables form the control plane, with read-only views exposing it all to the sql command](img/schema-map.svg)
 
 See [`docs/architecture.md`](docs/architecture.md) for implementation details.
 

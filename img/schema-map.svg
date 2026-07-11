@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="580" viewBox="0 0 1200 580" role="img" aria-labelledby="title desc">
+  <title id="title">s7trace SQLite schema map</title>
+  <desc id="desc">The SQLite schema grouped by domain. Topology and configuration tables (plc, poll_group, tag, metric_set, dataset and their junctions) define what is recorded. Recorded history and event tables (poll_cycle, read_span, sample, sample_rollup, plc_time_sample, event_marker, raw_probe) hold the evidence, with sample as the core change history keyed by dataset, tag and cycle. Command-queue and control tables (command_request, command_result, config_apply, history_cleanup_policy, schema_meta) form the control plane. A set of read-only views is what the sql command queries.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57534e"/>
+    </marker>
+    <style>
+      .eyebrow { font: 600 11px Consolas, 'Courier New', monospace; letter-spacing: 1.4px; fill: #78716c; }
+      .zone-head { font: 600 11px Consolas, 'Courier New', monospace; letter-spacing: 1.2px; fill: #78716c; }
+      .tname { font: 700 13px Consolas, 'Courier New', monospace; fill: #1c1917; }
+      .trole { font: 400 10px Consolas, 'Courier New', monospace; fill: #78716c; }
+      .note  { font: 400 11px Consolas, 'Courier New', monospace; fill: #57534e; }
+      .label { font: 600 11px Consolas, 'Courier New', monospace; fill: #57534e; }
+      .badge { font: 700 9px Consolas, 'Courier New', monospace; fill: #ffffff; letter-spacing: 0.5px; }
+      .view  { font: 600 12px Consolas, 'Courier New', monospace; fill: #1c1917; }
+      .zone { fill: rgba(28,25,23,0.03); stroke: rgba(28,25,23,0.20); stroke-width: 1; }
+      .chip { fill: #ffffff; stroke: #1c1917; stroke-width: 1; }
+      .chip-focal { fill: rgba(181,82,58,0.08); stroke: #b5523a; stroke-width: 1.6; }
+      .pill { fill: rgba(28,25,23,0.04); stroke: #57534e; stroke-width: 1; }
+      .rootbadge { fill: #b5523a; }
+      .line { fill: none; stroke: #57534e; stroke-width: 1.4; marker-end: url(#arrow); }
+      .mask { fill: #faf7f2; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="580" fill="#faf7f2"/>
+  <text x="40" y="44" class="eyebrow">SQLITE SCHEMA · GROUPED BY DOMAIN · ONE FILE</text>
+
+  <!-- ============ ZONE 1: TOPOLOGY & CONFIG ============ -->
+  <rect x="40" y="64" width="356" height="340" rx="8" class="zone"/>
+  <text x="56" y="92" class="zone-head">TOPOLOGY &amp; CONFIG · WHAT IS RECORDED</text>
+
+  <rect x="56" y="104" width="324" height="30" rx="5" class="chip-focal"/>
+  <text x="70" y="124" class="tname">plc</text>
+  <rect x="102" y="111" width="40" height="16" rx="8" class="rootbadge"/>
+  <text x="110" y="123" class="badge">ROOT</text>
+  <text x="366" y="124" class="trole" text-anchor="end">controllers</text>
+
+  <rect x="56" y="144" width="324" height="30" rx="5" class="chip"/>
+  <text x="70" y="164" class="tname">poll_group</text>
+  <text x="366" y="164" class="trole" text-anchor="end">periods</text>
+
+  <rect x="56" y="184" width="324" height="30" rx="5" class="chip"/>
+  <text x="70" y="204" class="tname">tag</text>
+  <text x="366" y="204" class="trole" text-anchor="end">address · last value</text>
+
+  <rect x="56" y="224" width="324" height="30" rx="5" class="chip"/>
+  <text x="70" y="244" class="tname">metric_set</text>
+  <text x="366" y="244" class="trole" text-anchor="end">focused signal groups</text>
+
+  <rect x="56" y="264" width="324" height="30" rx="5" class="chip"/>
+  <text x="70" y="284" class="tname">metric_set_tag</text>
+  <text x="366" y="284" class="trole" text-anchor="end">set &#8596; tag</text>
+
+  <rect x="56" y="304" width="324" height="30" rx="5" class="chip"/>
+  <text x="70" y="324" class="tname">dataset</text>
+  <text x="366" y="324" class="trole" text-anchor="end">investigations</text>
+
+  <rect x="56" y="344" width="324" height="30" rx="5" class="chip"/>
+  <text x="70" y="364" class="tname">dataset_metric_set</text>
+  <text x="366" y="364" class="trole" text-anchor="end">dataset &#8596; set</text>
+
+  <!-- ============ ZONE 2: HISTORY & EVENTS ============ -->
+  <rect x="428" y="64" width="356" height="340" rx="8" class="zone"/>
+  <text x="444" y="92" class="zone-head">RECORDED HISTORY &amp; EVENTS · THE EVIDENCE</text>
+
+  <rect x="444" y="104" width="324" height="30" rx="5" class="chip"/>
+  <text x="458" y="124" class="tname">poll_cycle</text>
+  <text x="754" y="124" class="trole" text-anchor="end">per-cycle timing</text>
+
+  <rect x="444" y="144" width="324" height="30" rx="5" class="chip"/>
+  <text x="458" y="164" class="tname">read_span</text>
+  <text x="754" y="164" class="trole" text-anchor="end">batched PDU reads</text>
+
+  <rect x="444" y="184" width="324" height="30" rx="5" class="chip-focal"/>
+  <text x="458" y="204" class="tname">sample</text>
+  <text x="754" y="204" class="trole" text-anchor="end">change history · core</text>
+
+  <rect x="444" y="224" width="324" height="30" rx="5" class="chip"/>
+  <text x="458" y="244" class="tname">sample_rollup</text>
+  <text x="754" y="244" class="trole" text-anchor="end">windowed aggregates</text>
+
+  <rect x="444" y="264" width="324" height="30" rx="5" class="chip"/>
+  <text x="458" y="284" class="tname">plc_time_sample</text>
+  <text x="754" y="284" class="trole" text-anchor="end">PLC clock vs host</text>
+
+  <rect x="444" y="304" width="324" height="30" rx="5" class="chip"/>
+  <text x="458" y="324" class="tname">event_marker</text>
+  <text x="754" y="324" class="trole" text-anchor="end">diagnostic events</text>
+
+  <rect x="444" y="344" width="324" height="30" rx="5" class="chip"/>
+  <text x="458" y="364" class="tname">raw_probe</text>
+  <text x="754" y="364" class="trole" text-anchor="end">raw byte captures</text>
+
+  <!-- ============ ZONE 3: COMMAND QUEUE & CONTROL ============ -->
+  <rect x="816" y="64" width="344" height="340" rx="8" class="zone"/>
+  <text x="832" y="92" class="zone-head">COMMAND QUEUE &amp; CONTROL PLANE</text>
+
+  <rect x="832" y="104" width="312" height="30" rx="5" class="chip"/>
+  <text x="846" y="124" class="tname">command_request</text>
+  <text x="1130" y="124" class="trole" text-anchor="end">durable queue</text>
+
+  <rect x="832" y="144" width="312" height="30" rx="5" class="chip"/>
+  <text x="846" y="164" class="tname">command_result</text>
+  <text x="1130" y="164" class="trole" text-anchor="end">outcomes</text>
+
+  <rect x="832" y="184" width="312" height="30" rx="5" class="chip"/>
+  <text x="846" y="204" class="tname">config_apply</text>
+  <text x="1130" y="204" class="trole" text-anchor="end">debounced changes</text>
+
+  <rect x="832" y="224" width="312" height="30" rx="5" class="chip"/>
+  <text x="846" y="244" class="tname">history_cleanup_policy</text>
+  <text x="1130" y="244" class="trole" text-anchor="end">retention</text>
+
+  <rect x="832" y="264" width="312" height="30" rx="5" class="chip"/>
+  <text x="846" y="284" class="tname">schema_meta</text>
+  <text x="1130" y="284" class="trole" text-anchor="end">version · time unit</text>
+
+  <text x="832" y="330" class="note">The CLI enqueues typed commands here;</text>
+  <text x="832" y="348" class="note">the server drains the queue, owns the PLC,</text>
+  <text x="832" y="366" class="note">and applies config changes after a cooldown.</text>
+
+  <!-- ============ SPINE: tag + dataset -> sample ============ -->
+  <path d="M 380 199 L 444 199" class="line"/>
+  <rect x="384" y="181" width="60" height="16" class="mask"/>
+  <text x="388" y="192" class="label">records</text>
+  <text x="390" y="234" class="note" opacity="0"> </text>
+
+  <!-- derived views arrow -->
+  <path d="M 592 404 L 592 438" class="line"/>
+  <rect x="600" y="414" width="150" height="16" class="mask"/>
+  <text x="604" y="425" class="label">derived · read-only</text>
+
+  <!-- ============ VIEWS BAND ============ -->
+  <rect x="40" y="440" width="1120" height="108" rx="8" class="zone"/>
+  <text x="56" y="468" class="zone-head">READ-ONLY VIEWS · WHAT THE sql COMMAND QUERIES</text>
+
+  <rect x="56" y="486" width="168" height="34" rx="6" class="pill"/>
+  <text x="140" y="508" class="view" text-anchor="middle">v_tag_status</text>
+
+  <rect x="238" y="486" width="168" height="34" rx="6" class="pill"/>
+  <text x="322" y="508" class="view" text-anchor="middle">v_metric_set_status</text>
+
+  <rect x="420" y="486" width="168" height="34" rx="6" class="pill"/>
+  <text x="504" y="508" class="view" text-anchor="middle">v_metric_set_member</text>
+
+  <rect x="602" y="486" width="168" height="34" rx="6" class="pill"/>
+  <text x="686" y="508" class="view" text-anchor="middle">v_active_tag</text>
+
+  <rect x="784" y="486" width="168" height="34" rx="6" class="pill"/>
+  <text x="868" y="508" class="view" text-anchor="middle">v_latest_sample</text>
+
+  <rect x="966" y="486" width="168" height="34" rx="6" class="pill"/>
+  <text x="1050" y="508" class="view" text-anchor="middle">v_transition</text>
+</svg>

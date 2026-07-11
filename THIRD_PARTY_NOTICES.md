@@ -5,9 +5,13 @@
 
 - Package: `turbos7` 0.2.1
 - Upstream author: ghouldevourer
-- Upstream repository: <https://github.com/ghouldevourer/turbos7>
+- Published package: <https://crates.io/crates/turbos7/0.2.1>
 - Declared license: MIT OR Apache-2.0
 - Local modifications: see `vendor/turbos7/FORK-PATCH-NOTES.md`
+
+The repository URL recorded in the published package metadata is no longer
+available. This project therefore vendors the reviewed source snapshot instead
+of depending on that repository.
 
 All other Rust dependencies are resolved by Cargo. Their authors and license
 metadata are available from their package manifests and the corresponding

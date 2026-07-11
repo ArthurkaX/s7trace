@@ -21,8 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-# turbos7 is available on crates.io (the GitHub link in its metadata is dead,
-# which is a yellow flag, but the crate is published and downloadable).
+# The published crate is patched to the reviewed source copy in vendor/turbos7.
 turbos7 = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 axum = "0.7"

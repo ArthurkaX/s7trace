@@ -34,7 +34,6 @@ categories = [
     "api-bindings",
 ]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/ghouldevourer/turbos7"
 
 [lib]
 name = "turbos7"

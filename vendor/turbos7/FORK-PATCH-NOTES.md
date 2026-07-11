@@ -1,8 +1,8 @@
 # turbos7 fork patch notes
 
-This is a **local fork** of `turbos7` 0.2.1 (crates.io `MIT OR Apache-2.0`,
-upstream repo `https://github.com/ghouldevourer/turbos7` is **404/dead** as of
-2026-06-26, so this is maintained in-tree). Changes from the published crate:
+This is a **local fork** of `turbos7` 0.2.1 (published on crates.io under
+`MIT OR Apache-2.0`). The repository URL in the package metadata is unavailable,
+so the reviewed source is maintained in-tree. Changes from the published crate:
 
 ---
 

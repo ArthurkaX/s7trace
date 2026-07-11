@@ -2,8 +2,8 @@
 name = "s7trace"
 version = "0.1.0"
 edition = "2021"
-description = "Read-only S7 data collection service for Siemens PLCs"
-repository = "https://github.com/example/s7trace"
+description = "Read-only troubleshooting recorder for Siemens S7-300/400 PLCs"
+repository = "https://github.com/ArthurkaX/s7trace"
 license = "MIT"
 
 [dependencies]

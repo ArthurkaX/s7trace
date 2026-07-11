@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">s7trace troubleshooting workflow</title>
+  <desc id="desc">A controls engineer works with an LLM agent. The agent combines static STEP 7 project information exported by awl-text-sync with runtime evidence obtained through the s7trace CLI from an on-site server, PLC, and SQLite database.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57534e"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <style>
+      .eyebrow { font: 600 11px Consolas, 'Courier New', monospace; letter-spacing: 1.4px; fill: #78716c; }
+      .name { font: 600 17px 'Segoe UI', Arial, sans-serif; fill: #1c1917; }
+      .focal-name { font: 700 22px 'Segoe UI', Arial, sans-serif; fill: #1c1917; }
+      .sub { font: 400 12px Consolas, 'Courier New', monospace; fill: #57534e; }
+      .label { font: 400 11px Consolas, 'Courier New', monospace; fill: #57534e; }
+      .label-blue { font: 600 11px Consolas, 'Courier New', monospace; fill: #2563eb; }
+      .node { fill: #ffffff; stroke: #1c1917; stroke-width: 1.2; }
+      .external { fill: rgba(28,25,23,0.03); stroke: rgba(28,25,23,0.35); stroke-width: 1; }
+      .store { fill: rgba(28,25,23,0.05); stroke: #57534e; stroke-width: 1.2; }
+      .focal { fill: rgba(181,82,58,0.08); stroke: #b5523a; stroke-width: 2; }
+      .line { fill: none; stroke: #57534e; stroke-width: 1.4; marker-end: url(#arrow); }
+      .link { fill: none; stroke: #2563eb; stroke-width: 1.8; marker-end: url(#arrow-blue); }
+      .mask { fill: #faf7f2; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="720" fill="#faf7f2"/>
+
+  <g transform="translate(0,-140)">
+  <text x="72" y="184" class="eyebrow">ENGINEERING · ANYWHERE</text>
+  <text x="824" y="184" class="eyebrow">ON-SITE · CONTROLS NETWORK</text>
+  <line x1="788" y1="180" x2="788" y2="584" stroke="rgba(181,82,58,0.35)" stroke-width="1"/>
+
+  <!-- Static project path -->
+  <rect x="72" y="212" width="180" height="92" rx="6" class="external"/>
+  <text x="92" y="244" class="name">STEP 7 project</text>
+  <text x="92" y="268" class="sub">program · symbols</text>
+  <text x="92" y="286" class="sub">DB layouts</text>
+
+  <rect x="300" y="212" width="180" height="92" rx="6" class="node"/>
+  <text x="320" y="244" class="name">awl-text-sync</text>
+  <text x="320" y="268" class="sub">project → text</text>
+  <text x="320" y="286" class="sub">symbols · DB layouts</text>
+
+  <!-- Human / agent focal conversation -->
+  <rect x="72" y="392" width="180" height="112" rx="6" class="node"/>
+  <text x="92" y="428" class="name">Controls engineer</text>
+  <text x="92" y="454" class="sub">symptoms · constraints</text>
+  <text x="92" y="474" class="sub">review · final decision</text>
+
+  <rect x="300" y="352" width="240" height="192" rx="8" class="focal"/>
+  <text x="328" y="394" class="eyebrow" fill="#b5523a">INVESTIGATION PARTNER</text>
+  <text x="328" y="432" class="focal-name">LLM agent</text>
+  <line x1="328" y1="450" x2="512" y2="450" stroke="rgba(181,82,58,0.35)"/>
+  <text x="328" y="478" class="sub">reads program context</text>
+  <text x="328" y="498" class="sub">selects evidence with engineer</text>
+  <text x="328" y="518" class="sub">tests hypotheses with SQL</text>
+
+  <rect x="612" y="392" width="124" height="112" rx="6" class="node"/>
+  <text x="632" y="428" class="name">s7trace</text>
+  <text x="632" y="450" class="name">CLI</text>
+  <text x="632" y="478" class="sub">typed commands</text>
+  <text x="632" y="496" class="sub">read-only SQL</text>
+
+  <!-- Site components -->
+  <rect x="824" y="352" width="152" height="152" rx="6" class="node"/>
+  <text x="848" y="388" class="eyebrow">ON-SITE CORE</text>
+  <text x="848" y="424" class="name">s7trace server</text>
+  <text x="848" y="452" class="sub">pollers · queue</text>
+  <text x="848" y="472" class="sub">single PLC owner</text>
+
+  <rect x="1016" y="228" width="112" height="100" rx="6" class="external"/>
+  <text x="1036" y="266" class="name">S7-300</text>
+  <text x="1036" y="288" class="name">/ 400 PLC</text>
+  <text x="1036" y="312" class="sub">live process</text>
+
+  <path d="M 1016 412 C 1016 394, 1128 394, 1128 412 L 1128 492 C 1128 510, 1016 510, 1016 492 Z" class="store"/>
+  <ellipse cx="1072" cy="412" rx="56" ry="18" class="store"/>
+  <text x="1038" y="452" class="name">SQLite</text>
+  <text x="1038" y="476" class="sub">history · events</text>
+  <text x="1038" y="494" class="sub">configuration</text>
+
+  <!-- Connectors -->
+  <path d="M 252 258 L 300 258" class="line"/>
+  <rect x="258" y="242" width="36" height="16" class="mask"/>
+  <text x="262" y="253" class="label">export</text>
+
+  <path d="M 390 304 L 390 336 L 420 336 L 420 352" class="line"/>
+  <rect x="400" y="318" width="92" height="16" class="mask"/>
+  <text x="404" y="329" class="label">program context</text>
+
+  <path d="M 252 420 L 300 420" class="line"/>
+  <rect x="256" y="400" width="42" height="16" class="mask"/>
+  <text x="260" y="411" class="label">ask</text>
+
+  <path d="M 300 484 L 252 484" class="line"/>
+  <rect x="256" y="488" width="42" height="16" class="mask"/>
+  <text x="260" y="499" class="label">explain</text>
+
+  <path d="M 540 420 L 612 420" class="line"/>
+  <rect x="548" y="400" width="58" height="16" class="mask"/>
+  <text x="552" y="411" class="label">operate</text>
+
+  <path d="M 612 484 L 540 484" class="line"/>
+  <rect x="548" y="488" width="58" height="16" class="mask"/>
+  <text x="552" y="499" class="label">evidence</text>
+
+  <path d="M 736 420 L 824 420" class="link"/>
+  <rect x="748" y="394" width="64" height="18" class="mask"/>
+  <text x="752" y="407" class="label-blue">VPN / LAN</text>
+
+  <path d="M 824 476 L 736 476" class="link"/>
+
+  <path d="M 936 352 L 936 278 L 1016 278" class="line"/>
+  <rect x="942" y="260" width="72" height="16" class="mask"/>
+  <text x="946" y="271" class="label">read-only poll</text>
+
+  <path d="M 1016 306 L 960 306 L 960 352" class="line"/>
+
+  <path d="M 976 436 L 1016 436" class="line"/>
+  <path d="M 1016 476 L 976 476" class="line"/>
+
+  </g>
+</svg>

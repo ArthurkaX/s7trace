@@ -1,154 +1,122 @@
-# CLI Ergonomics: simplifying metric-set configuration
+# CLI ergonomics: declarative diagnostic sets
 
-Status: design note / proposal. Written 2026-06-26 after building the `tomo2_split` metric set
-(88 tags) against a live server. That build took ~40 mutating CLI calls and ~8.5 min of
-round-trips. Almost all of that cost is structural, not incidental — this note traces it to one
-root cause and proposes fixes in priority order.
+Status: **design note / proposal**, reviewed 2026-07-11. Commands marked as
+proposals do not exist yet.
 
-## What happened (the motivating case)
+## Motivation
 
-Goal: one comprehensive diagnostic set, all tags polled at a single 150 ms cadence. The set was
-assembled from 16 brand-new tags plus 72 tags reused from existing (disabled) sets. Observed cost:
+Building a diagnostic set from many existing tags currently requires several
+independent facts to be reconciled:
 
-- New tags were cheap: `tag-add` already does create + `--set` + `--poll-group` in one call.
-- **Reuse was expensive.** Each reused tag carried its own `poll_group_id`, so unifying the
-  cadence meant `set-add-tag` *then* a per-tag `tag-update --poll-group`. ~70 of those.
-- Offsets for the machine-side ISD telegram (`UDT_RTT_ISD01_Com` at DB1291 base 2022) had to be
-  hand-derived field by field — the most error-prone step.
-- Output parsing fought us: log lines and a banner on stdout, and `sql` injecting `LIMIT`.
+- membership belongs to the metric set;
+- cadence belongs to each tag through `poll_group_id`;
+- a tag has its own `enabled` flag;
+- `set-add-tag` changes membership but does not enable the tag;
+- imported structures still require address and type expansion before they can
+  become tags.
 
-## Root cause: poll cadence is bound to the tag, not the set
+This is manageable for a small investigation but produces many round trips and
+opportunities for drift in a large reused set.
 
-`tag.poll_group_id` lives on the tag. There is no set→group binding, so "this whole set polls at
-150 ms" is not expressible as a single fact — it must be stamped onto every member tag. Every
-downstream pain (the `tag-update` storm, "can't say a set's rate", regrouping requiring an id
-lookup) flows from this one modeling decision.
+## Current capabilities
 
-## Proposals, by leverage
+- `tag-add` can create a tag and attach it to a set and poll group in one call.
+- `tag-import` imports the `signals:` section of a YAML-shaped file and can
+  validate every address.
+- `set-add-tag` accepts a name, ID, comma-separated values, a file, or IDs from
+  a `SELECT` query.
+- `tag-enable` and `tag-disable` are available explicitly.
+- `poll-group-set-period` changes cadence without recreating the group.
+- Bare remote hosts and full URLs are normalized consistently.
 
-### 1. Set-level poll group (biggest win)
+## Proposal 1: declarative `set-apply`
 
-Make the poll group a property of the metric set, with an optional per-tag override:
+One version-controlled file should describe the desired state of a diagnostic
+set. The tool would diff it against live state, show the plan, and reconcile
+missing tags, membership, enabled state, and poll-group assignment. Re-running
+the same file should be a no-op.
 
+```yaml
+plc: line1
+set: intermittent_fault
+poll_group: diagnostic
+period_ms: 150
+
+signals:
+  - name: Sequence.State
+    address: DB10.DBW20
+    type: i16
+  - name: Handshake.Ready
+    address: DB10.DBX30.0
+    type: bool
 ```
-set-create --plc plc2 --name tomo2_split --poll-group diag_split --period-ms 150
+
+Possible interface:
+
+```text
+s7trace -r recorder-host set-apply --file intermittent_fault.yaml --dry-run
+s7trace -r recorder-host set-apply --file intermittent_fault.yaml
 ```
 
-Membership then determines cadence. This alone removes the ~70 `tag-update` calls from the
-motivating case (40 calls → ~5). If per-tag flexibility must stay, model it as "set default group,
-tag may override" rather than "tag is the only source of truth".
+The important property is atomic intent: a complete set should not appear
+healthy while half its members remain disabled or attached to an old cadence.
 
-### 2. Declarative, idempotent set-apply
+## Proposal 2: set-level cadence
 
-One file describing the desired set; the tool diffs against live state and reconciles
-(create missing tags, attach, set group, drop extras). Re-running is a no-op.
+Today cadence is stored on the tag. A set-level default poll group, with an
+optional per-tag override, would make “record this investigation at 150 ms” one
+fact rather than a series of updates.
 
-```
-s7trace set-apply -f tomo2_split.yaml
-```
+This requires a schema and planner decision because one tag may belong to
+multiple sets. The implementation must define whether the fastest enabled set
+wins, duplicate sampling is allowed, or membership is constrained.
 
-This collapses the whole 40-command session into one reviewable, version-controllable artifact,
-and is inherently restart/resume-safe. `tag-import` already ingests a YAML signal file with
-`--set`, `--poll-group`, and `--validate`, but it is append-only ("create"). The extension is
-set-level *reconcile* (diff + prune), not just import. Pairs with #1.
+## Proposal 3: structure-aware expansion
 
-### 3. UDT / struct-aware expansion (S7-specific superpower)
-
-The single most error-prone step was deriving ~20 offsets from a packed UDT by hand. Let the
-importer expand a struct from a base offset:
+The most error-prone part of S7 diagnostics is manually deriving packed UDT
+offsets. A future importer could consume type information exported by
+`awl-text-sync`, expand selected leaves from a DB base address, and emit a
+reviewable signal list.
 
 ```yaml
 - expand_udt:
-    db: 1291
-    base: 2022                 # byte offset of the struct instance in the DB
-    udt: UDT_RTT_ISD01_Com     # parsed from exported AWL/SCL, or an inline field list
-    prefix: ISD                # tag-name prefix -> ISD.Run_State, ISD.Screening_Mode, ...
-    include: [Run_State, Screening_Mode, Fault_Status, Bag_In_Process, Decision_Sent_To_BHS]
-    # omit `include` to take every leaf field
+    db: 10
+    base: 200
+    type: DiagnosticHandshake
+    prefix: Handshake
+    include: [Ready, Request, Acknowledge, FaultCode]
 ```
 
-The tool walks the UDT layout, computes each leaf's offset/type/name, and emits tags. The machine
-side of `tomo2_split` would have been ~3 lines instead of 20 hand-computed addresses. This is
-uniquely valuable for S7 because everything is a packed struct and offset arithmetic is exactly
-what humans get wrong.
+Address generation must remain reviewable before anything reaches a production
+PLC. Validation should use normal read-only `s7trace` reads.
 
-### 4. Idempotent `tag-ensure` (or make `tag-add` an upsert)
+## Proposal 4: stable machine output
 
-One verb that is safe to re-run: given `address` + `set` + `group`, create-if-missing,
-attach-if-not-member, set group. Natural dedupe key is `(plc, address)`. Removes the
-find → add → update dance on the reuse path. (Largely subsumed by #2, but useful on its own for
-quick interactive edits.)
+`status --format json` and `sql --format jsonl` already provide structured
+output, but all commands do not yet share one stable envelope. Remote action
+commands currently print a queue line followed by a result line.
 
-### 5. Clean machine output + stop injecting `LIMIT`
+A future machine mode could emit exactly one compact object containing command
+ID, terminal state, result, error class, and exit code, with diagnostics kept on
+stderr. Human output should remain the default for interactive use.
 
-Two concrete bugs that cost scripting time:
+## Remaining SQL caveat
 
-- **Logs and banner on stdout.** The `applying migration …` log line and the
-  `(remote server: …)` banner are written to stdout, breaking `| jq` / `| python -c json.load`.
-  Send logs + banner to stderr; keep stdout pure payload. Add `--json` to `status` and `sql`.
-- **`sql` auto-appends `LIMIT 200`.** This breaks `PRAGMA` outright and corrupts any query with
-  its own `LIMIT` / trailing `;`. Make it an explicit `--limit` (default off, or wrap only a bare
-  top-level `SELECT`), and never touch `PRAGMA`. Today it silently rewrites valid SQL. See also the
-  `pragma_table_info('tag')` workaround currently needed to introspect columns.
-
-### 6. `-r` consistency
-
-See `fix.md` for the bare-IP-vs-URL bug. Beyond that: one global `--server`, bare-host normalized
-once, identical flag position across all subcommands, and `read-raw` should not require/parse the
-server differently from the read path.
-
-### 7. `tag-update` selection by address
-
-Allow `--address` as a *selector* (not only "new address"), so a tag can be re-pointed or
-regrouped without first resolving its id/name.
+The local SQL path appends `LIMIT` text when it does not detect an existing
+limit. This is fragile for trailing semicolons and some `PRAGMA` statements.
+The remote endpoint applies its limit independently. A future implementation
+should limit rows without rewriting user SQL text.
 
 ## Priority
 
-- **#1 + #2** deliver ~80% of the win: a declarative set whose cadence lives on the set.
-- **#3** removes the main S7-specific error source (offset derivation).
-- **#5** is cheap and unblocks all scripting/automation around the tool.
+1. Declarative `set-apply` provides the largest reduction in round trips and
+   configuration drift.
+2. Stable machine output improves scripting and LLM operation.
+3. Structure-aware expansion removes the most S7-specific source of human
+   address errors.
+4. Set-level cadence should follow only after its multi-set semantics are
+   explicit.
 
-## Sketch: what `tomo2_split.yaml` could look like under #1–#3
-
-```yaml
-set: tomo2_split
-plc: plc2
-poll_group: diag_split
-period_ms: 150
-store_mode: on_change
-description: "Tomo2 fault-split: machine ISD handshake vs BHS coupling/tracking, one timeline"
-
-tags:
-  # machine side — expanded from the ISD telegram UDT
-  - expand_udt: { db: 1291, base: 2022, udt: UDT_RTT_ISD01_Com, prefix: ISD,
-                  include: [Run_State, HBS_RTR, Bag_In_Process, HBS_RTS,
-                            Exit_Bag_Data_Available, Decision_Sent_To_BHS,
-                            Screening_Mode, Fault_Status] }
-  - expand_udt: { db: 1291, base: 2066, udt: UDT_RTT_ISD01_ID, prefix: ISD,
-                  include: [Bag_Decision, LIC, Barcode_Type] }
-
-  # BHS coupling + tracking — explicit addresses (or a third expand_udt over the FB instance)
-  - { address: DB1291.DBW3090, name: FHO2PLT.Rcv_Data_LE_Not_Found, type: i16 }
-  - { address: DB1291.DBW3088, name: FHO2PLT.Data_Coupled_To_PLT,  type: i16 }
-  - { address: DB1291.DBW3420, name: TRS5.UFO_Generated,           type: i16 }
-  # ...
-
-  # decision point
-  - { address: DB1327.DBW32,  name: TDZ40.TimeOut_Lvl4, type: i16 }
-  # ...
-```
-
-`s7trace set-apply -f tomo2_split.yaml` then reconciles the live set to exactly this — idempotent,
-reviewable, diffable in version control.
-
-## Related findings (2026-06-26, round 2)
-
-- **`fix.md`** — two concrete bugs surfaced while building a set by reuse: the `-r` bare-host
-  rejection on mutating commands, and `set-add-tag` not enabling reused members (no `tag-enable`
-  CLI verb, though the `tag_enable` control action already exists server-side). The half-disabled
-  set was silent — a strong argument for #2 (declarative apply would have caught the drift) and #5
-  (clean output / visibility).
-- **`server-ui.md`** — planned task for a native **Win32 control panel** (no web UI) to see and
-  toggle metric sets, and to surface a stalled poll engine (which once ran ~8 h with zero poll
-  cycles while still answering queries). The operate/observe counterpart to the config-as-code
-  direction here.
+See `fix.md` for resolved remote-address and `tag-enable` issues, plus the
+remaining membership/enabled-state caveat. See `server-ui.md` for the current
+local operator window.

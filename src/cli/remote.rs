@@ -300,10 +300,7 @@ mod tests {
 
     #[test]
     fn test_resolve_url_bare_ip_default_port() {
-        assert_eq!(
-            resolve_url("192.0.2.56", 7707),
-            "http://192.0.2.56:7707"
-        );
+        assert_eq!(resolve_url("192.0.2.56", 7707), "http://192.0.2.56:7707");
     }
 
     #[test]

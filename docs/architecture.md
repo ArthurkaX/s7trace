@@ -29,18 +29,21 @@ CLI ──enqueue (HTTP)──▶  command_queue ──claim──▶ command_wo
 - **Client** (the other subcommands): mutating/action commands are routed to a
   running server with `-r HOST`. They are serialized and **enqueued** on the
   durable SQLite command queue; the server claims and executes them and writes
-  a result the client waits for. Read-only `sql` / `admin-sql` may instead run
-  directly against the database file with `--local-db`.
+  a result the client waits for. Read-only `sql` may instead inspect a stopped
+  or copied database with `--local-db`. Write-capable `admin-sql` is explicit
+  local maintenance and must only be used while the server is stopped.
 
 ## Unified command core (`src/engine/ops.rs`)
 
 Every mutating operation is described by one typed value, `Op`
 (`#[serde(tag = "action")]`), and executed by exactly one function,
-`execute(&ExecCtx, op) -> OpOutput`. Both entry points share it:
+`execute(&ExecCtx, op) -> OpOutput`. The server and internal local execution
+path share it:
 
 - the **server** command-worker deserializes a queued `request_json` into an
   `Op` and runs `execute(ExecCtx::server(..), op)` (with live registries);
-- the **CLI** in local mode runs `execute(ExecCtx::local(conn), op)` directly.
+- tests and maintenance code may run `execute(ExecCtx::local(conn), op)`
+  directly. Public action commands require a configured remote server.
 
 `MIGRATED_ACTIONS` gates which actions go through the core; the server routes
 those before the legacy `match` in `workers/command/`. The tags, metric-sets,
@@ -92,6 +95,11 @@ The HTTP layer supports optional bearer-token authentication via the
 `S7TRACE_TOKEN` environment variable; when unset or empty the server is open
 (default). The CLI client sends the matching `Authorization: Bearer …` header
 automatically when the variable is set.
+
+On Windows, the server may also start the embedded native control window in
+`platform/windows.rs`. It reads status from the shared database and enqueues
+typed control requests directly into the durable queue; it does not loop back
+through HTTP. `server --noui` disables it.
 
 ## PLC backend (`src/plc/`)
 

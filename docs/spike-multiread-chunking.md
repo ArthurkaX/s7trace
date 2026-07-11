@@ -1,13 +1,20 @@
-# Spike: Multi-read Chunking in turbos7 Backend
+# Multi-read batching in the turbos7 backend
 
-## What changed and where
+Status: **implemented**. This note records the reason for the batching and
+adaptive-cap logic in `src/plc/turbos7_backend.rs`.
 
-**`src/plc/turbos7_backend.rs`** -- the `read_multi` method on `Turbo7Client` (the `PlcClient`
-impl backed by the turbos7 crate) now splits the input `items` slice into sub-batches and calls
-`client.read_multiple` once per batch, concatenating results **in order** so the returned
-`Vec<ReadResult>` lines up 1:1 with the original input `items`.
+## Problem
 
-A new pure function `plan_batches` was added:
+An S7 multi-read request must fit both the request and response sides of the
+negotiated PDU. Some S7-300 CPUs may also return fewer items than requested even
+when the calculated byte budget fits. Treating that truncated response as a
+complete batch misaligns results with requested addresses and can take an
+otherwise valid polling group offline.
+
+## Current implementation
+
+`Turbo7Client::read_multi` splits input items into ordered sub-batches. The pure
+`plan_batches` function returns ranges into the original item slice:
 
 ```rust
 pub(crate) fn plan_batches(
@@ -17,74 +24,54 @@ pub(crate) fn plan_batches(
 ) -> Vec<Range<usize>>
 ```
 
-`plan_batches` returns ranges into the original slice and is fully unit-testable without a
-live PLC. Each emitted batch respects **both** the negotiated PDU byte budget on the request
-and response sides (using the framing constants from `src/engine/plan.rs`) **and** the
-per-batch item-count cap.
+Every range respects:
 
-**`src/engine/plan.rs`** -- the S7 multi-read framing constants (`S7_MULTI_REQ_HEADER`,
-`S7_MULTI_REQ_PER_ITEM`, `S7_MULTI_RESP_HEADER`, `S7_MULTI_RESP_PER_ITEM`,
-`S7_PDU_SAFETY_MARGIN`) and the `pad_even` helper were promoted from `const`/private to
-`pub(crate)` so the backend can reuse them without duplication.
+- S7 request framing size;
+- expected response framing and payload size;
+- even-byte response padding;
+- the negotiated PDU;
+- an optional per-batch item-count cap.
 
-**Files NOT touched:** `src/plc/client.rs` (trait unchanged), `src/plc/snap7.rs` (unchanged),
-`src/engine/plan.rs` (only visibility changes), no write path code added anywhere.
+Results from successful batches are concatenated in original request order so
+the returned `Vec<ReadResult>` remains one-to-one with the input.
 
-## Knob for the experiment
+## Adaptive item cap
 
-Set `S7TRACE_MULTI_BATCH_MAX` (env var) before starting the daemon. It controls the
-maximum number of items per multi-read batch. Default is `3`.
+`S7TRACE_MULTI_BATCH_MAX` selects the initial item cap. The default is `3`:
 
-| Value | Meaning                                                                |
-|-------|------------------------------------------------------------------------|
-| 3     | Default -- up to 3 items per `read_multiple` call (may be PDU-split). |
-| 2     | At most 2 items per call.                                              |
-| 1     | Single reads -- effectively disables multi-read; one call per item.     |
-| 0     | No item-count cap; rely on PDU byte budget alone for splitting.         |
+| Value | Behaviour |
+|---|---|
+| `3` | Default: at most three items, still subject to PDU splitting |
+| `2` | At most two items per multi-read |
+| `1` | Effectively use one item per call |
+| `0` | Disable the count cap and rely on the PDU budget |
 
-Sweep 3 -> 2 -> 1 on the server. No recompile needed.
+If a response is truncated, that client halves its cap and retries from the
+start. The reduced cap is retained for later calls. At the minimum cap, another
+truncated response becomes an error instead of being accepted ambiguously.
 
-## Experiment protocol
+This adaptation is per client connection; it does not rewrite global
+configuration or affect another PLC.
 
-Run this **on the server host** (the PLCs at 192.168.0.50 / 192.168.0.51:102 are only
-reachable from the server).
+## Diagnostic sweep
 
-1. Rebuild and deploy the updated binary.
-2. Restart the daemon with the default batch size (3):
-   ```
-   set S7TRACE_MULTI_BATCH_MAX=3
-   <start daemon>
-   ```
-3. Wait for a full poll cycle (~10 s) and check:
-   ```
-   s7trace status
-   ```
-   Note: are `rtt` and `plc2` online? What are their RTTs?
-4. Stop the daemon, restart with batch size 2, repeat step 3.
-5. Stop the daemon, restart with batch size 1, repeat step 3.
-6. (Optional) Stop, restart with batch size 0 (PDU-only splitting), repeat step 3.
+When investigating an unfamiliar CPU, restart the server with caps `3`, `2`,
+and `1`, waiting for complete poll cycles between runs. Interpret the result as
+follows:
 
-## Decision table
+| Observation | Likely conclusion |
+|---|---|
+| Recovery only at `1` | Device or library cannot reliably handle multi-item reads |
+| Recovery at `2` or `3` | A conservative item cap is sufficient |
+| Recovery at `0` | PDU byte planning alone is sufficient for that device |
+| No recovery | Investigate address geometry, connection state, and CPU configuration |
 
-Interpret the results of the sweep:
+An item-level S7 address error is different from response truncation. Verify the
+planned DB number, start offset, and length independently; reducing the batch
+size cannot repair an item that extends beyond the DB.
 
-| Recovery at batch=1 only            | turbos7's `read_multiple` has a parsing bug or the PLC has a hard CPU-item limit. Favours building our own S7 client.           |
-|-------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
-| Recovery at batch=2 or 3            | Backend chunking is the real fix. A full rewrite of the S7 stack is lower priority; tune `S7TRACE_MULTI_BATCH_MAX` to the right value. |
-| Recovery even at batch=0 (no cap)   | It was purely a PDU-size miscalculation elsewhere. The planner's `MAX_MULTI_READ_ITEMS` or the backend's framing constants may be off, but chunking at default 3 fixes it. |
-| No recovery at any batch size       | The root cause is not multi-read truncation. Investigate planner errors, connection issues, or CPU-side configuration.          |
+## Related code
 
-## Separate open question: plc2 error_code=0x05 on DB1291@2022
-
-The planner emits a multi-read item for DB1291 starting at byte 2022. When read as a
-single item via `read_db` it succeeds, but inside a multi-read the PLC returns
-`error_code=0x05` (address out of range). This may be a **planner start/len bug** (the
-multi-read item may extend past the end of the DB) and is **not necessarily a protocol
-issue**. Chunking alone may not fix it. If plc2 stays offline after the sweep, check the
-DB1291 item geometry independently.
-
-## Files changed
-
-- `src/plc/turbos7_backend.rs` -- adds `plan_batches()`, `max_batch_items()`, batched `read_multi`
-- `src/engine/plan.rs` -- made framing consts and `pad_even` `pub(crate)`
-- `docs/spike-multiread-chunking.md` -- this file
+- `src/plc/turbos7_backend.rs` — batching, adaptive cap, and tests.
+- `src/engine/plan.rs` — shared S7 framing constants and padding helper.
+- `src/plc/client.rs` — backend-neutral `PlcClient` contract.

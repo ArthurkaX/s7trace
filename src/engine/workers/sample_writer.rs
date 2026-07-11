@@ -97,7 +97,7 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
     let mut span_rowids: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     for s in &batch.spans {
         // read_span has (plc_id, poll_group_id, db_num, byte_offset,
-        // byte_len, active) per docs/schema.sql. `ok` is implicit in
+        // byte_len, active) per the initial migration. `ok` is implicit in
         // the parent poll_cycle row.
         conn.execute(
             "INSERT INTO read_span

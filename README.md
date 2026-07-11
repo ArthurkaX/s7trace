@@ -325,7 +325,8 @@ See [`docs/architecture.md`](docs/architecture.md) for implementation details.
 - [`docs/cli-ergonomics.md`](docs/cli-ergonomics.md) — proposed CLI improvements.
 - [`docs/spike-multiread-chunking.md`](docs/spike-multiread-chunking.md) — S7
   multi-read batching and PDU constraints.
-- [`docs/schema.sql`](docs/schema.sql) — canonical SQLite schema.
+- [`migrations/0001_initial.sql`](migrations/0001_initial.sql) — initial SQLite
+  schema embedded in the binary.
 
 ## Project status
 

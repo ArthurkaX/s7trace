@@ -82,8 +82,8 @@ thin validate-and-enqueue client.
 ## Storage
 
 SQLite in WAL mode (`synchronous=NORMAL`, `busy_timeout=5000`,
-`foreign_keys=ON`; see `db/schema.rs`). The schema lives in
-`migrations/0001_initial.sql`, kept byte-identical to `docs/schema.sql`.
+`foreign_keys=ON`; see `db/schema.rs`). The initial schema lives in
+`migrations/0001_initial.sql` and is embedded in the binary at compile time.
 
 The server holds a single writer `Connection` behind a mutex, shared by the
 workers (SQLite allows one writer). The HTTP API opens its **own** WAL

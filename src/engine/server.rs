@@ -438,11 +438,20 @@ impl Server {
             // few hours without ever holding the database against the writer.
             if tick.is_multiple_of(60) {
                 if let Some(ref c) = totals_conn {
-                    if let Some(policy) = crate::engine::retention::load_policy(c) {
-                        let n = crate::engine::retention::sweep(c, policy, now_us(), 20);
-                        if n > 0 {
-                            info!("cycle retention: deleted {n} poll_cycle rows");
-                        }
+                    let policy = crate::engine::retention::load_policy(c);
+                    let n = policy
+                        .as_ref()
+                        .map(|p| crate::engine::retention::sweep(c, *p, now_us(), 20))
+                        .unwrap_or(0);
+                    // Span cleanup is independent of cycle retention. A user
+                    // may intentionally keep every cycle forever while still
+                    // expecting metadata orphaned by sample deletion to go.
+                    let batch_rows = policy.as_ref().map(|p| p.batch_rows).unwrap_or(10_000);
+                    let spans = crate::engine::retention::sweep_orphan_spans(c, batch_rows, 20);
+                    if n > 0 || spans > 0 {
+                        info!(
+                            "history retention: deleted {n} poll_cycle rows and {spans} orphan read_span rows"
+                        );
                     }
                 }
             }

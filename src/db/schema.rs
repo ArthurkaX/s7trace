@@ -121,8 +121,9 @@ pub fn open_memory() -> Result<Connection> {
 }
 
 /// The current global retention policy, as read back from the database:
-/// `(cutoff_days, cycle_cutoff_days, keep_failed_cycles, delete_batch_rows, enabled)`.
-pub type HistoryPolicy = (Option<i64>, Option<i64>, bool, i64, bool);
+/// `(sample_cutoff_days, cycle_cutoff_days, failed_cycle_cutoff_days,
+/// keep_failed_cycles, delete_batch_rows, enabled)`.
+pub type HistoryPolicy = (Option<i64>, Option<i64>, Option<i64>, bool, i64, bool);
 
 /// Apply a history-retention policy change (if any) against the global row and
 /// read the resulting policy back.
@@ -136,6 +137,7 @@ pub fn apply_history_policy(
     conn: &Connection,
     cycle_days: Option<i64>,
     sample_days: Option<i64>,
+    failed_cycle_days: Option<i64>,
     keep_failed: Option<bool>,
     batch_rows: Option<i64>,
 ) -> Result<HistoryPolicy> {
@@ -143,6 +145,7 @@ pub fn apply_history_policy(
     // reads; per-group rows are not consulted for cycle retention.
     if cycle_days.is_some()
         || sample_days.is_some()
+        || failed_cycle_days.is_some()
         || keep_failed.is_some()
         || batch_rows.is_some()
     {
@@ -164,6 +167,15 @@ pub fn apply_history_policy(
                 rusqlite::params![v],
             )?;
         }
+        if let Some(d) = failed_cycle_days {
+            // 0 means "keep failed cycles forever" when keep_failed is true.
+            let v = if d > 0 { Some(d) } else { None };
+            conn.execute(
+                "UPDATE history_cleanup_policy SET failed_cycle_cutoff_days = ?1
+                 WHERE poll_group_id IS NULL",
+                rusqlite::params![v],
+            )?;
+        }
         if let Some(k) = keep_failed {
             conn.execute(
                 "UPDATE history_cleanup_policy SET keep_failed_cycles = ?1
@@ -181,16 +193,18 @@ pub fn apply_history_policy(
     }
 
     let row = conn.query_row(
-        "SELECT cutoff_days, cycle_cutoff_days, keep_failed_cycles, delete_batch_rows, enabled
+        "SELECT cutoff_days, cycle_cutoff_days, failed_cycle_cutoff_days,
+                keep_failed_cycles, delete_batch_rows, enabled
          FROM history_cleanup_policy WHERE poll_group_id IS NULL",
         [],
         |r| {
             Ok((
                 r.get::<_, Option<i64>>(0)?,
                 r.get::<_, Option<i64>>(1)?,
-                r.get::<_, i64>(2)? != 0,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)? != 0,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, i64>(3)? != 0,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)? != 0,
             ))
         },
     );
@@ -246,6 +260,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(days, Some(14));
+        let failed_days: Option<i64> = conn
+            .query_row(
+                "SELECT failed_cycle_cutoff_days FROM history_cleanup_policy
+                 WHERE poll_group_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_days, Some(30));
 
         // ...and re-running the runner is a no-op rather than an error.
         // `ALTER TABLE ADD COLUMN` would fail if 0002 were applied twice.

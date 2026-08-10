@@ -169,6 +169,7 @@ pub enum Op {
     HistoryPolicy {
         cycle_days: Option<i64>,
         sample_days: Option<i64>,
+        failed_cycle_days: Option<i64>,
         keep_failed: Option<bool>,
         batch_rows: Option<i64>,
     },
@@ -1172,14 +1173,16 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
         Op::HistoryPolicy {
             cycle_days,
             sample_days,
+            failed_cycle_days,
             keep_failed,
             batch_rows,
         } => {
-            let (cutoff, cycle_cutoff, keep_failed, batch, enabled) =
+            let (cutoff, cycle_cutoff, failed_cycle_cutoff, keep_failed, batch, enabled) =
                 db::schema::apply_history_policy(
                     conn,
                     cycle_days,
                     sample_days,
+                    failed_cycle_days,
                     keep_failed,
                     batch_rows,
                 )?;
@@ -1188,14 +1191,16 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 None => "keep forever".into(),
             };
             let summary = format!(
-                "enabled={enabled} sample_history={} cycle_history={} keep_failed_cycles={keep_failed} delete_batch_rows={batch}",
+                "enabled={enabled} sample_history={} cycle_history={} failed_cycle_history={} use_failed_cutoff={keep_failed} delete_batch_rows={batch}",
                 fmt(cutoff),
-                fmt(cycle_cutoff)
+                fmt(cycle_cutoff),
+                fmt(failed_cycle_cutoff)
             );
             Ok(OpOutput::ok_data(
                 summary,
                 serde_json::json!({
                     "cycle_cutoff_days": cycle_cutoff,
+                    "failed_cycle_cutoff_days": failed_cycle_cutoff,
                     "cutoff_days": cutoff,
                     "keep_failed_cycles": keep_failed,
                     "delete_batch_rows": batch,
@@ -1638,6 +1643,7 @@ mod tests {
             Op::HistoryPolicy {
                 cycle_days: Some(0),
                 sample_days: None,
+                failed_cycle_days: Some(0),
                 keep_failed: Some(false),
                 batch_rows: Some(999_999_999),
             },
@@ -1651,15 +1657,17 @@ mod tests {
         );
         assert_eq!(out.data["delete_batch_rows"], 100_000);
         // Values read back from the DB directly.
-        let (ccd, kfc, dbr): (Option<i64>, i64, i64) = conn
+        let (ccd, fcd, kfc, dbr): (Option<i64>, Option<i64>, i64, i64) = conn
             .query_row(
-                "SELECT cycle_cutoff_days, keep_failed_cycles, delete_batch_rows
+                "SELECT cycle_cutoff_days, failed_cycle_cutoff_days,
+                        keep_failed_cycles, delete_batch_rows
                  FROM history_cleanup_policy WHERE poll_group_id IS NULL",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(ccd, None, "--cycle-days 0 must store NULL");
+        assert_eq!(fcd, None, "--failed-cycle-days 0 must store NULL");
         assert_eq!(kfc, 0, "keep_failed=false must store 0");
         assert_eq!(dbr, 100_000, "batch_rows above max must clamp to 100000");
 
@@ -1669,6 +1677,7 @@ mod tests {
             Op::HistoryPolicy {
                 cycle_days: Some(21),
                 sample_days: None,
+                failed_cycle_days: None,
                 keep_failed: None,
                 batch_rows: None,
             },

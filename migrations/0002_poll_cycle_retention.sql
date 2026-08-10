@@ -48,17 +48,19 @@ CREATE INDEX IF NOT EXISTS ix_plc_time_sample_cycle
 -- `cycle_cutoff_days` is separate from `cutoff_days` (which bounds sample
 -- history) because the two have very different value per byte: cycle rows are
 -- diagnostics worth days, samples are the product worth months.
--- `keep_failed_cycles` retains ok=0 rows past the cutoff, so the record of an
--- outage outlives the routine cycles around it.
+-- `keep_failed_cycles` applies the separate failed-cycle cutoff, so the record
+-- of an outage outlives routine cycles without making failure history endless.
 ALTER TABLE history_cleanup_policy ADD COLUMN cycle_cutoff_days INTEGER;
+ALTER TABLE history_cleanup_policy ADD COLUMN failed_cycle_cutoff_days INTEGER;
 ALTER TABLE history_cleanup_policy ADD COLUMN keep_failed_cycles INTEGER NOT NULL DEFAULT 1;
 
 -- Global default policy (poll_group_id NULL = applies to every group).
 -- 14 days of cycle history at the observed 20-40 rows/s is ~25-50M rows, so
 -- this is a ceiling rather than a target; operators tighten it per site.
 INSERT INTO history_cleanup_policy (poll_group_id, cutoff_days, cycle_cutoff_days,
-                                    delete_batch_rows, keep_failed_cycles, enabled)
-SELECT NULL, NULL, 14, 10000, 1, 1
+                                    failed_cycle_cutoff_days, delete_batch_rows,
+                                    keep_failed_cycles, enabled)
+SELECT NULL, NULL, 14, 30, 10000, 1, 1
 WHERE NOT EXISTS (
     SELECT 1 FROM history_cleanup_policy WHERE poll_group_id IS NULL AND enabled = 1
 );

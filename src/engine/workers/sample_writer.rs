@@ -17,6 +17,21 @@ use crate::engine::snapshot::Snapshot;
 use crate::types::*;
 
 fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::Error> {
+    // Retention runs on a separate connection. Keep the cycle, spans, samples,
+    // rollups and events atomic so orphan-span cleanup cannot observe the
+    // interval after a span insert but before its sample insert.
+    let tx = conn.unchecked_transaction()?;
+    let result = write_samples_inner(&tx, batch);
+    match result {
+        Ok(()) => {
+            tx.commit()?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn write_samples_inner(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::Error> {
     let ci = &batch.cycle_info;
 
     // Update PLC runtime status (last_ok_ts / last_error / connectivity)
@@ -94,10 +109,16 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
     )?;
     let cycle_id = conn.last_insert_rowid();
 
-    // Insert one read_span per physical S7 read, and remember the rowid
-    // for each cycle-local span id.
+    // Insert only spans that are referenced by stored samples. Persisting one
+    // row for every physical read made failed/on-change cycles create millions
+    // of permanently orphaned read_span rows.
     let mut span_rowids: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let referenced_spans: std::collections::HashSet<i64> =
+        batch.samples.iter().filter_map(|s| s.span_id).collect();
     for s in &batch.spans {
+        if !referenced_spans.contains(&s.span_id) {
+            continue;
+        }
         // read_span has (plc_id, poll_group_id, db_num, byte_offset,
         // byte_len, active) per the initial migration. `ok` is implicit in
         // the parent poll_cycle row.

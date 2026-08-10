@@ -19,8 +19,10 @@ use tracing::{debug, warn};
 pub struct CyclePolicy {
     /// Cycles finished more than this many days ago are eligible.
     pub cutoff_days: i64,
-    /// Retain `ok = 0` rows past the cutoff, so the record of an outage
-    /// outlives the routine cycles around it.
+    /// Separate retention window for failed cycles. `None` deliberately means
+    /// forever, but the fresh-database default is bounded.
+    pub failed_cutoff_days: Option<i64>,
+    /// Use the separate failed-cycle cutoff instead of the normal cutoff.
     pub keep_failed: bool,
     /// Rows per DELETE statement.
     pub batch_rows: i64,
@@ -33,24 +35,27 @@ pub struct CyclePolicy {
 /// table's size depending on which group happened to fail most.
 pub fn load_policy(conn: &Connection) -> Option<CyclePolicy> {
     conn.query_row(
-        "SELECT cycle_cutoff_days, keep_failed_cycles, delete_batch_rows
+        "SELECT cycle_cutoff_days, failed_cycle_cutoff_days,
+                keep_failed_cycles, delete_batch_rows
          FROM history_cleanup_policy
          WHERE poll_group_id IS NULL AND enabled = 1",
         [],
         |r| {
             Ok((
                 r.get::<_, Option<i64>>(0)?,
-                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
             ))
         },
     )
     .ok()
-    .and_then(|(days, keep_failed, batch)| {
+    .and_then(|(days, failed_days, keep_failed, batch)| {
         // A NULL or non-positive cutoff means "keep everything" — the setting
         // is absent, not zero days.
         days.filter(|d| *d > 0).map(|cutoff_days| CyclePolicy {
             cutoff_days,
+            failed_cutoff_days: failed_days.filter(|d| *d > 0),
             keep_failed: keep_failed != 0,
             batch_rows: batch.clamp(100, 100_000),
         })
@@ -65,7 +70,11 @@ pub fn load_policy(conn: &Connection) -> Option<CyclePolicy> {
 /// database against the writer for as long as that took.
 pub fn sweep(conn: &Connection, policy: CyclePolicy, now_us: i64, max_batches: u32) -> i64 {
     let cutoff = now_us - policy.cutoff_days * 86_400_000_000;
-    let keep_failed = i64::from(policy.keep_failed);
+    let failed_cutoff = policy
+        .failed_cutoff_days
+        .filter(|d| *d > 0)
+        .map(|days| now_us - days * 86_400_000_000);
+    let use_failed_cutoff = i64::from(policy.keep_failed);
     let mut deleted = 0;
 
     for _ in 0..max_batches {
@@ -76,14 +85,19 @@ pub fn sweep(conn: &Connection, policy: CyclePolicy, now_us: i64, max_batches: u
             "DELETE FROM poll_cycle
              WHERE rowid IN (
                SELECT rowid FROM poll_cycle
-               WHERE finished_ts < ?1
-                 AND (?2 = 0 OR ok = 1)
+               WHERE (
+                   (ok = 1 AND finished_ts < ?1)
+                   OR (ok = 0 AND (
+                       (?2 = 0 AND finished_ts < ?1)
+                       OR (?2 = 1 AND ?3 IS NOT NULL AND finished_ts < ?3)
+                   ))
+               )
                  AND NOT EXISTS (SELECT 1 FROM sample s WHERE s.cycle_id = poll_cycle.id)
                  AND NOT EXISTS (SELECT 1 FROM event_marker em WHERE em.cycle_id = poll_cycle.id)
                  AND NOT EXISTS (SELECT 1 FROM plc_time_sample pts WHERE pts.cycle_id = poll_cycle.id)
-               LIMIT ?3
+                LIMIT ?4
              )",
-            rusqlite::params![cutoff, keep_failed, policy.batch_rows],
+            rusqlite::params![cutoff, use_failed_cutoff, failed_cutoff, policy.batch_rows],
         );
         match n {
             Ok(0) => break,
@@ -100,6 +114,35 @@ pub fn sweep(conn: &Connection, policy: CyclePolicy, now_us: i64, max_batches: u
             "cycle retention: deleted {deleted} poll_cycle rows older than {} days",
             policy.cutoff_days
         );
+    }
+    deleted
+}
+
+/// Delete spans that no remaining sample references. Spans are metadata for a
+/// stored sample, not an audit log of every failed physical read; keeping
+/// unreferenced rows made `read_span` larger than `poll_cycle` in the field.
+pub fn sweep_orphan_spans(conn: &Connection, batch_rows: i64, max_batches: u32) -> i64 {
+    let batch_rows = batch_rows.clamp(100, 100_000);
+    let mut deleted = 0;
+    for _ in 0..max_batches {
+        match conn.execute(
+            "DELETE FROM read_span
+             WHERE rowid IN (
+                 SELECT rs.rowid FROM read_span rs
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM sample s WHERE s.span_id = rs.id
+                 )
+                 LIMIT ?1
+             )",
+            rusqlite::params![batch_rows],
+        ) {
+            Ok(0) => break,
+            Ok(n) => deleted += n as i64,
+            Err(e) => {
+                warn!("read_span retention: {e}");
+                break;
+            }
+        }
     }
     deleted
 }
@@ -153,6 +196,7 @@ mod tests {
         let conn = fixture();
         let p = load_policy(&conn).expect("0002 seeds a global policy");
         assert_eq!(p.cutoff_days, 14);
+        assert_eq!(p.failed_cutoff_days, Some(30));
         assert!(p.keep_failed);
         assert_eq!(p.batch_rows, 10_000);
     }
@@ -173,6 +217,7 @@ mod tests {
         add_cycle(&conn, 2, now - DAY, true); // recent
         let policy = CyclePolicy {
             cutoff_days: 14,
+            failed_cutoff_days: Some(30),
             keep_failed: false,
             batch_rows: 1000,
         };
@@ -190,11 +235,53 @@ mod tests {
         add_cycle(&conn, 2, now - 30 * DAY, true);
         let policy = CyclePolicy {
             cutoff_days: 14,
+            failed_cutoff_days: Some(30),
             keep_failed: true,
             batch_rows: 1000,
         };
         assert_eq!(sweep(&conn, policy, now, 10), 1);
         assert_eq!(cycle_ids(&conn), vec![1]);
+    }
+
+    #[test]
+    fn failed_cycles_are_bounded_by_their_own_cutoff() {
+        let conn = fixture();
+        let now = 100 * DAY;
+        add_cycle(&conn, 1, now - 31 * DAY, false); // failed retention expired
+        add_cycle(&conn, 2, now - 29 * DAY, false); // failed retention remains
+        let policy = CyclePolicy {
+            cutoff_days: 14,
+            failed_cutoff_days: Some(30),
+            keep_failed: true,
+            batch_rows: 1000,
+        };
+        assert_eq!(sweep(&conn, policy, now, 10), 1);
+        assert_eq!(cycle_ids(&conn), vec![2]);
+    }
+
+    #[test]
+    fn orphan_spans_are_removed_but_sample_spans_remain() {
+        let conn = fixture();
+        conn.execute_batch(
+            "INSERT INTO read_span (id, plc_id, poll_group_id, db_num, byte_offset, byte_len)
+             VALUES (1, 1, 1, 1, 0, 2), (2, 1, 1, 1, 2, 2);
+             INSERT INTO tag (id, plc_id, name, address, db_num, byte_offset,
+                              byte_size, data_type, poll_group_id, created_ts, updated_ts)
+             VALUES (1, 1, 't1', 'DB1.DBW0', 1, 0, 2, 'u16', 1, 0, 0);
+             INSERT INTO sample (dataset_id, cycle_id, tag_id, span_id, ts, vi)
+             VALUES (1, NULL, 1, 2, 1, 42);",
+        )
+        .unwrap();
+
+        assert_eq!(sweep_orphan_spans(&conn, 1000, 10), 1);
+        let remaining: Vec<i64> = conn
+            .prepare("SELECT id FROM read_span ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(remaining, vec![2]);
     }
 
     #[test]
@@ -212,6 +299,7 @@ mod tests {
         .unwrap();
         let policy = CyclePolicy {
             cutoff_days: 14,
+            failed_cutoff_days: Some(30),
             keep_failed: false,
             batch_rows: 1000,
         };
@@ -230,6 +318,7 @@ mod tests {
         }
         let policy = CyclePolicy {
             cutoff_days: 14,
+            failed_cutoff_days: Some(30),
             keep_failed: false,
             batch_rows: 2,
         };

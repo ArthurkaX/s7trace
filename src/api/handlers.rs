@@ -19,6 +19,10 @@ const SQL_MAX_TIMEOUT_MS: u64 = 30_000;
 
 /// Default row cap for `/v1/sql` when no `limit` parameter is given.
 const SQL_DEFAULT_LIMIT: u64 = 200;
+/// Absolute response row cap. The query parameter may lower this value, never
+/// raise it; otherwise a remote client could turn the bounded endpoint into a
+/// large response/memory allocation.
+const SQL_MAX_ROWS: u64 = 10_000;
 
 pub(crate) fn handle_tags(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
     let plc = param_owned(query, "plc");
@@ -554,9 +558,10 @@ pub(crate) fn handle_sql(db: &Arc<Mutex<Connection>>, query: &[(String, String)]
         return Response::err(400, "only SELECT/WITH/PRAGMA allowed");
     }
 
-    let limit: u64 = qparam(query, "limit")
+    let requested_limit: u64 = qparam(query, "limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(SQL_DEFAULT_LIMIT);
+    let limit = requested_limit.min(SQL_MAX_ROWS);
 
     // The caller may ask for a longer deadline than the default, up to the
     // server's ceiling. Anything unparseable falls back to the default rather

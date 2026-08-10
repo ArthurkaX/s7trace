@@ -504,7 +504,11 @@ pub enum Command {
         #[arg(long = "sample-days")]
         sample_days: Option<i64>,
 
-        /// Keep failed (ok=0) cycles past the cutoff.
+        /// Days of failed poll_cycle history to keep; 0 keeps failed cycles forever.
+        #[arg(long = "failed-cycle-days")]
+        failed_cycle_days: Option<i64>,
+
+        /// Apply the separate failed-cycle cutoff instead of cycle-days.
         #[arg(long = "keep-failed")]
         keep_failed: Option<bool>,
 

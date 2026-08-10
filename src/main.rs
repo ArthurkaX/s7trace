@@ -503,6 +503,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
         Command::HistoryPolicy {
             cycle_days,
             sample_days,
+            failed_cycle_days,
             keep_failed,
             batch_rows,
         } => {
@@ -517,6 +518,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
                     engine::ops::Op::HistoryPolicy {
                         cycle_days: *cycle_days,
                         sample_days: *sample_days,
+                        failed_cycle_days: *failed_cycle_days,
                         keep_failed: *keep_failed,
                         batch_rows: *batch_rows,
                     },
@@ -526,6 +528,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
                     conn,
                     *cycle_days,
                     *sample_days,
+                    *failed_cycle_days,
                     *keep_failed,
                     *batch_rows,
                 )

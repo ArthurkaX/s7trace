@@ -760,6 +760,19 @@ mod tests {
         assert_eq!(v["rows"][1][0], 2);
     }
 
+    #[test]
+    fn sql_requested_limit_cannot_raise_server_cap() {
+        let db = temp_db();
+        let v = sql_get(
+            &db,
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x - -1 FROM c WHERE x < 10001)
+             SELECT x FROM c",
+            Some("1000000000"),
+        );
+        assert_eq!(v["count"], 10_000);
+        assert_eq!(v["truncated"], true);
+    }
+
     /// Without a limit the default cap applies, but here there are fewer rows
     /// than the cap, so the result is complete and untruncated.
     #[test]

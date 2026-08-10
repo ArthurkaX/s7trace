@@ -105,11 +105,19 @@ pub(crate) fn handle_history_policy(
     conn: &Connection,
     cycle_days: Option<i64>,
     sample_days: Option<i64>,
+    failed_cycle_days: Option<i64>,
     keep_failed: Option<bool>,
     batch_rows: Option<i64>,
 ) -> Result<ExitCode> {
-    match db::schema::apply_history_policy(conn, cycle_days, sample_days, keep_failed, batch_rows) {
-        Ok((cutoff, cycle_cutoff, keep_failed, batch, enabled)) => {
+    match db::schema::apply_history_policy(
+        conn,
+        cycle_days,
+        sample_days,
+        failed_cycle_days,
+        keep_failed,
+        batch_rows,
+    ) {
+        Ok((cutoff, cycle_cutoff, failed_cycle_cutoff, keep_failed, batch, enabled)) => {
             let fmt = |d: Option<i64>| match d {
                 Some(d) => format!("{d} days"),
                 None => "keep forever".into(),
@@ -118,7 +126,8 @@ pub(crate) fn handle_history_policy(
             println!("  enabled           = {enabled}");
             println!("  sample history    = {}", fmt(cutoff));
             println!("  poll_cycle history= {}", fmt(cycle_cutoff));
-            println!("  keep failed cycles= {keep_failed}");
+            println!("  failed cycles    = {}", fmt(failed_cycle_cutoff));
+            println!("  use failed cutoff= {keep_failed}");
             println!("  delete batch rows = {batch}");
             Ok(ExitCode::Ok)
         }

@@ -29,6 +29,7 @@
 mod handlers;
 mod status;
 
+use crate::engine::health::CollectorHealth;
 use crate::version;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -42,13 +43,31 @@ use std::sync::Arc;
 /// Max request body we will buffer (1 MiB). Command payloads are tiny JSON.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// What the request handlers can reach.
+///
+/// The database connection was the whole of it until `/status` had to stop
+/// deriving the collector's liveness from rows the collector writes. `health`
+/// is the running process's own account of itself; it is `None` when the API
+/// is served without a collector behind it (tests, and a future read-only
+/// mode), and `/status` then falls back to the database as before.
+#[derive(Clone)]
+pub(crate) struct ApiState {
+    pub(crate) db: Arc<Mutex<Connection>>,
+    pub(crate) health: Option<Arc<CollectorHealth>>,
+}
+
 /// Start the HTTP API on `bind_addr` (e.g. "127.0.0.1:8080").
 /// Blocks the calling thread; spawn a thread to run in background.
-pub fn serve(db: Arc<Mutex<Connection>>, bind_addr: String) -> std::io::Result<()> {
+pub fn serve(
+    db: Arc<Mutex<Connection>>,
+    bind_addr: String,
+    health: Option<Arc<CollectorHealth>>,
+) -> std::io::Result<()> {
+    let state = ApiState { db, health };
     run_on_runtime(async move {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
         tracing::info!("HTTP API listening on http://{bind_addr}");
-        axum::serve(listener, router(db)).await
+        axum::serve(listener, router(state)).await
     })
 }
 
@@ -57,11 +76,13 @@ pub fn serve(db: Arc<Mutex<Connection>>, bind_addr: String) -> std::io::Result<(
 pub fn serve_with_listener(
     listener: std::net::TcpListener,
     db: Arc<Mutex<Connection>>,
+    health: Option<Arc<CollectorHealth>>,
 ) -> std::io::Result<()> {
+    let state = ApiState { db, health };
     run_on_runtime(async move {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        axum::serve(listener, router(db)).await
+        axum::serve(listener, router(state)).await
     })
 }
 
@@ -79,14 +100,14 @@ where
 }
 
 /// The axum application: a single fallback handler over all routes, with the
-/// shared DB connection as state.
-fn router(db: Arc<Mutex<Connection>>) -> Router {
-    Router::new().fallback(dispatch).with_state(db)
+/// shared state (DB connection + collector health) attached.
+fn router(state: ApiState) -> Router {
+    Router::new().fallback(dispatch).with_state(state)
 }
 
 /// Adapter handler: capture the request, enforce auth, delegate to [`route`]
 /// on a blocking task, and map the [`Response`] back to HTTP.
-async fn dispatch(State(db): State<Arc<Mutex<Connection>>>, req: Request) -> HttpResponse {
+async fn dispatch(State(state): State<ApiState>, req: Request) -> HttpResponse {
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
     // Reconstruct the raw request target so `split_query` parses it exactly as
@@ -116,7 +137,7 @@ async fn dispatch(State(db): State<Arc<Mutex<Connection>>>, req: Request) -> Htt
     let (path, query) = split_query(&target);
     // `route` is synchronous and locks the rusqlite connection; run it off the
     // async worker so a slow query can't stall the runtime.
-    let resp = tokio::task::spawn_blocking(move || route(&db, &method, &path, &query, &body))
+    let resp = tokio::task::spawn_blocking(move || route(&state, &method, &path, &query, &body))
         .await
         .unwrap_or_else(|e| Response::err(500, &format!("handler task failed: {e}")));
 
@@ -210,7 +231,7 @@ fn split_query(target: &str) -> (String, Vec<(String, String)>) {
 }
 
 fn route(
-    db: &Arc<Mutex<Connection>>,
+    state: &ApiState,
     method: &str,
     path: &str,
     query: &[(String, String)],
@@ -218,9 +239,10 @@ fn route(
 ) -> Response {
     // Strip /v1 prefix if present
     let p = path.strip_prefix("/v1").unwrap_or(path);
+    let db = &state.db;
 
     match (method, p) {
-        ("GET", "/status") => status::handle_status(db),
+        ("GET", "/status") => status::handle_status(state),
         ("GET", "/tags") => handlers::handle_tags(db, query),
         ("GET", "/sample") => handlers::handle_sample(db, query),
         ("GET", "/rollup") => handlers::handle_rollup(db, query),
@@ -250,7 +272,7 @@ fn route(
             if name.is_empty() {
                 return Response::err(400, "missing set name");
             }
-            handlers::handle_set_show_api(db, name)
+            handlers::handle_set_show_api(db, name, qparam(query, "plc"))
         }
         ("GET", "/") => Response::json(serde_json::json!({
             "service": "s7trace",
@@ -327,6 +349,7 @@ fn urldecode(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::db::schema;
+    use crate::engine::health::CollectorHealth;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
@@ -396,7 +419,7 @@ mod tests {
                 // Since `serve` takes a String, we re-bind through a custom
                 // path: we own the listener, so we use it directly.
                 let _ = tx.send(port);
-                if serve_with_listener(l, db.clone()).is_err() {
+                if serve_with_listener(l, db.clone(), None).is_err() {
                     // listener gone, exit
                 }
                 return;
@@ -572,6 +595,92 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // /status against a live collector — the 22-day outage, in miniature
+    // ---------------------------------------------------------------------------
+
+    fn status_of(state: &ApiState) -> serde_json::Value {
+        let resp = route(state, "GET", "/v1/status", &[], b"");
+        assert_eq!(resp.status, 200);
+        serde_json::from_str(&resp.body).expect("status body is json")
+    }
+
+    /// The plc row says "online" because that is what the collector last wrote
+    /// before it stopped. Status must report the collector, not the row.
+    #[test]
+    fn status_reports_a_stopped_collector_not_the_last_row_it_wrote() {
+        let db = temp_db();
+        db.lock()
+            .execute(
+                "UPDATE plc SET connectivity = 'online', last_ok_ts = ?1 WHERE id = 1",
+                rusqlite::params![crate::types::now_us()],
+            )
+            .expect("seed plc state");
+
+        let health = Arc::new(CollectorHealth::new());
+        let g = health.group(1, 1, "plc1", 1000);
+        let generation = g.mark_started();
+        g.mark_stopped(generation); // the poller exited behind a dead writer
+
+        let state = ApiState {
+            db,
+            health: Some(health),
+        };
+        let v = status_of(&state);
+        assert_eq!(v["plcs"][0]["health"], "stopped");
+        assert_eq!(v["plcs"][0]["connected"], false);
+        // The stored connectivity is still reported, under both names, so the
+        // discrepancy is visible rather than hidden.
+        assert_eq!(v["plcs"][0]["conn"], "online");
+        assert_eq!(v["plcs"][0]["connectivity"], "online");
+        assert_eq!(v["collector"]["pollers_alive"], 0);
+        assert_eq!(v["collector"]["pollers_total"], 1);
+        assert_eq!(v["collector"]["writer_alive"], false);
+    }
+
+    /// A collector that is polling normally reports `ok` — even for a poll
+    /// group slow enough that the old fixed 60 s staleness window would have
+    /// called it stale.
+    #[test]
+    fn status_reports_a_running_collector_as_ok() {
+        let db = temp_db();
+        let health = Arc::new(CollectorHealth::new());
+        health.writer_started();
+        let g = health.group(1, 1, "plc1", 1000);
+        g.mark_started();
+        health.record_cycle(1, 1, crate::types::now_us(), true, 42.0, None, 3);
+        health.set_db_totals(1_431_943, 12_744_003);
+
+        let state = ApiState {
+            db,
+            health: Some(health),
+        };
+        let v = status_of(&state);
+        assert_eq!(v["plcs"][0]["health"], "ok");
+        assert_eq!(v["plcs"][0]["connected"], true);
+        assert_eq!(v["collector"]["pollers_alive"], 1);
+        assert_eq!(v["collector"]["writer_alive"], true);
+        assert_eq!(v["plcs"][0]["poll_groups"][0]["running"], true);
+        assert_eq!(v["plcs"][0]["poll_groups"][0]["cycles_ok"], 1);
+        assert_eq!(v["metrics"]["last_hour"]["cycles_ok"], 1);
+        // Totals come from the cached snapshot, not from a COUNT(*) scan.
+        assert_eq!(v["metrics"]["poll_cycles_total"], 12_744_003);
+        assert!(v["metrics"]["totals_as_of_ts"].is_i64());
+    }
+
+    /// Without a collector the database is still the only source, and the
+    /// response keeps the same shape.
+    #[test]
+    fn status_without_a_collector_falls_back_to_the_database() {
+        let db = temp_db();
+        let state = ApiState { db, health: None };
+        let v = status_of(&state);
+        assert_eq!(v["collector"]["present"], false);
+        // Never connected, never polled.
+        assert_eq!(v["plcs"][0]["health"], "unavailable");
+        assert_eq!(v["metrics"]["poll_cycles_total"], 0);
+    }
+
+    // ---------------------------------------------------------------------------
     // is_authorized — pure, no env vars, no server, no threads
     // ---------------------------------------------------------------------------
 
@@ -606,5 +715,58 @@ mod tests {
     fn is_authorized_no_scheme_rejected() {
         // Token value without "Bearer " prefix is not accepted
         assert!(!is_authorized(Some("s3cret"), Some("s3cret")));
+    }
+
+    // ---------------------------------------------------------------------------
+    // /v1/sql — normal SELECT, row-cap truncation, and the timeout limit
+    // ---------------------------------------------------------------------------
+
+    fn sql_get(db: &Arc<Mutex<Connection>>, sql: &str, limit: Option<&str>) -> serde_json::Value {
+        let mut query = vec![("query".to_string(), sql.to_string())];
+        if let Some(l) = limit {
+            query.push(("limit".to_string(), l.to_string()));
+        }
+        let resp = handlers::handle_sql(db, &query);
+        assert_eq!(resp.status, 200, "sql resp: {}", resp.body);
+        serde_json::from_str(&resp.body).expect("sql body is json")
+    }
+
+    /// A plain SELECT still runs and reports its rows untruncated.
+    #[test]
+    fn sql_normal_select_works() {
+        let db = temp_db();
+        let v = sql_get(&db, "SELECT id, name FROM plc", None);
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["rows"][0][1], "plc1");
+    }
+
+    /// The row cap stops early and flags the truncation instead of silently
+    /// dropping the tail. A recursive CTE yields 5 rows; `limit=2` keeps 2.
+    /// (Multiplicative CTE so the SQL needs no `+`, which `param_owned` would
+    /// url-decode to a space.)
+    #[test]
+    fn sql_row_cap_truncates_and_flags() {
+        let db = temp_db();
+        let v = sql_get(
+            &db,
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x * 2 FROM c WHERE x < 16)
+             SELECT x FROM c",
+            Some("2"),
+        );
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["rows"][0][0], 1);
+        assert_eq!(v["rows"][1][0], 2);
+    }
+
+    /// Without a limit the default cap applies, but here there are fewer rows
+    /// than the cap, so the result is complete and untruncated.
+    #[test]
+    fn sql_default_cap_does_not_flag_within_budget() {
+        let db = temp_db();
+        let v = sql_get(&db, "SELECT id, name FROM plc", None);
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["truncated"], false);
     }
 }

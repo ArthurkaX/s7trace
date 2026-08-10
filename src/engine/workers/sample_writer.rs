@@ -4,12 +4,14 @@
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use crate::engine::health::CollectorHealth;
 use crate::engine::server::SampleBatch;
 use crate::engine::snapshot::Snapshot;
 use crate::types::*;
@@ -253,40 +255,76 @@ fn write_samples(conn: &Connection, batch: &SampleBatch) -> Result<(), anyhow::E
     Ok(())
 }
 
+/// Why the inner writer loop returned.
+enum WriterExit {
+    /// `running` went false — a normal shutdown.
+    Stopped,
+    /// Every `Sender` was dropped. Only reachable at shutdown, since the
+    /// server holds one for the process lifetime.
+    Disconnected,
+}
+
+/// Restart-supervising entry point for the sample-writer.
+///
+/// This thread is the single consumer of every poller's output: if it stops,
+/// all pollers block, then exit on a closed channel, and collection ends with
+/// no error anywhere except one `warn!`. That is what happened in the field on
+/// 2026-07-19 — 22 days of silence while the HTTP API kept answering.
+///
+/// So the loop below owns the `Receiver` and never gives it up while the
+/// server is running. A panic in `write_samples` (a malformed row, an
+/// unexpected `None`, a poisoned assumption) unwinds into `catch_unwind` here
+/// and the loop resumes, rather than taking the whole pipeline with it. The
+/// channel therefore cannot close under the pollers' feet, and the restart is
+/// visible in `/v1/status` as `writer_restarts`.
 pub(crate) fn sample_writer(
     db: Arc<Mutex<Connection>>,
     rx: Receiver<SampleBatch>,
     running: Arc<AtomicBool>,
     snapshot: Arc<Snapshot>,
+    health: Arc<CollectorHealth>,
 ) {
     info!("sample-writer started");
+    health.writer_started();
 
     // Cache tag metadata so we can update the in-memory snapshot without
     // hitting SQLite on every poll cycle. Populated lazily from the DB.
     // Map: tag_id -> (plc_id, name, address, data_type)
-    use std::collections::HashMap;
+    // Kept outside the restart loop: it is a pure cache, so a panic mid-update
+    // costs at most a re-read, and rebuilding it on every restart would mean
+    // one query per tag right when the writer is already struggling.
     let mut tag_cache: HashMap<i64, (i64, String, String, DataType)> = HashMap::new();
 
+    let mut restarts: u32 = 0;
     while running.load(Ordering::Relaxed) {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(batch) => {
-                let conn = db.lock();
-                if let Err(e) = write_samples(&conn, &batch) {
-                    error!("sample-writer: write error: {e}");
-                }
-                // Update snapshot from every successful poll cycle, regardless
-                // of whether the samples were stored (the snapshot is the live
-                // view for status/API reads — per architecture.md D002).
-                update_snapshot_from_batch(&snapshot, &conn, &mut tag_cache, &batch);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                warn!("sample-writer: channel closed, stopping");
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            writer_loop(&db, &rx, &running, &snapshot, &health, &mut tag_cache)
+        }));
+
+        match outcome {
+            Ok(WriterExit::Stopped) => break,
+            Ok(WriterExit::Disconnected) => {
+                // Nothing left to receive from, and no new senders can appear.
+                warn!("sample-writer: all senders dropped, stopping");
                 break;
+            }
+            Err(_) => {
+                restarts = restarts.saturating_add(1);
+                health.writer_restarted();
+                // Bounded backoff: a panic that reproduces on the next batch
+                // would otherwise spin. The batch that caused it is already
+                // consumed, so the restart usually makes progress.
+                let delay = Duration::from_millis((200u64 << restarts.min(5)).min(5_000));
+                error!(
+                    "sample-writer: panicked while writing (restart {restarts}), \
+                     resuming in {delay:?}"
+                );
+                std::thread::sleep(delay);
             }
         }
     }
 
+    // Final drain: whatever the pollers already sent is still worth storing.
     while let Ok(batch) = rx.try_recv() {
         let conn = db.lock();
         if let Err(e) = write_samples(&conn, &batch) {
@@ -295,7 +333,53 @@ pub(crate) fn sample_writer(
         update_snapshot_from_batch(&snapshot, &conn, &mut tag_cache, &batch);
     }
 
+    health.writer_stopped();
     info!("sample-writer stopped");
+}
+
+/// The actual receive/write loop. Returns instead of looping forever so the
+/// supervisor above can tell a requested shutdown from a panic.
+fn writer_loop(
+    db: &Arc<Mutex<Connection>>,
+    rx: &Receiver<SampleBatch>,
+    running: &Arc<AtomicBool>,
+    snapshot: &Arc<Snapshot>,
+    health: &Arc<CollectorHealth>,
+    tag_cache: &mut HashMap<i64, (i64, String, String, DataType)>,
+) -> WriterExit {
+    while running.load(Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(batch) => {
+                let ci = batch.cycle_info.clone();
+                let conn = db.lock();
+                if let Err(e) = write_samples(&conn, &batch) {
+                    error!("sample-writer: write error: {e}");
+                }
+                // Update snapshot from every successful poll cycle, regardless
+                // of whether the samples were stored (the snapshot is the live
+                // view for status/API reads — per architecture.md D002).
+                update_snapshot_from_batch(snapshot, &conn, tag_cache, &batch);
+                drop(conn);
+
+                // Recorded after the write, and regardless of whether it
+                // succeeded: this is the collector's proof of life, and a
+                // pipeline that reads the PLC but cannot store is a different
+                // fault from one that has stopped entirely.
+                health.record_cycle(
+                    ci.plc_id,
+                    ci.poll_group_id,
+                    ci.finished_ts,
+                    ci.ok,
+                    ci.actual_ms,
+                    ci.error.as_deref(),
+                    batch.samples.len(),
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return WriterExit::Disconnected,
+        }
+    }
+    WriterExit::Stopped
 }
 
 /// Update the in-memory snapshot with tag values from a poll batch.

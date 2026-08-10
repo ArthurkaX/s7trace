@@ -53,6 +53,7 @@ pub const MIGRATED_ACTIONS: &[&str] = &[
     "plc_add",
     "poll_group_add",
     "poll_group_set_period",
+    "history_policy",
 ];
 
 /// A single mutating operation. The `action` tag matches the string the legacy
@@ -165,6 +166,12 @@ pub enum Op {
         before: Option<String>,
         batch_size: u64,
     },
+    HistoryPolicy {
+        cycle_days: Option<i64>,
+        sample_days: Option<i64>,
+        keep_failed: Option<bool>,
+        batch_rows: Option<i64>,
+    },
     HistoryDeleteDataset {
         dataset: String,
     },
@@ -228,6 +235,7 @@ impl Op {
             Op::CollectionStart { .. } => "collection_start",
             Op::CollectionStop { .. } => "collection_stop",
             Op::HistoryClean { .. } => "history_clean",
+            Op::HistoryPolicy { .. } => "history_policy",
             Op::HistoryDeleteDataset { .. } => "history_delete_dataset",
             Op::HistoryVacuum { .. } => "history_vacuum",
             Op::EventAdd { .. } => "event_add",
@@ -512,6 +520,24 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                     rusqlite::params![pg_id, now, tag_id],
                 )?;
             }
+            // An update can produce the same signed/unsigned mismatch an insert
+            // can — either half of the binding may have just moved.
+            if address.is_some() || data_type.is_some() {
+                if let Ok((addr_str, dt)) = conn.query_row(
+                    "SELECT address, data_type FROM tag WHERE id = ?1",
+                    rusqlite::params![tag_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                ) {
+                    if let Ok(dt) = dt.parse::<DataType>() {
+                        crate::db::validation::warn_on_questionable_binding(
+                            name.as_deref().unwrap_or("?"),
+                            &addr_str,
+                            dt,
+                        );
+                    }
+                }
+            }
+
             if let Some(sm) = &store_mode {
                 conn.execute(
                     "UPDATE tag SET store_mode = ?1, updated_ts = ?2, desired_version = desired_version + 1 WHERE id = ?3",
@@ -1143,6 +1169,41 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
             ))
         }
 
+        Op::HistoryPolicy {
+            cycle_days,
+            sample_days,
+            keep_failed,
+            batch_rows,
+        } => {
+            let (cutoff, cycle_cutoff, keep_failed, batch, enabled) =
+                db::schema::apply_history_policy(
+                    conn,
+                    cycle_days,
+                    sample_days,
+                    keep_failed,
+                    batch_rows,
+                )?;
+            let fmt = |d: Option<i64>| match d {
+                Some(d) => format!("{d} days"),
+                None => "keep forever".into(),
+            };
+            let summary = format!(
+                "enabled={enabled} sample_history={} cycle_history={} keep_failed_cycles={keep_failed} delete_batch_rows={batch}",
+                fmt(cutoff),
+                fmt(cycle_cutoff)
+            );
+            Ok(OpOutput::ok_data(
+                summary,
+                serde_json::json!({
+                    "cycle_cutoff_days": cycle_cutoff,
+                    "cutoff_days": cutoff,
+                    "keep_failed_cycles": keep_failed,
+                    "delete_batch_rows": batch,
+                    "enabled": enabled,
+                }),
+            ))
+        }
+
         // ---- not yet migrated ---------------------------------------------
         other => anyhow::bail!("op not yet migrated to unified core: {}", other.action()),
     }
@@ -1565,5 +1626,55 @@ mod tests {
         ] {
             assert!(!run(&conn, op).unwrap().ok);
         }
+    }
+
+    #[test]
+    fn op_history_policy_zero_clamps_and_roundtrips() {
+        let conn = mem();
+        // 0 stores NULL ("keep forever") for cycle retention; batch_rows is
+        // clamped to the 100..=100_000 range; the result round-trips.
+        let out = run(
+            &conn,
+            Op::HistoryPolicy {
+                cycle_days: Some(0),
+                sample_days: None,
+                keep_failed: Some(false),
+                batch_rows: Some(999_999_999),
+            },
+        )
+        .unwrap();
+        assert!(out.ok, "execute failed: {}", out.message);
+        assert_eq!(out.data["cycle_cutoff_days"], serde_json::Value::Null);
+        assert_eq!(
+            out.data["keep_failed_cycles"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(out.data["delete_batch_rows"], 100_000);
+        // Values read back from the DB directly.
+        let (ccd, kfc, dbr): (Option<i64>, i64, i64) = conn
+            .query_row(
+                "SELECT cycle_cutoff_days, keep_failed_cycles, delete_batch_rows
+                 FROM history_cleanup_policy WHERE poll_group_id IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(ccd, None, "--cycle-days 0 must store NULL");
+        assert_eq!(kfc, 0, "keep_failed=false must store 0");
+        assert_eq!(dbr, 100_000, "batch_rows above max must clamp to 100000");
+
+        // A positive cycle retention round-trips.
+        let out = run(
+            &conn,
+            Op::HistoryPolicy {
+                cycle_days: Some(21),
+                sample_days: None,
+                keep_failed: None,
+                batch_rows: None,
+            },
+        )
+        .unwrap();
+        assert!(out.ok);
+        assert_eq!(out.data["cycle_cutoff_days"], 21);
     }
 }

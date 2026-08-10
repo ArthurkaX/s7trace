@@ -74,6 +74,7 @@ pub(crate) fn handle_set_show(
     cli: &Cli,
     set_name_pos: Option<&str>,
     set_flag: Option<&str>,
+    plc: Option<&str>,
 ) -> Result<ExitCode> {
     let set_name = match set_flag.or(set_name_pos) {
         Some(n) => n,
@@ -85,7 +86,7 @@ pub(crate) fn handle_set_show(
     // Remote mode
     if let Some(base) = server_base(cli) {
         let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
-        let data = cli::remote::get_set_show(&base, set_name, timeout)?;
+        let data = cli::remote::get_set_show(&base, set_name, plc, timeout)?;
         println!("Set: {}", data["name"].as_str().unwrap_or(set_name));
         println!("Enabled: {}", data["enabled"].as_bool().unwrap_or(false));
         if let Some(members) = data["members"].as_array() {
@@ -107,35 +108,68 @@ pub(crate) fn handle_set_show(
         return Ok(ExitCode::Ok);
     }
 
-    let set_info = conn
-        .query_row(
-            "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
-         FROM metric_set ms WHERE ms.name = ?1",
-            rusqlite::params![set_name],
-            |row| {
-                let id: i64 = row.get(0)?;
-                let plc_id: i64 = row.get(1)?;
-                let name: String = row.get(2)?;
-                let enabled: bool = row.get::<_, i64>(3)? != 0;
-                let desc: Option<String> = row.get(4)?;
-                Ok((id, plc_id, name, enabled, desc))
-            },
+    // Metric set names are unique only per PLC. If a PLC is given, scope the
+    // lookup to it; otherwise, fail clearly when the name is ambiguous.
+    let (query, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(p) = plc {
+        (
+            "SELECT plc.name, ms.enabled, ms.description
+          FROM metric_set ms
+          JOIN plc ON plc.id = ms.plc_id
+          WHERE ms.name = ?1 AND plc.name = ?2",
+            vec![Box::new(set_name.to_string()), Box::new(p.to_string())],
         )
-        .map_err(|_| anyhow::anyhow!("metric set '{set_name}' not found"))?;
+    } else {
+        (
+            "SELECT plc.name, ms.enabled, ms.description
+          FROM metric_set ms
+          JOIN plc ON plc.id = ms.plc_id
+          WHERE ms.name = ?1",
+            vec![Box::new(set_name.to_string())],
+        )
+    };
 
-    let (_id, _plc_id, _name, enabled, _desc) = &set_info;
+    let mut stmt = conn.prepare(query)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(param_refs.iter().copied()),
+        |row| {
+            let plc_name: String = row.get(0)?;
+            let enabled: bool = row.get::<_, i64>(1)? != 0;
+            let desc: Option<String> = row.get(2)?;
+            Ok((plc_name, enabled, desc))
+        },
+    )?;
+    let sets: Vec<(String, bool, Option<String>)> = rows.filter_map(|r| r.ok()).collect();
+
+    if sets.is_empty() {
+        return Err(anyhow::anyhow!("metric set '{set_name}' not found"));
+    }
+    let (plc_name, enabled, _desc) = if sets.len() == 1 {
+        sets.into_iter().next().unwrap()
+    } else {
+        // Ambiguous across PLCs: list the owners so the operator can disambiguate.
+        let owners = sets
+            .iter()
+            .map(|(n, _, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow::anyhow!(
+            "metric set '{set_name}' exists on multiple PLCs ({owners}); pass --plc to disambiguate"
+        ));
+    };
 
     println!("Set: {set_name}");
+    println!("Plc: {plc_name}");
     println!("Enabled: {enabled}");
 
-    // List members
+    // List members, scoped to the resolved PLC so names do not bleed across sets.
     let mut stmt = conn.prepare(
         "SELECT t.id, t.name, t.address, t.data_type, t.bad, t.bad_class
          FROM v_metric_set_member vmsm
          JOIN tag t ON t.id = vmsm.tag_id
-         WHERE vmsm.metric_set = ?1",
+         WHERE vmsm.metric_set = ?1 AND vmsm.plc = ?2",
     )?;
-    let members = stmt.query_map(rusqlite::params![set_name], |row| {
+    let members = stmt.query_map(rusqlite::params![set_name, plc_name], |row| {
         let id: i64 = row.get(0)?;
         let name: String = row.get(1)?;
         let address: String = row.get(2)?;

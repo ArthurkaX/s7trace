@@ -2,31 +2,39 @@
 
 use rusqlite::Connection;
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use tracing::{debug, info};
 
+use crate::engine::health::CollectorHealth;
 use crate::engine::plan::build_plan;
 use crate::engine::poller::{spawn_poller, OverrunMode};
 use crate::engine::server::{PduCache, PlcRegistry, PollerRegistry, SampleBatch};
 use crate::types::*;
 
 /// Spawn a poller for one (plc, poll_group) pair.
+///
+/// Returns `Ok(false)` when the group has no active tags left, so callers that
+/// supervise pollers can tell "nothing to poll" from "poller running" instead
+/// of retrying a group that no longer exists.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_one_poller(
     plcs: &PlcRegistry,
     pollers: &PollerRegistry,
     pdu_cache: &PduCache,
     sample_tx: &Sender<SampleBatch>,
+    health: &Arc<CollectorHealth>,
     conn: &Connection,
     plc_id: i64,
     plc_name: &str,
     pg_id: i64,
     period_ms: u64,
     overrun_mode: OverrunMode,
-) -> Result<(), anyhow::Error> {
+) -> Result<bool, anyhow::Error> {
     // Build plan
     let tags = load_active_tags(conn, plc_id, pg_id)?;
     if tags.is_empty() {
         debug!("PLC {} group {}: no active tags, skipping", plc_name, pg_id);
-        return Ok(());
+        return Ok(false);
     }
     let pdu_payload = pdu_cache.lock().get(&plc_id).copied().unwrap_or(240);
     let max_gap = 8;
@@ -41,6 +49,7 @@ pub(crate) fn spawn_one_poller(
     };
 
     // Spawn
+    let group_health = health.group(plc_id, pg_id, plc_name, period_ms);
     let handle = spawn_poller(
         plc_id,
         plc_name.to_string(),
@@ -50,6 +59,7 @@ pub(crate) fn spawn_one_poller(
         client,
         sample_tx.clone(),
         overrun_mode,
+        group_health,
     );
 
     // Store. Stop any existing poller for this key first: a respawn (e.g. from
@@ -66,7 +76,7 @@ pub(crate) fn spawn_one_poller(
         "poller started for PLC {} group {} (period={}ms)",
         plc_name, pg_id, period_ms
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Load enabled, non-bad tags for a PLC + poll group from enabled metric sets.

@@ -96,6 +96,39 @@ pub(crate) fn handle_history_delete_dataset(
     Ok(ExitCode::Ok)
 }
 
+/// `history-policy`: show or change the retention policy.
+///
+/// The `poll_cycle` cutoff was previously fixed in the schema with no way to
+/// read or change it from the CLI, which made "configurable retention" true
+/// only for someone willing to open the database by hand.
+pub(crate) fn handle_history_policy(
+    conn: &Connection,
+    cycle_days: Option<i64>,
+    sample_days: Option<i64>,
+    keep_failed: Option<bool>,
+    batch_rows: Option<i64>,
+) -> Result<ExitCode> {
+    match db::schema::apply_history_policy(conn, cycle_days, sample_days, keep_failed, batch_rows) {
+        Ok((cutoff, cycle_cutoff, keep_failed, batch, enabled)) => {
+            let fmt = |d: Option<i64>| match d {
+                Some(d) => format!("{d} days"),
+                None => "keep forever".into(),
+            };
+            println!("retention policy (global):");
+            println!("  enabled           = {enabled}");
+            println!("  sample history    = {}", fmt(cutoff));
+            println!("  poll_cycle history= {}", fmt(cycle_cutoff));
+            println!("  keep failed cycles= {keep_failed}");
+            println!("  delete batch rows = {batch}");
+            Ok(ExitCode::Ok)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::BadInput)
+        }
+    }
+}
+
 pub(crate) fn handle_history_vacuum(conn: &Connection, force: bool) -> Result<ExitCode> {
     if !force {
         // Check for active datasets

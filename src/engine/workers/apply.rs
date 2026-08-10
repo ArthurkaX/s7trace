@@ -9,10 +9,12 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::db;
+use crate::engine::health::CollectorHealth;
 use crate::engine::poller::OverrunMode;
 use crate::engine::server::{PduCache, PlcRegistry, PollerRegistry, SampleBatch};
 use crate::types::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_worker(
     db: Arc<Mutex<Connection>>,
     running: Arc<AtomicBool>,
@@ -20,6 +22,7 @@ pub(crate) fn apply_worker(
     pollers: PollerRegistry,
     pdu_cache: PduCache,
     sample_tx: Sender<SampleBatch>,
+    health: Arc<CollectorHealth>,
     overrun_mode: OverrunMode,
 ) {
     info!("apply-worker started");
@@ -189,6 +192,7 @@ pub(crate) fn apply_worker(
                     &pollers,
                     &pdu_cache,
                     &sample_tx,
+                    &health,
                     &conn,
                     *plc_id,
                     &plc_name,

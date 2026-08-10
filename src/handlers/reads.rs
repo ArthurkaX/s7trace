@@ -16,6 +16,17 @@ pub(crate) fn handle_read(
     data_type: &str,
     fmt: &str,
 ) -> Result<ExitCode> {
+    // Validate local args before any network work so a bad data type or
+    // address isn't masked by a connection error.
+    if let Err(e) = data_type.parse::<crate::types::DataType>() {
+        eprintln!("error: {e}");
+        return Ok(ExitCode::BadInput);
+    }
+    if let Err(e) = crate::types::S7Address::parse(address) {
+        eprintln!("error: {e}");
+        return Ok(ExitCode::BadInput);
+    }
+
     // Remote mode: send to server, wait, print result.
     if let Some(base) = server_base(cli) {
         let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);

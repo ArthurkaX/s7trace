@@ -6,11 +6,13 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::db;
+use crate::engine::health::CollectorHealth;
 use crate::engine::poller::OverrunMode;
 use crate::engine::server::{PduCache, PlcRegistry, PollerRegistry, SampleBatch};
 use crate::engine::snapshot::Snapshot;
 use crate::types::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn execute_control(
     conn: &Connection,
     plcs: &PlcRegistry,
@@ -18,6 +20,7 @@ pub(super) fn execute_control(
     pdu_cache: &PduCache,
     snapshot: &Arc<Snapshot>,
     sample_tx: &Sender<SampleBatch>,
+    health: &Arc<CollectorHealth>,
     overrun_mode: OverrunMode,
     req: &serde_json::Value,
 ) -> Result<(bool, String), anyhow::Error> {
@@ -268,6 +271,7 @@ pub(super) fn execute_control(
                     pollers,
                     pdu_cache,
                     sample_tx,
+                    health,
                     conn,
                     plc_id,
                     plc_name,

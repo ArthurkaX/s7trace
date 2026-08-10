@@ -16,14 +16,18 @@ pub(crate) fn handle_sql(
     query: &str,
     fmt: &str,
     limit: u64,
+    timeout_ms: u64,
 ) -> Result<ExitCode> {
     // Ensure read-only: reject anything that isn't a SELECT or WITH.
     // Remote mode uses the private HTTP transport, but the user interface
     // remains this CLI command.
     if let Some(base) = server_base(cli) {
         let encoded = urlencode(query);
-        let url = format!("/v1/sql?query={}&limit={}", encoded, limit);
-        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
+        let url = format!("/v1/sql?query={encoded}&limit={limit}&timeout_ms={timeout_ms}");
+        // Give the socket a little more than the query deadline, so a query the
+        // server kills reports the server's own message rather than a read timeout.
+        let timeout =
+            std::time::Duration::from_millis(cli.remote_timeout_ms.max(timeout_ms + 2_000));
         let resp = match cli::remote::http_get(&base, &url, timeout) {
             Ok(r) => r,
             Err(e) => {
@@ -38,6 +42,13 @@ pub(crate) fn handle_sql(
                 return Ok(ExitCode::BadInput);
             }
         };
+        // A rejected or interrupted query answers with {"error": ...}. Without
+        // this the CLI printed an empty table and exited 0 — which is how a
+        // /v1/sql that never came back looked like "no rows" in the field.
+        if let Some(msg) = v["error"].as_str() {
+            eprintln!("error: {msg}");
+            return Ok(ExitCode::BadInput);
+        }
         let columns: Vec<String> = v["columns"]
             .as_array()
             .map(|a| {
@@ -68,6 +79,11 @@ pub(crate) fn handle_sql(
             Format::CompactJson => {
                 cli::format::print_columnar_json(&columns, &rows);
             }
+        }
+        // The server stops at the row cap rather than failing, so say so —
+        // otherwise a capped result reads as the complete answer.
+        if v["truncated"].as_bool().unwrap_or(false) {
+            eprintln!("note: output truncated at {limit} rows; raise --limit for more");
         }
         return Ok(ExitCode::Ok);
     }

@@ -186,6 +186,15 @@ pub fn insert_tag(
         )
     };
 
+    // A DBW address is an unsigned word on S7; binding it to signed i16
+    // silently misreports values above 32767 as negative. Warn (not error —
+    // existing configs must keep working) and suggest u16.
+    if word_i16_mismatch(address, data_type) {
+        tracing::warn!(
+            "tag '{name}': {address_str} (DBW word) bound to signed i16; values above 32767 read as negative, consider u16"
+        );
+    }
+
     conn.execute(
         "INSERT INTO tag
             (plc_id, name, address, db_num, byte_offset, bit_offset, byte_size, data_type,
@@ -245,6 +254,30 @@ fn byte_size_label(dt: DataType) -> &'static str {
         DataType::Bool => "X",
         DataType::I16 | DataType::U16 => "W",
         DataType::I32 | DataType::U32 | DataType::F32 => "D",
+    }
+}
+
+/// True when the address is a word (DBW) bound to signed i16 — a likely
+/// sign-extension mistake on S7, where DBW words are unsigned.
+pub(crate) fn word_i16_mismatch(address: &S7Address, data_type: DataType) -> bool {
+    address.area == Some(AddressArea::Word) && data_type == DataType::I16
+}
+
+/// Warn if a tag's address and type disagree about signedness.
+///
+/// Shared by tag creation and tag update: the field case reached the bad
+/// binding through configuration, and an update can produce it just as easily
+/// as an insert — by moving an `i16` tag onto a `DBW` address, or by retyping a
+/// `DBW` tag to `i16`.
+pub(crate) fn warn_on_questionable_binding(name: &str, address_str: &str, data_type: DataType) {
+    let Ok(address) = S7Address::parse(address_str) else {
+        return;
+    };
+    if word_i16_mismatch(&address, data_type) {
+        tracing::warn!(
+            "tag '{name}': {address_str} (DBW word) bound to signed i16; \
+             values above 32767 read as negative, consider u16"
+        );
     }
 }
 
@@ -344,5 +377,39 @@ mod tests {
             .query_row("SELECT last_error FROM plc WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn test_word_i16_mismatch_fires() {
+        // DBW bound to signed i16 should warn (word is unsigned on S7).
+        let addr = S7Address::parse("DB1.DBW0").unwrap();
+        assert!(word_i16_mismatch(&addr, DataType::I16));
+    }
+
+    #[test]
+    fn test_word_u16_no_mismatch() {
+        // DBW bound to unsigned u16 is correct: no warning.
+        let addr = S7Address::parse("DB1.DBW0").unwrap();
+        assert!(!word_i16_mismatch(&addr, DataType::U16));
+        // And a non-word address bound to i16 does not warn either.
+        let dword = S7Address::parse("DB1.DBD0").unwrap();
+        assert!(!word_i16_mismatch(&dword, DataType::I16));
+    }
+
+    #[test]
+    fn test_invalid_type_error_lists_valid_names() {
+        // The parser error must enumerate every accepted type name so the
+        // operator knows what is valid (BUG-6).
+        let err = "int".parse::<DataType>().unwrap_err();
+        for name in DATA_TYPE_NAMES.split(", ") {
+            assert!(
+                err.contains(name),
+                "error '{err}' should list valid type '{name}'"
+            );
+        }
+        // The suggested u16 is what the warning points operators at.
+        assert!("int".parse::<DataType>().is_err());
+        assert!("i16".parse::<DataType>().is_ok());
+        assert!("u16".parse::<DataType>().is_ok());
     }
 }

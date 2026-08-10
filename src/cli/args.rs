@@ -1,3 +1,4 @@
+use crate::types::DATA_TYPE_HELP;
 /// CLI argument definitions using clap derive.
 use clap::{Parser, Subcommand};
 
@@ -24,7 +25,7 @@ use clap::{Parser, Subcommand};
         sets      set-create  set-add-tag  set-remove-tag  set-enable  set-disable  set-list  set-show\n  \
         collect   collection-start  collection-stop\n  \
         inspect   status  read  read-raw  sql  command-list  command-result  command-wait\n  \
-        history   history-clean  history-delete-dataset  history-vacuum\n  \
+        history   history-clean  history-policy  history-delete-dataset  history-vacuum\n  \
         admin     server  admin-sql  tag-revalidate\n\
         \n\
         TARGETS:\n  \
@@ -115,7 +116,8 @@ pub enum Command {
         #[arg(long = "limit", default_value_t = 200)]
         limit: u64,
 
-        /// Query timeout in milliseconds.
+        /// Query timeout in milliseconds. The server caps this at 30000; a
+        /// query that runs past the deadline is interrupted, not queued.
         #[arg(long = "timeout-ms", default_value_t = 5000)]
         timeout_ms: u64,
     },
@@ -316,7 +318,7 @@ pub enum Command {
         address: String,
 
         /// Data type.
-        #[arg(long = "type")]
+        #[arg(long = "type", help = DATA_TYPE_HELP)]
         data_type: String,
 
         /// Output format.
@@ -431,6 +433,10 @@ pub enum Command {
 
     /// Show metric set details.
     SetShow {
+        /// PLC name.
+        #[arg(long = "plc")]
+        plc: Option<String>,
+
         /// Metric set name (positional).
         set_name: Option<String>,
 
@@ -473,17 +479,38 @@ pub enum Command {
         #[arg(long = "plc")]
         plc: String,
 
-        /// Delete samples before this timestamp (epoch microseconds).
+        /// Delete history (samples, rollups, events, PLC time samples, raw
+        /// probes and the poll cycles nothing references) before this
+        /// timestamp, in epoch microseconds.
         #[arg(long = "before-ts")]
         before_ts: Option<i64>,
 
-        /// Delete samples before this datetime (ISO 8601).
+        /// Same cutoff as --before-ts, given as an ISO 8601 datetime.
         #[arg(long = "before")]
         before: Option<String>,
 
         /// Batch size for deletes.
         #[arg(long = "batch-size", default_value_t = 10000)]
         batch_size: u64,
+    },
+
+    /// Show or change the retention policy.
+    HistoryPolicy {
+        /// Days of poll_cycle history to keep; 0 keeps it forever.
+        #[arg(long = "cycle-days")]
+        cycle_days: Option<i64>,
+
+        /// Days of sample history to keep; 0 keeps it forever.
+        #[arg(long = "sample-days")]
+        sample_days: Option<i64>,
+
+        /// Keep failed (ok=0) cycles past the cutoff.
+        #[arg(long = "keep-failed")]
+        keep_failed: Option<bool>,
+
+        /// Rows deleted per statement by the collector's retention sweep.
+        #[arg(long = "batch-rows")]
+        batch_rows: Option<i64>,
     },
 
     /// Delete a stopped dataset.

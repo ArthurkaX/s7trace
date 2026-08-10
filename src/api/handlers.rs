@@ -5,6 +5,21 @@ use std::sync::Arc;
 
 use super::{param_owned, qparam, Response};
 
+/// Max time a `/v1/sql` query may run before it is interrupted. Every request
+/// funnels through a single shared connection, so one runaway scan over a
+/// large table would otherwise hold the mutex — and with it every other
+/// endpoint — for as long as it runs. A watchdog thread holds the connection's
+/// interrupt handle and trips `SQLITE_INTERRUPT` once this deadline passes.
+const SQL_QUERY_TIMEOUT_MS: u64 = 5000;
+
+/// Ceiling for a caller-supplied `timeout_ms`. An operator running a genuinely
+/// heavy report can ask for more than the default, but not for an unbounded
+/// hold on the connection everything else shares.
+const SQL_MAX_TIMEOUT_MS: u64 = 30_000;
+
+/// Default row cap for `/v1/sql` when no `limit` parameter is given.
+const SQL_DEFAULT_LIMIT: u64 = 200;
+
 pub(crate) fn handle_tags(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
     let plc = param_owned(query, "plc");
     let enabled = param_owned(query, "enabled");
@@ -442,39 +457,67 @@ pub(crate) fn handle_set_list_api(
     Response::json(serde_json::json!(items))
 }
 
-pub(crate) fn handle_set_show_api(db: &Arc<Mutex<Connection>>, set_name: &str) -> Response {
+/// A metric set, optionally scoped to one PLC.
+///
+/// Set names are unique per PLC, not globally, so a bare name can match more
+/// than one set. Without a `plc` the query stays as it was — first match wins —
+/// but an ambiguous name is reported rather than silently resolved.
+pub(crate) fn handle_set_show_api(
+    db: &Arc<Mutex<Connection>>,
+    set_name: &str,
+    plc: Option<&str>,
+) -> Response {
     let conn = db.lock();
 
-    let set_info = match conn.query_row(
-        "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
-         FROM metric_set ms WHERE ms.name = ?1",
-        rusqlite::params![set_name],
-        |row| {
-            let id: i64 = row.get(0)?;
-            let plc_id: i64 = row.get(1)?;
-            let name: String = row.get(2)?;
-            let enabled: bool = row.get::<_, i64>(3)? != 0;
-            let desc: Option<String> = row.get(4)?;
-            Ok((id, plc_id, name, enabled, desc))
-        },
-    ) {
+    let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = match &plc {
+        Some(p) => (
+            "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
+             FROM metric_set ms JOIN plc ON plc.id = ms.plc_id
+             WHERE ms.name = ?1 AND plc.name = ?2",
+            vec![&set_name, p],
+        ),
+        None => (
+            "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
+             FROM metric_set ms WHERE ms.name = ?1",
+            vec![&set_name],
+        ),
+    };
+
+    let set_info = match conn.query_row(sql, params.as_slice(), |row| {
+        let id: i64 = row.get(0)?;
+        let plc_id: i64 = row.get(1)?;
+        let name: String = row.get(2)?;
+        let enabled: bool = row.get::<_, i64>(3)? != 0;
+        let desc: Option<String> = row.get(4)?;
+        Ok((id, plc_id, name, enabled, desc))
+    }) {
         Ok(info) => info,
-        Err(_) => return Response::err(404, &format!("metric set '{set_name}' not found")),
+        Err(_) => {
+            return match plc {
+                Some(p) => Response::err(
+                    404,
+                    &format!("metric set '{set_name}' not found on PLC '{p}'"),
+                ),
+                None => Response::err(404, &format!("metric set '{set_name}' not found")),
+            };
+        }
     };
 
     let (id, plc_id, name, enabled, description) = set_info;
 
+    // Members are keyed by set name in the view, so scope them by set id to
+    // avoid pulling in a same-named set that belongs to another PLC.
     let mut stmt = match conn.prepare(
         "SELECT t.id, t.name, t.address, t.data_type, t.bad, t.bad_class
-         FROM v_metric_set_member vmsm
-         JOIN tag t ON t.id = vmsm.tag_id
-         WHERE vmsm.metric_set = ?1",
+         FROM metric_set_tag mst
+         JOIN tag t ON t.id = mst.tag_id
+         WHERE mst.metric_set_id = ?1",
     ) {
         Ok(s) => s,
         Err(e) => return Response::err(500, &format!("query members: {e}")),
     };
 
-    let members: Vec<serde_json::Value> = match stmt.query_map(rusqlite::params![set_name], |row| {
+    let members: Vec<serde_json::Value> = match stmt.query_map(rusqlite::params![id], |row| {
         Ok(serde_json::json!({
             "id": row.get::<_, i64>(0)?,
             "name": row.get::<_, String>(1)?,
@@ -513,51 +556,124 @@ pub(crate) fn handle_sql(db: &Arc<Mutex<Connection>>, query: &[(String, String)]
 
     let limit: u64 = qparam(query, "limit")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(200);
+        .unwrap_or(SQL_DEFAULT_LIMIT);
 
-    let limited_sql = if trimmed.contains(" LIMIT ") {
-        raw.clone()
-    } else {
-        format!("{raw} LIMIT {limit}")
+    // The caller may ask for a longer deadline than the default, up to the
+    // server's ceiling. Anything unparseable falls back to the default rather
+    // than erroring — a bad timeout should not lose the operator their query.
+    let timeout_ms: u64 = qparam(query, "timeout_ms")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(SQL_QUERY_TIMEOUT_MS)
+        .min(SQL_MAX_TIMEOUT_MS);
+
+    // If the caller already wrote a LIMIT, take the smaller of the two so the
+    // row cap can never be widened by the query text.
+    let limit = match raw
+        .to_uppercase()
+        .split(" LIMIT ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(in_query) => limit.min(in_query),
+        None => limit,
     };
 
     let conn = db.lock();
-    let mut stmt = match conn.prepare(&limited_sql) {
-        Ok(s) => s,
-        Err(e) => return Response::err(400, &format!("sql error: {e}")),
-    };
+    // The statement borrows the connection, so it runs inside this block; it
+    // (and the guard) drop before the response body is built below.
+    let (col_names, result, truncated, rows) = {
+        let mut stmt = match conn.prepare(&raw) {
+            Ok(s) => s,
+            Err(e) => return Response::err(400, &format!("sql error: {e}")),
+        };
 
-    let col_count = stmt.column_count();
-    let col_names: Vec<String> = (0..col_count)
-        .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
-        .collect();
-
-    let rows: Vec<Vec<serde_json::Value>> = match stmt.query_map([], |row| {
-        let values: Vec<serde_json::Value> = (0..col_count)
-            .map(|i| match row.get::<_, rusqlite::types::Value>(i) {
-                Ok(v) => match v {
-                    rusqlite::types::Value::Null => serde_json::Value::Null,
-                    rusqlite::types::Value::Integer(n) => serde_json::Value::Number(n.into()),
-                    rusqlite::types::Value::Real(f) => serde_json::Number::from_f64(f)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null),
-                    rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
-                    rusqlite::types::Value::Blob(b) => {
-                        serde_json::Value::String(format!("{b:02x?}"))
-                    }
-                },
-                Err(_) => serde_json::Value::Null,
-            })
+        let col_count = stmt.column_count();
+        let col_names: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
             .collect();
-        Ok(values)
-    }) {
-        Ok(r) => r.filter_map(|x| x.ok()).collect(),
-        Err(e) => return Response::err(400, &format!("sql error: {e}")),
+
+        let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+        let mut truncated = false;
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<Vec<serde_json::Value>> {
+            let values: Vec<serde_json::Value> = (0..col_count)
+                .map(|i| match row.get::<_, rusqlite::types::Value>(i) {
+                    Ok(v) => match v {
+                        rusqlite::types::Value::Null => serde_json::Value::Null,
+                        rusqlite::types::Value::Integer(n) => serde_json::Value::Number(n.into()),
+                        rusqlite::types::Value::Real(f) => serde_json::Number::from_f64(f)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null),
+                        rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
+                        rusqlite::types::Value::Blob(b) => {
+                            serde_json::Value::String(format!("{b:02x?}"))
+                        }
+                    },
+                    Err(_) => serde_json::Value::Null,
+                })
+                .collect();
+            Ok(values)
+        };
+
+        // Arm a watchdog that interrupts the query if it runs past the
+        // deadline. The handle works on the connection from another thread, so
+        // a runaway scan cannot hold the shared mutex — and with it every other
+        // endpoint — for longer than the limit. The query signals the channel
+        // when it is done (or errored), so the watchdog exits immediately on
+        // the normal path.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let handle = conn.get_interrupt_handle();
+        let watchdog = std::thread::spawn(move || {
+            let timeout = std::time::Duration::from_millis(timeout_ms);
+            if done_rx.recv_timeout(timeout).is_err() {
+                // Deadline passed before the query signalled completion.
+                handle.interrupt();
+            }
+        });
+
+        let result = (|| -> rusqlite::Result<()> {
+            let mut q = stmt.query([])?;
+            while let Some(row) = q.next()? {
+                // Stop at the cap instead of appending a LIMIT clause, so a
+                // query that already wrote its own LIMIT cannot bypass it, and
+                // so the caller learns from `truncated` that there was more.
+                if rows.len() >= limit as usize {
+                    truncated = true;
+                    break;
+                }
+                rows.push(map_row(row)?);
+            }
+            Ok(())
+        })();
+
+        // Let the watchdog exit now that the query is finished.
+        let _ = done_tx.send(());
+        watchdog.join().ok();
+
+        (col_names, result, truncated, rows)
     };
+    // The guard is dropped here, before the (potentially large) JSON body is
+    // serialised, so formatting a big result set never holds the connection.
+    drop(conn);
+
+    if let Err(e) = result {
+        // `SQLITE_INTERRUPT` is what the watchdog raises when the deadline
+        // trips; report it as the limit, not as a SQL error.
+        let is_interrupt = matches!(
+            e.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OperationInterrupted)
+        );
+        if is_interrupt {
+            return Response::err(503, &format!("query exceeded the {timeout_ms}ms limit"));
+        }
+        return Response::err(400, &format!("sql error: {e}"));
+    }
 
     Response::json(serde_json::json!({
         "columns": col_names,
         "rows": rows,
         "count": rows.len(),
+        "truncated": truncated,
     }))
 }

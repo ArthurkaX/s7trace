@@ -5,6 +5,23 @@ use tracing::info;
 
 /// Initial schema, embedded in the binary at compile time.
 const MIGRATION_0001: &str = include_str!("../../migrations/0001_initial.sql");
+/// poll_cycle retention config and the time-range indexes it needs.
+const MIGRATION_0002: &str = include_str!("../../migrations/0002_poll_cycle_retention.sql");
+
+/// Embedded migrations, ordered. The first field is the schema version the
+/// migration brings the database *to*; each file ends by writing that value
+/// into `schema_meta.schema_version`.
+///
+/// A migration is applied only when the stored version is below its target, so
+/// migrations need not be idempotent — `ALTER TABLE ADD COLUMN`, which SQLite
+/// has no `IF NOT EXISTS` form for, is fine here.
+const EMBEDDED: &[(i64, &str, &str)] = &[
+    (1, "0001_initial", MIGRATION_0001),
+    (2, "0002_poll_cycle_retention", MIGRATION_0002),
+];
+
+/// Schema version this binary expects after all embedded migrations run.
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 /// Open or create the database, run pending migrations.
 pub fn open(path: &str) -> Result<Connection> {
@@ -21,11 +38,6 @@ pub fn open(path: &str) -> Result<Connection> {
     // re-opening a freshly-created DB would fail on the duplicate
     // CREATE TABLE.
 
-    // Embedded migrations applied in order. Real migrations live under
-    // `migrations/*.sql` (loaded via include_str!). For now only 0001 is
-    // embedded; future versions add 0002, 0003, ...
-    const EMBEDDED: &[(&str, &str)] = &[("0001_initial", MIGRATION_0001)];
-
     let version: String = conn
         .query_row(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'",
@@ -34,20 +46,28 @@ pub fn open(path: &str) -> Result<Connection> {
         )
         .unwrap_or_default();
 
-    if version.is_empty() {
+    let current: i64 = if version.is_empty() {
         info!("fresh database, applying initial schema");
-        apply_migrations(&conn, EMBEDDED)?;
+        0
     } else {
-        info!("database at schema version {version}");
-        // Future: detect version < current and apply pending migrations.
-        // For now only version 1 exists.
-        if version != "1" {
+        let n: i64 = version.parse().with_context(|| {
+            format!("database schema version '{version}' is not a number — database is corrupt")
+        })?;
+        if n > CURRENT_SCHEMA_VERSION {
             anyhow::bail!(
-                "database schema version '{version}' is newer than this binary (max 1). \
-                 Upgrade the binary first."
+                "database schema version '{version}' is newer than this binary \
+                 (max {CURRENT_SCHEMA_VERSION}). Upgrade the binary first."
             );
         }
-    }
+        if n < CURRENT_SCHEMA_VERSION {
+            info!("database at schema version {n}, upgrading to {CURRENT_SCHEMA_VERSION}");
+        } else {
+            info!("database at schema version {n}");
+        }
+        n
+    };
+
+    apply_migrations(&conn, current)?;
 
     // Ensure time_unit is set
     let tu: String = conn
@@ -64,15 +84,28 @@ pub fn open(path: &str) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Apply all embedded migrations that haven't been recorded as applied
-/// yet. The migration files are expected to be idempotent
-/// (`CREATE TABLE IF NOT EXISTS` style); this is a deliberate choice so
-/// that opening an existing database is safe.
-fn apply_migrations(conn: &Connection, migrations: &[(&str, &str)]) -> Result<()> {
-    for (name, sql) in migrations {
+/// Apply every embedded migration whose target version is above `from`.
+///
+/// Transactions are the migration file's own business, not the runner's: the
+/// initial schema opens with `PRAGMA journal_mode`/`synchronous`, which SQLite
+/// refuses to run inside a transaction. Files that can be wrapped (everything
+/// after 0001) open with `BEGIN` and close with `COMMIT` themselves, so a
+/// failure mid-file leaves the database at the previous version rather than
+/// half-upgraded.
+fn apply_migrations(conn: &Connection, from: i64) -> Result<()> {
+    for (version, name, sql) in EMBEDDED {
+        if *version <= from {
+            continue;
+        }
         info!("applying migration {name}");
-        conn.execute_batch(sql)
-            .with_context(|| format!("applying migration {name}"))?;
+        if let Err(e) = conn
+            .execute_batch(sql)
+            .with_context(|| format!("applying migration {name}"))
+        {
+            // No-op when the file was not transactional or already committed.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -83,24 +116,140 @@ pub fn open_memory() -> Result<Connection> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     // `schema_meta` is part of the initial migration, so we don't pre-create
     // it here.
-    apply_migrations(&conn, &[("0001_initial", MIGRATION_0001)])?;
+    apply_migrations(&conn, 0)?;
     Ok(conn)
+}
+
+/// The current global retention policy, as read back from the database:
+/// `(cutoff_days, cycle_cutoff_days, keep_failed_cycles, delete_batch_rows, enabled)`.
+pub type HistoryPolicy = (Option<i64>, Option<i64>, bool, i64, bool);
+
+/// Apply a history-retention policy change (if any) against the global row and
+/// read the resulting policy back.
+///
+/// The single source of truth for the write+clamp rules, shared by the local
+/// CLI handler (`handlers::history::handle_history_policy`) and the unified
+/// `Op::HistoryPolicy` execution arm so the two never drift apart.
+///
+/// Returns [`HistoryPolicy`].
+pub fn apply_history_policy(
+    conn: &Connection,
+    cycle_days: Option<i64>,
+    sample_days: Option<i64>,
+    keep_failed: Option<bool>,
+    batch_rows: Option<i64>,
+) -> Result<HistoryPolicy> {
+    // The global row (poll_group_id IS NULL) is the one the collector's sweep
+    // reads; per-group rows are not consulted for cycle retention.
+    if cycle_days.is_some()
+        || sample_days.is_some()
+        || keep_failed.is_some()
+        || batch_rows.is_some()
+    {
+        if let Some(d) = cycle_days {
+            // 0 means "keep everything", stored as NULL so the sweep's own
+            // "unset" and the operator's "off" are the same state.
+            let v = if d > 0 { Some(d) } else { None };
+            conn.execute(
+                "UPDATE history_cleanup_policy SET cycle_cutoff_days = ?1
+                 WHERE poll_group_id IS NULL",
+                rusqlite::params![v],
+            )?;
+        }
+        if let Some(d) = sample_days {
+            let v = if d > 0 { Some(d) } else { None };
+            conn.execute(
+                "UPDATE history_cleanup_policy SET cutoff_days = ?1
+                 WHERE poll_group_id IS NULL",
+                rusqlite::params![v],
+            )?;
+        }
+        if let Some(k) = keep_failed {
+            conn.execute(
+                "UPDATE history_cleanup_policy SET keep_failed_cycles = ?1
+                 WHERE poll_group_id IS NULL",
+                rusqlite::params![i64::from(k)],
+            )?;
+        }
+        if let Some(b) = batch_rows {
+            conn.execute(
+                "UPDATE history_cleanup_policy SET delete_batch_rows = ?1
+                 WHERE poll_group_id IS NULL",
+                rusqlite::params![b.clamp(100, 100_000)],
+            )?;
+        }
+    }
+
+    let row = conn.query_row(
+        "SELECT cutoff_days, cycle_cutoff_days, keep_failed_cycles, delete_batch_rows, enabled
+         FROM history_cleanup_policy WHERE poll_group_id IS NULL",
+        [],
+        |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, i64>(2)? != 0,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)? != 0,
+            ))
+        },
+    );
+    row.map_err(|_| anyhow::anyhow!("no global retention policy row; database predates schema 2"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn schema_version(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_schema_applies_cleanly() {
         let conn = open_memory().unwrap();
-        let version: String = conn
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn test_upgrade_from_v1_applies_only_pending() {
+        // Simulate a database created by an older binary: apply 0001 only.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(MIGRATION_0001).unwrap();
+        assert_eq!(schema_version(&conn), "1");
+
+        apply_migrations(&conn, 1).unwrap();
+        assert_eq!(schema_version(&conn), "2");
+
+        // The v2 additions are present...
+        let idx: i64 = conn
             .query_row(
-                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'ix_poll_cycle_finished_ts'",
                 [],
-                |row| row.get(0),
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "1");
+        assert_eq!(idx, 1);
+        let days: Option<i64> = conn
+            .query_row(
+                "SELECT cycle_cutoff_days FROM history_cleanup_policy
+                 WHERE poll_group_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(days, Some(14));
+
+        // ...and re-running the runner is a no-op rather than an error.
+        // `ALTER TABLE ADD COLUMN` would fail if 0002 were applied twice.
+        apply_migrations(&conn, 2).unwrap();
+        assert_eq!(schema_version(&conn), "2");
     }
 }

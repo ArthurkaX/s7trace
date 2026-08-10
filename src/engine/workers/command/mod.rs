@@ -13,12 +13,14 @@ use std::time::Duration;
 use tracing::{debug, error, info};
 
 use crate::db;
+use crate::engine::health::CollectorHealth;
 use crate::engine::poller::OverrunMode;
 use crate::engine::server::{PduCache, PlcRegistry, PollerRegistry, SampleBatch};
 use crate::engine::snapshot::Snapshot;
 use crate::types::*;
 
 /// Execute a PLC read command.
+#[allow(clippy::too_many_arguments)]
 fn execute_command(
     conn: &Connection,
     plcs: &PlcRegistry,
@@ -26,6 +28,7 @@ fn execute_command(
     pdu_cache: &PduCache,
     snapshot: &Arc<Snapshot>,
     sample_tx: &Sender<SampleBatch>,
+    health: &Arc<CollectorHealth>,
     cmd_id: i64,
     kind: CommandKind,
     request_json: &str,
@@ -63,6 +66,7 @@ fn execute_command(
             pdu_cache,
             snapshot,
             sample_tx,
+            health,
             overrun_mode,
             &req,
         ),
@@ -75,6 +79,7 @@ fn execute_command(
 
 /// Runs in a dedicated thread: claims pending commands, dispatches to
 /// `execute_command`, writes results.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn command_worker(
     db: Arc<Mutex<Connection>>,
     running: Arc<AtomicBool>,
@@ -83,6 +88,7 @@ pub(crate) fn command_worker(
     pollers: PollerRegistry,
     pdu_cache: PduCache,
     sample_tx: Sender<SampleBatch>,
+    health: Arc<CollectorHealth>,
     overrun_mode: OverrunMode,
 ) {
     info!("cmd-worker started");
@@ -130,6 +136,7 @@ pub(crate) fn command_worker(
                     &pdu_cache,
                     &snapshot,
                     &sample_tx,
+                    &health,
                     cmd.id,
                     cmd.kind,
                     &cmd.request_json,

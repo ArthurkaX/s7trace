@@ -9,6 +9,11 @@ use crate::server_base;
 use crate::types::*;
 use crate::{cli, db, version};
 
+/// Staleness threshold for the local (database-only) view: with no collector
+/// to ask, a fixed window is all there is. The server's own `/status` scales it
+/// to each poll group's period instead.
+const STALE_AFTER_US: i64 = 60_000_000; // 60s
+
 pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
     // Remote mode: fetch JSON from server and pretty-print.
     if let Some(base) = server_base(cli) {
@@ -128,44 +133,56 @@ pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<E
                 .filter_map(|x| x.ok())
                 .collect();
 
-            // Per-(plc, poll_group) most recent cycle metrics
+            // Per-(plc, poll_group) recent cycle metrics.
+            //
+            // Both subqueries are bounded to the last hour and driven by
+            // ix_poll_cycle_plc_group_finished. The unbounded form counted
+            // overruns across all history — a full scan of a table that reached
+            // 12.7M rows in the field, per poll group, per `status` call.
             let mut pg_stmt = conn.prepare(
                 "SELECT DISTINCT pg.id, pg.name, pg.period_ms,
-                        (SELECT actual_ms FROM poll_cycle pc
+                        (SELECT pc.actual_ms FROM poll_cycle pc
                          WHERE pc.plc_id = ?1 AND pc.poll_group_id = pg.id
-                         ORDER BY pc.id DESC LIMIT 1),
+                         ORDER BY pc.finished_ts DESC LIMIT 1),
                         (SELECT COUNT(*) FROM poll_cycle pc
                          WHERE pc.plc_id = ?1 AND pc.poll_group_id = pg.id
-                           AND pc.actual_ms > pg.period_ms)
+                           AND pc.finished_ts > ?2
+                           AND pc.actual_ms > pg.period_ms),
+                        (SELECT MAX(pc.finished_ts) FROM poll_cycle pc
+                         WHERE pc.plc_id = ?1 AND pc.poll_group_id = pg.id)
                  FROM poll_group pg
                  JOIN tag t ON t.poll_group_id = pg.id
                  WHERE t.plc_id = ?1
                  ORDER BY pg.id",
             )?;
-            let poll_groups: Vec<serde_json::Value> = pg_stmt
-                .query_map(rusqlite::params![id], |r| {
+            let hour_cutoff = now_us() - 3_600_000_000;
+            let pg_rows: Vec<(serde_json::Value, Option<i64>)> = pg_stmt
+                .query_map(rusqlite::params![id, hour_cutoff], |r| {
                     let n: String = r.get(1)?;
                     let target: i64 = r.get(2)?;
                     let actual: Option<f64> = r.get(3)?;
                     let overruns: i64 = r.get(4)?;
-                    Ok(serde_json::json!({
-                        "name": n,
-                        "target_ms": target,
-                        "actual_ms": actual,
-                        "overrun_count": overruns,
-                    }))
+                    let last_finished: Option<i64> = r.get(5)?;
+                    Ok((
+                        serde_json::json!({
+                            "name": n,
+                            "target_ms": target,
+                            "actual_ms": actual,
+                            "overrun_count": overruns,
+                            "last_cycle_ts": last_finished,
+                        }),
+                        last_finished,
+                    ))
                 })?
                 .filter_map(|x| x.ok())
                 .collect();
 
-            // Last poll cycle finished timestamp for this PLC
-            let last_poll_cycle_finished_ts: Option<i64> = conn
-                .query_row(
-                    "SELECT MAX(finished_ts) FROM poll_cycle WHERE plc_id = ?1",
-                    rusqlite::params![id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(None);
+            // Last poll cycle for this PLC: the newest of its groups', rather
+            // than a `MAX(finished_ts) WHERE plc_id = ?` that no index can
+            // answer without scanning every cycle the PLC ever ran.
+            let last_poll_cycle_finished_ts: Option<i64> =
+                pg_rows.iter().filter_map(|(_, ts)| *ts).max();
+            let poll_groups: Vec<serde_json::Value> = pg_rows.into_iter().map(|(v, _)| v).collect();
 
             // Metric sets with member counts
             let mut ms_stmt = conn.prepare(
@@ -270,12 +287,36 @@ pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<E
                 }));
             }
 
+            // Derived health, matching the field the HTTP API reports so the
+            // local and remote views of the same server agree. Read from the
+            // database, this can only describe what the collector last wrote:
+            // "ok" here means the last cycle it stored was recent, not that a
+            // poller is running now. Ask a running server (`-r`) for that.
+            let stale = match last_ok_ts {
+                Some(ts) => now_us() - ts > STALE_AFTER_US,
+                None => true,
+            };
+            let health = if !enabled {
+                "disabled"
+            } else if connectivity != "online" {
+                "unavailable"
+            } else if stale {
+                "stale"
+            } else {
+                "ok"
+            };
+
             Ok(serde_json::json!({
                 "name": name,
                 "host": host,
                 "enabled": enabled,
+                "health": health,
                 "last_ok_ts": last_ok_ts,
                 "last_error": last_error,
+                // Both spellings: the text view has always labelled this
+                // column `conn`, so that is the name operators look for in the
+                // JSON, where only `connectivity` existed.
+                "conn": connectivity,
                 "connectivity": connectivity,
                 "last_poll_cycle_finished_ts": last_poll_cycle_finished_ts,
                 "datasets": datasets,
@@ -341,10 +382,11 @@ pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<E
             println!("PLCs:");
             for plc in &plcs {
                 println!(
-                    "  {} (host={}, enabled={}, conn={}) last_ok={:?}",
+                    "  {} (host={}, enabled={}, health={}, conn={}) last_ok={:?}",
                     plc["name"],
                     plc["host"],
                     plc["enabled"],
+                    plc["health"].as_str().unwrap_or("?"),
                     plc["connectivity"],
                     plc["last_ok_ts"]
                 );

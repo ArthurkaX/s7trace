@@ -92,8 +92,14 @@ fn run_main() -> Result<()> {
         Some(Command::Server { .. }) => dry_run_check(&cli.db),
         Some(_) => {
             validate_client_target(&cli)?;
+            // Remote mode never opens a local database. Every command that
+            // reaches dispatch is remote-servable (checked above) and returns
+            // in its remote branch before touching SQLite, so a bare in-memory
+            // placeholder satisfies the handlers' `&Connection` without
+            // opening, creating, or migrating anything on disk. Local mode
+            // opens (and migrates) the on-disk database as before.
             let conn = if cli.remote_server.is_some() {
-                db::schema::open_memory()
+                rusqlite::Connection::open_in_memory()
                     .context("opening in-memory client placeholder database")?
             } else {
                 db::schema::open(&cli.db)
@@ -153,6 +159,7 @@ fn supports_remote(cmd: &Command) -> bool {
             | Command::PlcAdd { .. }
             | Command::PollGroupAdd { .. }
             | Command::PollGroupSetPeriod { .. }
+            | Command::HistoryPolicy { .. }
             | Command::TagImport { .. }
     )
 }
@@ -185,6 +192,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::CollectionStart { .. } => "collection-start",
         Command::CollectionStop { .. } => "collection-stop",
         Command::HistoryClean { .. } => "history-clean",
+        Command::HistoryPolicy { .. } => "history-policy",
         Command::HistoryDeleteDataset { .. } => "history-delete-dataset",
         Command::HistoryVacuum { .. } => "history-vacuum",
         Command::PlcAdd { .. } => "plc-add",
@@ -241,8 +249,8 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             query,
             format: fmt,
             limit,
-            timeout_ms: _,
-        } => crate::handlers::sql::handle_sql(conn, cli, query, fmt, *limit),
+            timeout_ms,
+        } => crate::handlers::sql::handle_sql(conn, cli, query, fmt, *limit, *timeout_ms),
         Command::AdminSql { query } => crate::handlers::sql::handle_admin_sql(cli, conn, query),
         Command::CommandList { state, format: fmt } => {
             crate::handlers::commands::handle_command_list(conn, state.as_deref(), fmt)
@@ -454,11 +462,16 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
         Command::SetList { plc } => {
             crate::handlers::sets::handle_set_list(cli, conn, plc.as_deref())
         }
-        Command::SetShow { set_name, set_flag } => crate::handlers::sets::handle_set_show(
+        Command::SetShow {
+            set_name,
+            set_flag,
+            plc,
+        } => crate::handlers::sets::handle_set_show(
             conn,
             cli,
             set_name.as_deref(),
             set_flag.as_deref(),
+            plc.as_deref(),
         ),
         Command::SetDelete { set_name } => run_op(
             cli,
@@ -486,6 +499,38 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             before.as_deref(),
             *batch_size,
         ),
+
+        Command::HistoryPolicy {
+            cycle_days,
+            sample_days,
+            keep_failed,
+            batch_rows,
+        } => {
+            // Remote goes through the queue like every other mutating command —
+            // that is the whole point, a remote operator must be able to cap the
+            // database. Local keeps the handler's readable policy block instead
+            // of the op's one-line result summary.
+            if server_base(cli).is_some() {
+                run_op(
+                    cli,
+                    conn,
+                    engine::ops::Op::HistoryPolicy {
+                        cycle_days: *cycle_days,
+                        sample_days: *sample_days,
+                        keep_failed: *keep_failed,
+                        batch_rows: *batch_rows,
+                    },
+                )
+            } else {
+                crate::handlers::history::handle_history_policy(
+                    conn,
+                    *cycle_days,
+                    *sample_days,
+                    *keep_failed,
+                    *batch_rows,
+                )
+            }
+        }
         Command::HistoryDeleteDataset { dataset } => {
             crate::handlers::history::handle_history_delete_dataset(conn, cli, dataset)
         }
@@ -663,7 +708,8 @@ mod tests {
     fn test_handle_sql_select() {
         let conn = db::schema::open_memory().unwrap();
         let cli = local_cli();
-        let result = crate::handlers::sql::handle_sql(&conn, &cli, "SELECT 1 AS col", "json", 10);
+        let result =
+            crate::handlers::sql::handle_sql(&conn, &cli, "SELECT 1 AS col", "json", 10, 5000);
         assert!(result.is_ok());
     }
 
@@ -671,7 +717,8 @@ mod tests {
     fn test_handle_sql_rejects_write() {
         let conn = db::schema::open_memory().unwrap();
         let cli = local_cli();
-        let result = crate::handlers::sql::handle_sql(&conn, &cli, "DELETE FROM tag", "json", 10);
+        let result =
+            crate::handlers::sql::handle_sql(&conn, &cli, "DELETE FROM tag", "json", 10, 5000);
         assert!(result.is_ok());
         assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
     }

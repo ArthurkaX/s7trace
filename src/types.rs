@@ -70,10 +70,24 @@ impl FromStr for DataType {
             "i32" => Ok(DataType::I32),
             "u32" => Ok(DataType::U32),
             "f32" => Ok(DataType::F32),
-            _ => Err(format!("unknown data type: {s}")),
+            _ => Err(format!("unknown data type: {s} (valid: {DATA_TYPE_NAMES})")),
         }
     }
 }
+
+/// The accepted `--type` type names, comma-separated. Single source of truth
+/// for the `FromStr` error above and for [`DATA_TYPE_HELP`], so the two cannot
+/// drift: the field report's complaint was that neither told the operator what
+/// was valid.
+macro_rules! data_type_names {
+    () => {
+        "bool, i16, u16, i32, u32, f32"
+    };
+}
+pub const DATA_TYPE_NAMES: &str = data_type_names!();
+
+/// `--type` help text, for `cli/args.rs`.
+pub const DATA_TYPE_HELP: &str = concat!("Data type (valid: ", data_type_names!(), ")");
 
 // ---------------------------------------------------------------------------
 // Value role (D006)
@@ -352,12 +366,46 @@ pub enum ApplyScope {
 // S7 address parsing
 // ---------------------------------------------------------------------------
 
+/// S7 area mnemonic from an address string (`DBW`, `DBD`, `DBB`, `DBX`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressArea {
+    /// Word (2 bytes, unsigned on S7).
+    Word,
+    /// Double word (4 bytes).
+    DWord,
+    /// Byte.
+    Byte,
+    /// Bit.
+    Bit,
+}
+
+impl AddressArea {
+    /// Parse the area mnemonic from an address string like `DB1.DBW120`.
+    /// Returns `None` when the string carries no area token.
+    pub fn from_address(s: &str) -> Option<AddressArea> {
+        if s.contains(".DBX") {
+            Some(AddressArea::Bit)
+        } else if s.contains(".DBW") {
+            Some(AddressArea::Word)
+        } else if s.contains(".DBD") {
+            Some(AddressArea::DWord)
+        } else if s.contains(".DBB") {
+            Some(AddressArea::Byte)
+        } else {
+            None
+        }
+    }
+}
+
 /// Parsed S7 address, e.g. `DB5999.DBW120` or `DB5999.DBD240`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S7Address {
     pub db_num: u16,
     pub byte_offset: usize,
     pub bit_offset: Option<u8>,
+    /// Area mnemonic from the original address string, if any (`DBW`/`DBD`/
+    /// `DBB`/`DBX`). Used to warn on questionable type bindings.
+    pub area: Option<AddressArea>,
 }
 
 impl S7Address {
@@ -394,6 +442,7 @@ impl S7Address {
                 db_num,
                 byte_offset: byte,
                 bit_offset: Some(bit),
+                area: Some(AddressArea::Bit),
             });
         }
         // Then try the simple form: DB<n>.<DB{W|D|B|X})<num>
@@ -416,21 +465,25 @@ impl S7Address {
                 db_num,
                 byte_offset: offset,
                 bit_offset: None,
+                area: Some(AddressArea::Word),
             }),
             "DBD" => Ok(S7Address {
                 db_num,
                 byte_offset: offset,
                 bit_offset: None,
+                area: Some(AddressArea::DWord),
             }),
             "DBB" => Ok(S7Address {
                 db_num,
                 byte_offset: offset,
                 bit_offset: None,
+                area: Some(AddressArea::Byte),
             }),
             "DBX" => Ok(S7Address {
                 db_num,
                 byte_offset: offset / 8,
                 bit_offset: Some((offset % 8) as u8),
+                area: Some(AddressArea::Bit),
             }),
             _ => Err(format!("unknown area type: {area}")),
         }
@@ -494,6 +547,44 @@ mod tests {
         assert!(S7Address::parse("invalid").is_err());
         assert!(S7Address::parse("DB10.DBW22.1").is_err());
     }
+
+    #[test]
+    fn test_address_area() {
+        assert_eq!(
+            AddressArea::from_address("DB1.DBW0"),
+            Some(AddressArea::Word)
+        );
+        assert_eq!(
+            AddressArea::from_address("DB10.DBD240"),
+            Some(AddressArea::DWord)
+        );
+        assert_eq!(
+            AddressArea::from_address("DB2.DBB4"),
+            Some(AddressArea::Byte)
+        );
+        assert_eq!(
+            AddressArea::from_address("DB3.DBX10.1"),
+            Some(AddressArea::Bit)
+        );
+        assert_eq!(
+            AddressArea::from_address("DB1.DBX10"),
+            Some(AddressArea::Bit)
+        );
+        assert_eq!(AddressArea::from_address("no-area"), None);
+        // Parsed address retains its area mnemonic.
+        assert_eq!(
+            S7Address::parse("DB1.DBW22").unwrap().area,
+            Some(AddressArea::Word)
+        );
+        assert_eq!(
+            S7Address::parse("DB1.DBD240").unwrap().area,
+            Some(AddressArea::DWord)
+        );
+        assert_eq!(
+            S7Address::parse("DB5.DBX10").unwrap().area,
+            Some(AddressArea::Bit)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +615,22 @@ impl PlcError {
             PlcError::PlcUnavailable(_) => BadClass::PlcUnavailable,
             PlcError::Internal(_) => BadClass::Internal,
         }
+    }
+
+    /// Whether this error means the S7 link itself is down, as opposed to a
+    /// problem with one address or one span's contents.
+    ///
+    /// The poller uses this to decide between two very different responses:
+    /// a link failure must reach the reconnect/backoff path, while an
+    /// address- or decode-level failure is localized to individual tags.
+    /// Probing tags one by one over a dead link is pointless — every single
+    /// read fails identically — and at ~200 tags per cycle it is the bulk of
+    /// the work done during an outage.
+    pub fn is_link_failure(&self) -> bool {
+        matches!(
+            self,
+            PlcError::Timeout(_) | PlcError::Disconnected(_) | PlcError::PlcUnavailable(_)
+        )
     }
 
     pub fn detail(&self) -> &str {

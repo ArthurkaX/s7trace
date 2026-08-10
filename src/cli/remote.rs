@@ -151,9 +151,15 @@ pub fn get_set_list(
 pub fn get_set_show(
     base_url: &str,
     set_name: &str,
+    plc: Option<&str>,
     timeout: Duration,
 ) -> Result<serde_json::Value> {
-    let url = format!("/v1/set/{}", urlencode(set_name));
+    let mut url = format!("/v1/set/{}", urlencode(set_name));
+    // Set names repeat across PLCs; pass the operator's selector on so the
+    // server resolves the same set the local path would.
+    if let Some(p) = plc {
+        url.push_str(&format!("?plc={}", urlencode(p)));
+    }
     let resp = http_get(base_url, &url, timeout)?;
     serde_json::from_str(&resp).with_context(|| format!("invalid JSON from {url}: {resp}"))
 }

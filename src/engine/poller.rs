@@ -2,6 +2,7 @@
 ///
 /// Manages per-PLC polling with configurable periods and overrun behavior
 /// (`skip_missed_ticks` by default per architecture doc).
+use crate::engine::health::GroupHealth;
 use crate::engine::storage::{self, HookState, RollupPayload, WriteDecision};
 use crate::plc::client::PlcClient;
 use crate::plc::PlcHandle;
@@ -59,6 +60,14 @@ pub struct PollResult {
     /// Derived event markers (e.g. negative counter delta = wraparound
     /// that exceeded the configured `wrap_at`).
     pub event_markers: Vec<EventMarkerRecord>,
+    /// Set when the cycle aborted because the S7 link is down.
+    ///
+    /// A span-level read failure aborts the cycle but still yields a
+    /// `PollResult` (so the failed cycle is recorded), which means the poll
+    /// loop cannot tell "link is dead" from "cycle completed" by looking at
+    /// the `Ok`/`Err` discriminant alone. This field carries that signal
+    /// through so the loop can enter the reconnect path.
+    pub link_failure: Option<PlcError>,
 }
 
 #[derive(Debug, Clone)]
@@ -298,7 +307,7 @@ impl PlcPoller {
                         }
                         Err(e) => {
                             error!(
-                                "PLC {}: read span DB{} offset={} len={} failed: {}; localizing",
+                                "PLC {}: read span DB{} offset={} len={} failed: {}",
                                 self.plc_name, span.db_num, span.byte_offset, span.byte_len, e
                             );
                             spans.push(SpanResult {
@@ -308,57 +317,21 @@ impl PlcPoller {
                                 byte_len: span.byte_len,
                                 ok: false,
                             });
-                            for &tag_id in &span.tag_ids {
-                                if let Some(tag) = self.tags.get(&tag_id).cloned() {
-                                    match client.read_db(tag.db_num, tag.byte_offset, tag.byte_size)
-                                    {
-                                        Ok(_) => {
-                                            debug!(
-                                                "PLC {}: tag {} ({}) reads OK on its own",
-                                                self.plc_name, tag.name, tag.address
-                                            );
-                                        }
-                                        Err(tag_err) => {
-                                            let bc = tag_err.bad_class();
-                                            let det = tag_err.detail().to_string();
-                                            warn!(
-                                                "PLC {}: tag {} ({}) localized bad: {}: {}",
-                                                self.plc_name, tag.name, tag.address, bc, det
-                                            );
-                                            bad_tags.push(BadTagRecord {
-                                                tag_id,
-                                                bad_class: bc,
-                                                detail: det,
-                                            });
-                                        }
-                                    }
-                                }
+                            if !e.is_link_failure() {
+                                self.localize_span_failure(client, span, &mut bad_tags);
                             }
-                            let elapsed = started.elapsed();
-                            let actual_ms = elapsed.as_secs_f64() * 1000.0;
-                            self.last_actual_ms = actual_ms;
-                            return Ok(PollResult {
-                                plc_id: self.plc_id,
-                                poll_group_id: self.plan.poll_group_id,
+                            return Ok(self.aborted_cycle(
                                 seq,
-                                cycle_info: PollCycleInfo {
-                                    plc_id: self.plc_id,
-                                    poll_group_id: self.plan.poll_group_id,
-                                    seq,
-                                    started_ts,
-                                    finished_ts: now_us(),
-                                    target_ms: self.period_ms,
-                                    actual_ms,
-                                    ok: false,
-                                    error: Some(e.to_string()),
-                                },
+                                started,
+                                started_ts,
+                                e,
                                 samples,
                                 spans,
                                 rollups,
                                 state_intervals,
                                 bad_tags,
                                 event_markers,
-                            });
+                            ));
                         }
                     }
                 }
@@ -403,7 +376,7 @@ impl PlcPoller {
                     }
                     Err(e) => {
                         error!(
-                            "PLC {}: multi-read span for DB{} failed: {}; localizing",
+                            "PLC {}: multi-read span for DB{} failed: {}",
                             self.plc_name, span.db_num, e
                         );
                         spans.push(SpanResult {
@@ -413,56 +386,21 @@ impl PlcPoller {
                             byte_len: span.byte_len,
                             ok: false,
                         });
-                        for &tag_id in &span.tag_ids {
-                            if let Some(tag) = self.tags.get(&tag_id).cloned() {
-                                match client.read_db(tag.db_num, tag.byte_offset, tag.byte_size) {
-                                    Ok(_) => {
-                                        debug!(
-                                            "PLC {}: tag {} ({}) reads OK on its own",
-                                            self.plc_name, tag.name, tag.address
-                                        );
-                                    }
-                                    Err(tag_err) => {
-                                        let bc = tag_err.bad_class();
-                                        let det = tag_err.detail().to_string();
-                                        warn!(
-                                            "PLC {}: tag {} ({}) localized bad: {}: {}",
-                                            self.plc_name, tag.name, tag.address, bc, det
-                                        );
-                                        bad_tags.push(BadTagRecord {
-                                            tag_id,
-                                            bad_class: bc,
-                                            detail: det,
-                                        });
-                                    }
-                                }
-                            }
+                        if !e.is_link_failure() {
+                            self.localize_span_failure(client, span, &mut bad_tags);
                         }
-                        let elapsed = started.elapsed();
-                        let actual_ms = elapsed.as_secs_f64() * 1000.0;
-                        self.last_actual_ms = actual_ms;
-                        return Ok(PollResult {
-                            plc_id: self.plc_id,
-                            poll_group_id: self.plan.poll_group_id,
+                        return Ok(self.aborted_cycle(
                             seq,
-                            cycle_info: PollCycleInfo {
-                                plc_id: self.plc_id,
-                                poll_group_id: self.plan.poll_group_id,
-                                seq,
-                                started_ts,
-                                finished_ts: now_us(),
-                                target_ms: self.period_ms,
-                                actual_ms,
-                                ok: false,
-                                error: Some(e.to_string()),
-                            },
+                            started,
+                            started_ts,
+                            e,
                             samples,
                             spans,
                             rollups,
                             state_intervals,
                             bad_tags,
                             event_markers,
-                        });
+                        ));
                     }
                 },
             }
@@ -521,7 +459,93 @@ impl PlcPoller {
             state_intervals,
             bad_tags,
             event_markers,
+            link_failure: None,
         })
+    }
+
+    /// Probe each tag of a failed span with an individual read, so a span
+    /// failure caused by one bad address is attributed to that address rather
+    /// than to the whole span.
+    ///
+    /// Only meaningful for address- or content-level failures. Callers must
+    /// skip this when the link itself is down (see `PlcError::is_link_failure`).
+    fn localize_span_failure(
+        &self,
+        client: &mut dyn PlcClient,
+        span: &ReadSpan,
+        bad_tags: &mut Vec<BadTagRecord>,
+    ) {
+        for &tag_id in &span.tag_ids {
+            let Some(tag) = self.tags.get(&tag_id).cloned() else {
+                continue;
+            };
+            match client.read_db(tag.db_num, tag.byte_offset, tag.byte_size) {
+                Ok(_) => debug!(
+                    "PLC {}: tag {} ({}) reads OK on its own",
+                    self.plc_name, tag.name, tag.address
+                ),
+                Err(tag_err) => {
+                    let bad_class = tag_err.bad_class();
+                    let detail = tag_err.detail().to_string();
+                    warn!(
+                        "PLC {}: tag {} ({}) localized bad: {}: {}",
+                        self.plc_name, tag.name, tag.address, bad_class, detail
+                    );
+                    bad_tags.push(BadTagRecord {
+                        tag_id,
+                        bad_class,
+                        detail,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Build the `PollResult` for a cycle aborted by a span read failure.
+    ///
+    /// The cycle is still reported (so the failure lands in `poll_cycle`),
+    /// but `link_failure` is set for link-level errors so the poll loop
+    /// reconnects instead of spinning through cycles that cannot succeed.
+    #[allow(clippy::too_many_arguments)]
+    fn aborted_cycle(
+        &mut self,
+        seq: u64,
+        started: Instant,
+        started_ts: TimestampUs,
+        err: PlcError,
+        samples: Vec<SampleRecord>,
+        spans: Vec<SpanResult>,
+        rollups: Vec<RollupRecord>,
+        state_intervals: Vec<StateIntervalRecord>,
+        bad_tags: Vec<BadTagRecord>,
+        event_markers: Vec<EventMarkerRecord>,
+    ) -> PollResult {
+        let actual_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.last_actual_ms = actual_ms;
+        let link_failure = err.is_link_failure().then(|| err.clone());
+        PollResult {
+            plc_id: self.plc_id,
+            poll_group_id: self.plan.poll_group_id,
+            seq,
+            cycle_info: PollCycleInfo {
+                plc_id: self.plc_id,
+                poll_group_id: self.plan.poll_group_id,
+                seq,
+                started_ts,
+                finished_ts: now_us(),
+                target_ms: self.period_ms,
+                actual_ms,
+                ok: false,
+                error: Some(err.to_string()),
+            },
+            samples,
+            spans,
+            rollups,
+            state_intervals,
+            bad_tags,
+            event_markers,
+            link_failure,
+        }
     }
 }
 
@@ -529,12 +553,41 @@ impl PlcPoller {
 pub struct PollerHandle {
     pub plc_id: i64,
     pub running: Arc<Mutex<bool>>,
+    /// Liveness of the thread this handle spawned.
+    ///
+    /// `running` is intent — what the operator asked for. `health.is_alive()`
+    /// is fact — whether a thread is still there to honor it. The 22-day
+    /// outage lived exactly in the gap between the two: every poller had
+    /// exited, and nothing compared the two flags to notice.
+    pub health: Arc<GroupHealth>,
 }
 
 impl PollerHandle {
     pub fn stop(&self) {
         let mut running = self.running.lock();
         *running = false;
+    }
+
+    /// True when this poller is wanted but its thread is gone — the condition
+    /// the supervisor respawns on.
+    pub fn is_dead(&self) -> bool {
+        *self.running.lock() && !self.health.is_alive()
+    }
+}
+
+/// Marks a poll group's health record dead when the poller thread leaves its
+/// loop. A drop guard rather than a call at the end of the thread body, so a
+/// panic unwinding out of the loop is reported the same as a clean exit —
+/// a silently panicking poller is the failure mode with no other symptom.
+///
+/// Carries the generation it was started under so an outgoing poller, which
+/// may not notice `stop()` until its next tick, cannot mark the replacement
+/// that has already taken its place as dead.
+struct AliveGuard(Arc<GroupHealth>, u64);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.mark_stopped(self.1);
     }
 }
 
@@ -570,13 +623,23 @@ pub fn spawn_poller(
     client: PlcHandle,
     sample_tx: Sender<PollResult>,
     overrun_mode: OverrunMode,
+    health: Arc<GroupHealth>,
 ) -> PollerHandle {
     let running = Arc::new(Mutex::new(true));
     let thread_running = running.clone();
+    let thread_health = health.clone();
+    // Claimed here, not inside the thread: the handle returned below is
+    // published to the registry immediately, and a supervisor tick landing
+    // before the thread got scheduled would otherwise read it as dead.
+    let generation = health.mark_started();
 
     std::thread::Builder::new()
         .name(format!("poller-{}", plc_name))
         .spawn(move || {
+            // Marks the group dead on any exit from this thread, including a
+            // panic. Must outlive the loop below.
+            let _alive = AliveGuard(thread_health, generation);
+
             // Each poller drives its own handle to the per-PLC actor at a
             // priority equal to its poll period (lower period = more urgent).
             // The actor serializes the actual reads but interleaves them at
@@ -595,58 +658,81 @@ pub fn spawn_poller(
                 let cycle_start = Instant::now();
                 let result = poller.poll_once(&mut plc_client);
 
-                match result {
+                // A dead S7 link surfaces two different ways: as `Err` when the
+                // cycle could not start, and as `Ok` with `link_failure` set
+                // when a span read aborted it. Both must reach the reconnect
+                // path below — treating only `Err` as a link failure is what
+                // let a disconnected PLC poll forever without reconnecting.
+                let link_error: Option<PlcError> = match result {
                     Ok(r) => {
-                        reconnect_attempts = 0;
-                        if r.samples.is_empty() && r.spans.is_empty() {
-                            warn!(
-                                "poller-{}: cycle {} had empty samples+spans (decision path?)",
-                                plc_name, r.seq
-                            );
-                        } else {
-                            debug!(
-                                "poller-{}: cycle {} in {:.1}ms ({} samples, {} spans)",
-                                plc_name,
-                                r.seq,
-                                poller.last_actual_ms,
-                                r.samples.len(),
-                                r.spans.len()
-                            );
+                        let link_failure = r.link_failure.clone();
+                        if link_failure.is_none() {
+                            // Only a cycle that actually reached the PLC clears
+                            // the backoff. Clearing it on any `Ok` would also
+                            // clear it for cycles that failed on the first span.
+                            reconnect_attempts = 0;
+                            if r.samples.is_empty() && r.spans.is_empty() {
+                                warn!(
+                                    "poller-{}: cycle {} had empty samples+spans (decision path?)",
+                                    plc_name, r.seq
+                                );
+                            } else {
+                                debug!(
+                                    "poller-{}: cycle {} in {:.1}ms ({} samples, {} spans)",
+                                    plc_name,
+                                    r.seq,
+                                    poller.last_actual_ms,
+                                    r.samples.len(),
+                                    r.spans.len()
+                                );
+                            }
                         }
                         if sample_tx.send(r).is_err() {
-                            warn!("poller-{}: sample channel closed, stopping", plc_name);
+                            // The receiving end is the sample-writer. If it is
+                            // gone, this poller cannot store anything and no
+                            // amount of retrying will help — exiting is correct,
+                            // but it means collection has stopped, so it is an
+                            // error and the supervisor must hear about it.
+                            error!(
+                                "poller-{}: sample channel closed (sample-writer gone) — \
+                                 collection stopped for this group",
+                                plc_name
+                            );
                             break;
                         }
+                        link_failure
                     }
                     Err(e) => {
                         error!("PLC {}: poll cycle failed: {}", plc_name, e);
-                        if matches!(&e, PlcError::Disconnected(_) | PlcError::Timeout(_)) {
-                            reconnect_attempts = reconnect_attempts.saturating_add(1);
-                            // Back off before retrying so an unreachable PLC is
-                            // not hammered with a connect() every cycle.
-                            let base = reconnect_backoff_ms(reconnect_attempts);
-                            let delay = Duration::from_millis(base + reconnect_jitter_ms(base));
-                            warn!(
-                                "poller-{}: reconnect attempt {} in {:?}",
-                                plc_name, reconnect_attempts, delay
-                            );
-                            std::thread::sleep(delay);
-                            if !*thread_running.lock() {
-                                break;
-                            }
-                            match plc_client.connect() {
-                                Ok(()) => {
-                                    info!("poller-{}: reconnected OK", plc_name);
-                                    reconnect_attempts = 0;
-                                }
-                                Err(e2) => error!(
-                                    "poller-{}: reconnect failed (attempt {}): {}",
-                                    plc_name, reconnect_attempts, e2
-                                ),
-                            }
-                            continue;
-                        }
+                        e.is_link_failure().then_some(e)
                     }
+                };
+
+                if let Some(e) = link_error {
+                    reconnect_attempts = reconnect_attempts.saturating_add(1);
+                    // Back off before retrying so an unreachable PLC is
+                    // not hammered with a connect() every cycle.
+                    let base = reconnect_backoff_ms(reconnect_attempts);
+                    let delay = Duration::from_millis(base + reconnect_jitter_ms(base));
+                    warn!(
+                        "poller-{}: link down ({}), reconnect attempt {} in {:?}",
+                        plc_name, e, reconnect_attempts, delay
+                    );
+                    std::thread::sleep(delay);
+                    if !*thread_running.lock() {
+                        break;
+                    }
+                    match plc_client.connect() {
+                        Ok(()) => {
+                            info!("poller-{}: reconnected OK", plc_name);
+                            reconnect_attempts = 0;
+                        }
+                        Err(e2) => error!(
+                            "poller-{}: reconnect failed (attempt {}): {}",
+                            plc_name, reconnect_attempts, e2
+                        ),
+                    }
+                    continue;
                 }
 
                 let elapsed = cycle_start.elapsed();
@@ -664,7 +750,11 @@ pub fn spawn_poller(
         })
         .expect("spawn poller thread");
 
-    PollerHandle { plc_id, running }
+    PollerHandle {
+        plc_id,
+        running,
+        health,
+    }
 }
 
 #[cfg(test)]
@@ -863,5 +953,198 @@ mod tests {
         assert!(result.cycle_info.ok);
         assert_eq!(result.samples.len(), 3);
         assert!(result.bad_tags.is_empty());
+    }
+
+    /// One tag, so the plan is a single BlockRead span.
+    fn single_tag() -> Vec<TagRow> {
+        vec![TagRow {
+            id: 1,
+            plc_id: 1,
+            name: "t1".into(),
+            address: "DB1.DBW0".into(),
+            db_num: 1,
+            byte_offset: 0,
+            bit_offset: None,
+            byte_size: 2,
+            data_type: DataType::I16,
+            poll_group_id: 1,
+            store_mode: StoreMode::OnChange,
+            storage_hook: StorageHook::OnChange,
+            hook_params_json: None,
+            enabled: true,
+            bad: false,
+            bad_class: None,
+            bad_detail: None,
+        }]
+    }
+
+    fn poller_for(tags: &[TagRow]) -> PlcPoller {
+        let plan = build_plan(1, 1, tags, 480, 8);
+        let mut poller = PlcPoller::new(1, "test", plan, 100, OverrunMode::SkipMissedTicks);
+        poller.init_tags(tags);
+        poller
+    }
+
+    /// A span read failing with `Disconnected` must be reported as a link
+    /// failure. Without this the poll loop sees a plain `Ok`, never enters
+    /// backoff/reconnect, and polls a dead PLC indefinitely.
+    #[test]
+    fn test_disconnected_span_marks_link_failure() {
+        let mut plc = MockPlcClient::new("test");
+        plc.connect().unwrap();
+        plc.fail_reads_with(PlcError::Disconnected("read_db: not connected".into()));
+
+        let tags = single_tag();
+        let result = poller_for(&tags).poll_once(&mut plc).unwrap();
+
+        assert!(!result.cycle_info.ok);
+        assert!(
+            matches!(result.link_failure, Some(PlcError::Disconnected(_))),
+            "expected link_failure to be set, got {:?}",
+            result.link_failure
+        );
+        // Probing tags one by one over a dead link tells us nothing, so the
+        // cycle must not mark them bad.
+        assert!(result.bad_tags.is_empty());
+    }
+
+    /// An address-level failure is not a link failure: the cycle localizes it
+    /// to the offending tag and the poll loop keeps its schedule.
+    #[test]
+    fn test_address_failure_localizes_without_link_failure() {
+        let mut plc = MockPlcClient::new("test");
+        plc.connect().unwrap();
+        plc.fail_reads_with(PlcError::AddressOutOfRange {
+            address: "DB1.DBW0".into(),
+            detail: "beyond DB length".into(),
+        });
+
+        let tags = single_tag();
+        let result = poller_for(&tags).poll_once(&mut plc).unwrap();
+
+        assert!(!result.cycle_info.ok);
+        assert!(result.link_failure.is_none());
+        assert_eq!(result.bad_tags.len(), 1);
+        assert_eq!(result.bad_tags[0].bad_class, BadClass::AddressOutOfRange);
+    }
+
+    #[test]
+    fn test_timeout_and_unavailable_count_as_link_failures() {
+        for err in [
+            PlcError::Timeout("read timed out".into()),
+            PlcError::PlcUnavailable("no route to host".into()),
+        ] {
+            let mut plc = MockPlcClient::new("test");
+            plc.connect().unwrap();
+            plc.fail_reads_with(err.clone());
+
+            let tags = single_tag();
+            let result = poller_for(&tags).poll_once(&mut plc).unwrap();
+            assert!(
+                result.link_failure.is_some(),
+                "{err} should be a link failure"
+            );
+            assert!(result.bad_tags.is_empty());
+        }
+    }
+
+    /// The exact shape of the 22-day outage: the sample-writer disappears, the
+    /// poller exits because it has nowhere to send, and nobody asked it to
+    /// stop. The handle must report that gap so the supervisor can act on it.
+    #[test]
+    fn a_poller_that_loses_its_writer_is_reported_dead() {
+        use crate::engine::health::CollectorHealth;
+        use crate::plc::spawn_actor;
+
+        let mut mock = MockPlcClient::new("test");
+        mock.connect().unwrap();
+        mock.seed(1, 0, vec![0x00, 0x2A]);
+        let client = spawn_actor("test".into(), Arc::new(Mutex::new(mock)));
+
+        let tags = single_tag();
+        let plan = build_plan(1, 1, &tags, 480, 8);
+        let health = Arc::new(CollectorHealth::new());
+        let group = health.group(1, 1, "test", 20);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let poller = spawn_poller(
+            1,
+            "test".into(),
+            20,
+            plan,
+            tags,
+            client.clone(),
+            tx,
+            OverrunMode::SkipMissedTicks,
+            group,
+        );
+
+        // A running poller is alive and not in need of supervision.
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "poller produced no cycle"
+        );
+        assert!(poller.health.is_alive());
+        assert!(!poller.is_dead());
+
+        // The writer goes away.
+        drop(rx);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while poller.health.is_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !poller.health.is_alive(),
+            "poller thread exited but is still reported alive"
+        );
+        // Still wanted, no longer running: this is what the supervisor
+        // restarts. Before it existed, this state was invisible.
+        assert!(poller.is_dead());
+
+        client.stop();
+    }
+
+    /// A poller that was asked to stop is not a fault, and must not be
+    /// restarted by the supervisor.
+    #[test]
+    fn a_stopped_poller_is_not_reported_dead() {
+        use crate::engine::health::CollectorHealth;
+        use crate::plc::spawn_actor;
+
+        let mut mock = MockPlcClient::new("test");
+        mock.connect().unwrap();
+        mock.seed(1, 0, vec![0x00, 0x2A]);
+        let client = spawn_actor("test".into(), Arc::new(Mutex::new(mock)));
+
+        let tags = single_tag();
+        let plan = build_plan(1, 1, &tags, 480, 8);
+        let health = Arc::new(CollectorHealth::new());
+        let group = health.group(1, 1, "test", 20);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let poller = spawn_poller(
+            1,
+            "test".into(),
+            20,
+            plan,
+            tags,
+            client.clone(),
+            tx,
+            OverrunMode::SkipMissedTicks,
+            group,
+        );
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+
+        poller.stop();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while poller.health.is_alive() && Instant::now() < deadline {
+            let _ = rx.try_recv();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!poller.health.is_alive());
+        assert!(!poller.is_dead(), "a stopped poller must not be respawned");
+
+        client.stop();
     }
 }

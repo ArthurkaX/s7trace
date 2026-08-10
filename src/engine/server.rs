@@ -21,6 +21,7 @@ use tracing::{error, info, warn};
 
 use crate::api;
 use crate::db;
+use crate::engine::health::CollectorHealth;
 use crate::engine::poller::{OverrunMode, PollResult, PollerHandle};
 use crate::engine::snapshot::Snapshot;
 use crate::plc::client::PlcClient;
@@ -66,6 +67,10 @@ pub struct Server {
     /// rather than queueing behind every poll-cycle write.
     db_path: String,
     snapshot: Arc<Snapshot>,
+    /// Liveness and runtime metrics for the collector, shared with the HTTP
+    /// API so `/status` can report what the workers are actually doing rather
+    /// than what they last managed to write to the database.
+    health: Arc<CollectorHealth>,
     running: Arc<AtomicBool>,
     plcs: PlcRegistry,
     pollers: PollerRegistry,
@@ -88,6 +93,7 @@ impl Server {
             db,
             db_path: config.db_path,
             snapshot,
+            health: Arc::new(CollectorHealth::new()),
             running,
             plcs: Arc::new(Mutex::new(HashMap::new())),
             pollers: Arc::new(Mutex::new(HashMap::new())),
@@ -225,6 +231,7 @@ impl Server {
         let db_writer = self.db.clone();
         let running_writer = self.running.clone();
         let snapshot_writer = self.snapshot.clone();
+        let health_writer = self.health.clone();
         std::thread::Builder::new()
             .name("sample-writer".into())
             .spawn(move || {
@@ -233,6 +240,7 @@ impl Server {
                     sample_rx,
                     running_writer,
                     snapshot_writer,
+                    health_writer,
                 )
             })?;
 
@@ -244,6 +252,7 @@ impl Server {
         let pollers_cmd = self.pollers.clone();
         let pdu_cache_cmd = self.pdu_cache.clone();
         let sample_tx_cmd = sample_tx.clone();
+        let health_cmd = self.health.clone();
         let overrun_cmd = self.overrun_mode;
         std::thread::Builder::new()
             .name("cmd-worker".into())
@@ -256,6 +265,7 @@ impl Server {
                     pollers_cmd,
                     pdu_cache_cmd,
                     sample_tx_cmd,
+                    health_cmd,
                     overrun_cmd,
                 );
             })?;
@@ -267,6 +277,7 @@ impl Server {
         let pollers_apply = self.pollers.clone();
         let pdu_cache_apply = self.pdu_cache.clone();
         let sample_tx_apply = sample_tx.clone();
+        let health_apply = self.health.clone();
         let overrun_apply = self.overrun_mode;
         std::thread::Builder::new()
             .name("apply-worker".into())
@@ -278,6 +289,7 @@ impl Server {
                     pollers_apply,
                     pdu_cache_apply,
                     sample_tx_apply,
+                    health_apply,
                     overrun_apply,
                 );
             })?;
@@ -319,6 +331,7 @@ impl Server {
                     &self.pollers,
                     &self.pdu_cache,
                     &sample_tx,
+                    &self.health,
                     &conn,
                     *plc_id,
                     plc_name,
@@ -340,6 +353,10 @@ impl Server {
         // `/status` responsive while the sample-writer holds the writer mutex.
         if let Some(bind) = self.http_bind.clone() {
             let db_path = self.db_path.clone();
+            // The API also gets the collector's in-memory health, so `/status`
+            // can report what this process is actually doing instead of
+            // re-deriving it from rows the collector may have stopped writing.
+            let health_http = self.health.clone();
             std::thread::Builder::new()
                 .name("http-api".into())
                 .spawn(move || {
@@ -351,7 +368,7 @@ impl Server {
                         }
                     };
                     let db_http = Arc::new(Mutex::new(conn));
-                    if let Err(e) = api::serve(db_http, bind) {
+                    if let Err(e) = api::serve(db_http, bind, Some(health_http)) {
                         error!("HTTP API server failed: {e}");
                     }
                 })?;
@@ -375,11 +392,60 @@ impl Server {
 
         info!("all workers started, monitoring...");
 
+        // Separate connection for the row counts below. They are full table
+        // scans; running them on the writer's connection would hold its mutex
+        // for seconds at a time, which is the very stall this is meant to keep
+        // out of `/status`. Under WAL a second connection reads concurrently.
+        let totals_conn = db::schema::open(&self.db_path)
+            .map_err(|e| {
+                error!("monitor: opening totals connection: {e}");
+                e
+            })
+            .ok();
+
+        // Per-group backoff for respawns, as an absolute tick number.
+        let mut respawn_after: HashMap<(i64, i64), u64> = HashMap::new();
+        let mut respawn_fails: HashMap<(i64, i64), u32> = HashMap::new();
+
         // Monitor loop
         let mut tick: u64 = 0;
         while self.running.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(5000));
             tick += 1;
+
+            self.supervise_pollers(&sample_tx, tick, &mut respawn_after, &mut respawn_fails);
+
+            // Refresh the cached row counts every 5 minutes. `/status` reports
+            // them with an `as_of_ts` rather than counting 12.7M rows per
+            // request — the field instance took 12 s to answer for numbers no
+            // operator needs to the row.
+            if tick == 1 || tick.is_multiple_of(60) {
+                if let Some(ref c) = totals_conn {
+                    let samples: i64 = c
+                        .query_row("SELECT COUNT(*) FROM sample", [], |r| r.get(0))
+                        .unwrap_or(0);
+                    let cycles: i64 = c
+                        .query_row("SELECT COUNT(*) FROM poll_cycle", [], |r| r.get(0))
+                        .unwrap_or(0);
+                    self.health.set_db_totals(samples, cycles);
+                }
+            }
+
+            // Cycle retention, every 5 minutes, on the same second connection.
+            //
+            // Bounded to 20 batches a pass: at the default 10k rows that is
+            // 200k cycles per sweep, enough to work down a large backlog over a
+            // few hours without ever holding the database against the writer.
+            if tick.is_multiple_of(60) {
+                if let Some(ref c) = totals_conn {
+                    if let Some(policy) = crate::engine::retention::load_policy(c) {
+                        let n = crate::engine::retention::sweep(c, policy, now_us(), 20);
+                        if n > 0 {
+                            info!("cycle retention: deleted {n} poll_cycle rows");
+                        }
+                    }
+                }
+            }
 
             if tick.is_multiple_of(6) {
                 let conn = self.db.lock();
@@ -410,9 +476,21 @@ impl Server {
                 let poller_count = self.pollers.lock().len();
                 drop(conn);
 
+                // Live poller count, not registry size: the registry keeps a
+                // handle whether or not its thread is still there, and the two
+                // diverging without a word is the 22-day outage in one number.
+                let alive = self
+                    .pollers
+                    .lock()
+                    .values()
+                    .filter(|h| h.health.is_alive())
+                    .count();
+
                 info!(
-                    "status: {} PLC(s), {} active tag(s), {} bad, {} pending cmd(s), {} active dataset(s), {} poller(s)",
-                    self.plcs.lock().len(), tag_count, bad_count, queue_count, active_ds, poller_count,
+                    "status: {} PLC(s), {} active tag(s), {} bad, {} pending cmd(s), {} active dataset(s), {}/{} poller(s) alive, writer {}",
+                    self.plcs.lock().len(), tag_count, bad_count, queue_count, active_ds,
+                    alive, poller_count,
+                    if self.health.writer_alive() { "alive" } else { "DEAD" },
                 );
             }
 
@@ -446,6 +524,121 @@ impl Server {
 
         info!("s7trace server stopped");
         Ok(())
+    }
+
+    /// Detect poller threads that have died while still being wanted, and
+    /// restart them with a per-group backoff.
+    ///
+    /// A poller can leave its loop for reasons that are not a shutdown: a
+    /// panic, or a send on a closed sample channel. Before this existed,
+    /// nothing noticed. On 2026-07-19 every poller exited within seconds of
+    /// each other and the process kept running for 22 days, answering HTTP
+    /// requests and reporting both PLCs as online, while `poll_cycle` received
+    /// not one further row.
+    ///
+    /// The condition checked is `wanted && !alive`: `PollerHandle::running` is
+    /// what the operator asked for, `GroupHealth::alive` is whether a thread is
+    /// still there to honor it. A stopped poller has both false and is left
+    /// alone.
+    fn supervise_pollers(
+        &self,
+        sample_tx: &mpsc::Sender<SampleBatch>,
+        tick: u64,
+        respawn_after: &mut HashMap<(i64, i64), u64>,
+        respawn_fails: &mut HashMap<(i64, i64), u32>,
+    ) {
+        let dead: Vec<(i64, i64, String, u64)> = self
+            .pollers
+            .lock()
+            .iter()
+            .filter(|(_, h)| h.is_dead())
+            .map(|(&(plc_id, pg_id), h)| {
+                (plc_id, pg_id, h.health.plc_name.clone(), h.health.period_ms)
+            })
+            .collect();
+
+        if dead.is_empty() {
+            return;
+        }
+
+        // Respawning into a dead writer would produce pollers that fill the
+        // channel and exit again, so the supervisor would spin. Report it and
+        // wait: the writer supervises itself and will come back.
+        if !self.health.writer_alive() {
+            error!(
+                "supervisor: {} poller(s) dead but the sample-writer is not running — \
+                 not respawning until it recovers",
+                dead.len()
+            );
+            return;
+        }
+
+        for (plc_id, pg_id, plc_name, period_ms) in dead {
+            let key = (plc_id, pg_id);
+            if tick < respawn_after.get(&key).copied().unwrap_or(0) {
+                continue;
+            }
+
+            let conn = self.db.lock();
+            let result = crate::engine::workers::spawn::spawn_one_poller(
+                &self.plcs,
+                &self.pollers,
+                &self.pdu_cache,
+                sample_tx,
+                &self.health,
+                &conn,
+                plc_id,
+                &plc_name,
+                pg_id,
+                period_ms,
+                self.overrun_mode,
+            );
+            drop(conn);
+
+            match result {
+                Ok(true) => {
+                    if let Some(g) = self.health.get_group(plc_id, pg_id) {
+                        g.note_restart();
+                        error!(
+                            "supervisor: poller for PLC {} group {} had died — restarted \
+                             (restart #{})",
+                            plc_name,
+                            pg_id,
+                            g.restarts()
+                        );
+                    }
+                    respawn_after.remove(&key);
+                    respawn_fails.remove(&key);
+                }
+                Ok(false) => {
+                    // The group has no active tags any more (tags disabled, or
+                    // the metric set turned off). Nothing to supervise; drop
+                    // the stale handle so this stops being reported as dead.
+                    info!(
+                        "supervisor: PLC {} group {} has no active tags — retiring its poller",
+                        plc_name, pg_id
+                    );
+                    self.pollers.lock().remove(&key);
+                    respawn_after.remove(&key);
+                    respawn_fails.remove(&key);
+                }
+                Err(e) => {
+                    let fails = respawn_fails.entry(key).or_insert(0);
+                    *fails = fails.saturating_add(1);
+                    // 1, 2, 4, 8, 12 ticks — 5 s up to a 1 min ceiling.
+                    let wait = (1u64 << (*fails - 1).min(3)).min(12);
+                    *respawn_after.entry(key).or_insert(0) = tick + wait;
+                    error!(
+                        "supervisor: restarting poller for PLC {} group {} failed \
+                         (attempt {}): {e} — retrying in {}s",
+                        plc_name,
+                        pg_id,
+                        fails,
+                        wait * 5
+                    );
+                }
+            }
+        }
     }
 
     /// Request graceful shutdown.

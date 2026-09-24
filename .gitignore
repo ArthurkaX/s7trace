@@ -10,3 +10,4 @@ plan.md
 # Optional local Snap7 checkout used only by development simulation scripts.
 # Snap7 is not bundled with s7trace and is not part of its distribution.
 snap7/
+.codegraph/

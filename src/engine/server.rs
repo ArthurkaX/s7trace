@@ -427,6 +427,11 @@ impl Server {
                 })?;
         }
 
+        // Ctrl+C and SIGTERM end the run through the clean shutdown below, so
+        // the stop is recorded as clean rather than reconstructed at the next
+        // start. Without this only the control window's Exit got there.
+        spawn_stop_signal_watcher(self.running.clone());
+
         info!("all workers started, monitoring...");
 
         // Separate connection for the row counts below. They are full table
@@ -447,7 +452,17 @@ impl Server {
         // Monitor loop
         let mut tick: u64 = 0;
         while self.running.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(5000));
+            // Five seconds per tick, but in steps, so a stop request does not
+            // wait out the rest of a tick.
+            for _ in 0..20 {
+                if !self.running.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if !self.running.load(Ordering::Relaxed) {
+                break;
+            }
             tick += 1;
 
             self.supervise_pollers(&sample_tx, tick, &mut respawn_after, &mut respawn_fails);
@@ -672,6 +687,96 @@ impl Server {
     pub fn shutdown(&self) {
         info!("shutdown requested");
         self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Watch for the operator's stop signals on a thread of its own: the first one
+/// clears `running`, a second one exits at once for a shutdown that hangs.
+///
+/// Unix: SIGINT and SIGTERM. Windows: Ctrl+C and Ctrl+Break. Closing the
+/// console window is not among them, because Windows ends the process as soon
+/// as the handler returns; that stop is reconstructed at the next start.
+fn spawn_stop_signal_watcher(running: Arc<AtomicBool>) {
+    let spawned = std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    warn!("signals: no runtime, stop signals end the process uncleanly: {e}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let mut signals = match StopSignals::new() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            "signals: cannot listen, stop signals end the process uncleanly: {e}"
+                        );
+                        return;
+                    }
+                };
+                signals.recv().await;
+                info!("stop signal received, shutting down (send it again to exit at once)");
+                running.store(false, Ordering::Relaxed);
+                signals.recv().await;
+                warn!("second stop signal: exiting without a clean shutdown");
+                std::process::exit(130);
+            });
+        });
+    if let Err(e) = spawned {
+        warn!("signals: cannot start watcher thread: {e}");
+    }
+}
+
+#[cfg(unix)]
+struct StopSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl StopSignals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
+#[cfg(windows)]
+struct StopSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+}
+
+#[cfg(windows)]
+impl StopSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()?,
+            ctrl_break: tokio::signal::windows::ctrl_break()?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => {}
+            _ = self.ctrl_break.recv() => {}
+        }
     }
 }
 

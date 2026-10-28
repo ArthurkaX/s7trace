@@ -157,6 +157,9 @@ cargo build --release
 The main binary is written to `target/release/s7trace` (`s7trace.exe` on
 Windows). The build also produces `s7mock`, a mock PLC server used for testing.
 
+Release builds for Windows (x86_64) and Linux (x86_64, statically linked) are
+on the [releases page](https://github.com/ArthurkaX/s7trace/releases).
+
 ### Start the on-site server
 
 ```sh
@@ -170,6 +173,10 @@ s7trace --db s7trace.db server --noui --http-bind 127.0.0.1:7707
 Port `7707` is the default CLI transport port. The server is the only process
 that polls PLCs and writes the live database; action commands are serialized
 through its durable queue.
+
+Stop the server with Ctrl+C (or SIGTERM on Linux), or Exit in the control
+window: it stops polling and records a clean `server_stop`. A second Ctrl+C
+exits at once.
 
 ### Work remotely through the CLI
 

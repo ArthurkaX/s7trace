@@ -23,7 +23,7 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # The published crate is patched to the reviewed source copy in vendor/turbos7.
 turbos7 = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal"] }
 axum = "0.7"
 
 [target.'cfg(windows)'.dependencies]

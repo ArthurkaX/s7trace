@@ -1,3 +1,4 @@
+pub mod cycle_daily;
 pub mod health;
 pub mod ops;
 pub mod plan;

@@ -197,6 +197,12 @@ Set `S7TRACE_SERVER` to avoid repeating `-r`; use `S7TRACE_PORT` or
 `--server-port` for a non-default port. A bare host, `host:port`, and a full
 `http://host:port` URL are accepted.
 
+For scripts and LLM agents, add `--json` (or set `S7TRACE_JSON=1`): every
+command then prints one JSON envelope with a stable error code, a retry hint
+and the queued `command_id`. A command that times out keeps running on the
+server; follow it with `command-wait <command_id>` instead of resubmitting. See
+[`docs/machine-output.md`](docs/machine-output.md).
+
 Do not expose port `7707` directly to the public Internet. Use a VPN or another
 protected private network and enable `S7TRACE_TOKEN`.
 
@@ -259,7 +265,33 @@ s7trace --local-db --db s7trace.db sql \
 The `sql` command accepts read-only `SELECT`, `WITH`, and `PRAGMA` statements,
 applies a row limit, and has a timeout. This is a practical boundary for LLM
 tools: ask the agent to inspect the schema and construct narrow queries instead
-of dumping the entire time-series into its context.
+of dumping the entire time-series into its context. A server answers at most
+10000 rows whatever `--limit` says; a cut result says so (`truncated` in JSON,
+a note on stderr otherwise).
+
+To pull the raw samples of some tags over a long window, use `sample-export`
+instead. It has no row cap: it reads in pages, merges the tags in timestamp
+order and streams JSON Lines or CSV:
+
+```sh
+s7trace -r 127.0.0.1 sample-export --tag motor.speed --tag motor.state \
+  --since "2026-10-22 00:00" --until 2026-10-23 --format csv --out day.csv
+```
+
+Times are UTC (`YYYY-MM-DD[ HH:MM[:SS]]`), RFC 3339 with an offset, or Unix
+microseconds; `--until` is exclusive. Rows carry `span_id`, so fields read in
+the same physical read can be joined.
+
+Restarts and pauses are recorded in `event_marker`: `server_start` (with the
+downtime since the previous stop), `server_stop`, `collection_start` and
+`collection_stop`. When the previous run ended without a clean stop (a crash
+or a killed process), the next start writes its `server_stop` with
+`"clean": false`, dated by the last cycle or collection change of that run:
+
+```sh
+s7trace -r 127.0.0.1 sql "SELECT datetime(ts / 1000000, 'unixepoch') AS t, kind, details_json
+  FROM event_marker WHERE kind LIKE 'server_%' OR kind LIKE 'collection_%' ORDER BY ts"
+```
 
 Run `s7trace --help` for all commands and `s7trace <command> --help` for one
 command's exact options.
@@ -269,6 +301,38 @@ command's exact options.
 > local web view containing the resulting plots. This is a roadmap idea, not a
 > feature in the current release; configuration, collection, and analysis are
 > CLI/SQL-driven today.
+
+### Bound the database size
+
+Samples are kept forever by default. Set a sample retention window and the
+server deletes older samples while collection runs, together with the poll
+cycles and read spans nothing references any more:
+
+```sh
+s7trace -r s7trace-site.example history-policy --sample-days 30
+```
+
+Cleanup runs a minute after the server starts and then once a day, in small
+batches with pauses so it does not stall sample writing. Poll cycles have their
+own window (`--cycle-days`, default 14); past it, only the cycles that samples
+still reference are kept. Before any are deleted, each complete UTC day is
+summarised in `poll_cycle_daily`, per PLC and poll group: cycles, failures,
+overruns, latency and the longest gap between cycles (`max_gap_ms`, ending at
+`max_gap_end_ts`). That table keeps telling a polling outage from a quiet
+stretch after the cycles themselves are gone:
+
+```sh
+s7trace -r 127.0.0.1 sql "SELECT date(day_ts / 1000000, 'unixepoch') AS day, plc_id, poll_group_id,
+  cycles, failed, round(max_gap_ms / 60000.0, 1) AS max_gap_min FROM poll_cycle_daily ORDER BY day_ts"
+```
+
+Deleted rows leave free space inside the file that new samples reuse. When at
+least a quarter of the file is free (and at least 64 MB), the server runs
+`VACUUM` at startup, before collection and the CLI transport start, and the
+file shrinks. This rewrites the whole database: it takes minutes on a large
+file and needs free disk space about the size of the result. If it fails, for
+example on a full disk, the server logs it and starts on the unchanged
+database. `server --no-startup-vacuum` skips it.
 
 ## Operational safety
 
@@ -316,6 +380,8 @@ See [`docs/architecture.md`](docs/architecture.md) for implementation details.
 - [`docs/concept.md`](docs/concept.md) — design principles and scope.
 - [`docs/architecture.md`](docs/architecture.md) — data flow and components.
 - [`docs/server-ui.md`](docs/server-ui.md) — native Windows control window.
+- [`docs/machine-output.md`](docs/machine-output.md) — the `--json` envelope,
+  error codes and exit codes for scripts and agents.
 - [`docs/cli-ergonomics.md`](docs/cli-ergonomics.md) — proposed CLI improvements.
 - [`docs/spike-multiread-chunking.md`](docs/spike-multiread-chunking.md) — S7
   multi-read batching and PDU constraints.

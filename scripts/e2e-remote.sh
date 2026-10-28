@@ -62,7 +62,7 @@ echo "==> 3. Verify remote CLI status"
 status=$("$BIN" --db "$DB" \
     -r "http://127.0.0.1:$HTTP_PORT" \
     status --format json 2>&1)
-echo "$status" | grep -q '"service": "s7trace"' || {
+echo "$status" | grep -q '"service": *"s7trace"' || {
     echo "    FAIL: remote CLI status failed"
     echo "    $status"
     exit 4
@@ -111,7 +111,7 @@ echo "==> 7. CLI read via -r (plc_read kind)"
 out=$("$BIN" --db "$DB" \
     -r "http://127.0.0.1:$HTTP_PORT" \
     --remote-timeout-ms 5000 \
-    read --plc test_plc --address DB5997.DBW0 --type i16 --format text 2>&1)
+    read --plc test_plc --address DB5997.DBW0 --type i16 2>&1)
 echo "    $out"
 echo "$out" | grep -qE "(disconnected|failed|not_connected)" || {
     echo "    FAIL: expected disconnection or failure for read"

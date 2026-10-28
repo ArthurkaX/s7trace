@@ -25,7 +25,12 @@ pub(super) fn execute_plc_read(
             rusqlite::params![plc_name],
             |row| row.get(0),
         )
-        .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?;
+        .map_err(|_| {
+            crate::types::coded(
+                crate::types::ErrorCode::NotFound,
+                format!("PLC '{plc_name}' not found"),
+            )
+        })?;
 
     // Get a handle from the registry. Interactive reads preempt pollers so an
     // ad-hoc `read` doesn't wait behind a polling sweep on the same PLC.
@@ -33,22 +38,25 @@ pub(super) fn execute_plc_read(
         let reg = plcs.lock();
         reg.get(&plc_id)
             .map(|h| h.with_priority(crate::plc::PRIORITY_INTERACTIVE))
-            .ok_or_else(|| anyhow::anyhow!("PLC {plc_id} client not registered"))?
+            .ok_or_else(|| {
+                crate::types::coded(
+                    crate::types::ErrorCode::PlcError,
+                    format!("PLC {plc_id} client not registered"),
+                )
+            })?
     };
 
     match action {
         "read_raw" => {
-            let db: u16 = req["db"]
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("missing db"))? as u16;
-            let start: usize = req["start"]
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("missing start"))?
-                as usize;
-            let len: usize = req["len"]
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("missing len"))?
-                as usize;
+            let db: u16 = req["db"].as_i64().ok_or_else(|| {
+                crate::types::coded(crate::types::ErrorCode::InvalidArgument, "missing db")
+            })? as u16;
+            let start: usize = req["start"].as_i64().ok_or_else(|| {
+                crate::types::coded(crate::types::ErrorCode::InvalidArgument, "missing start")
+            })? as usize;
+            let len: usize = req["len"].as_i64().ok_or_else(|| {
+                crate::types::coded(crate::types::ErrorCode::InvalidArgument, "missing len")
+            })? as usize;
             let format_str = req["format"].as_str().unwrap_or("hex");
 
             let data = client.read_db(db, start, len)?;
@@ -130,11 +138,18 @@ pub(super) fn execute_plc_read(
             let address = req["address"].as_str().unwrap_or("");
             let data_type = req["data_type"].as_str().unwrap_or("");
 
-            let dt: DataType = data_type
-                .parse()
-                .map_err(|e: String| anyhow::anyhow!("invalid data type: {e}"))?;
-            let addr =
-                S7Address::parse(address).map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+            let dt: DataType = data_type.parse().map_err(|e: String| {
+                crate::types::coded(
+                    crate::types::ErrorCode::InvalidArgument,
+                    format!("invalid data type: {e}"),
+                )
+            })?;
+            let addr = S7Address::parse(address).map_err(|e| {
+                crate::types::coded(
+                    crate::types::ErrorCode::InvalidAddress,
+                    format!("invalid address: {e}"),
+                )
+            })?;
 
             let data = client.read_db(addr.db_num, addr.byte_offset, dt.byte_size())?;
 

@@ -11,9 +11,7 @@ use rusqlite::Connection;
 /// Resolve the server base URL from CLI args.
 /// Returns None when no server address is configured.
 pub(crate) fn server_base(cli: &Cli) -> Option<String> {
-    cli.remote_server
-        .as_ref()
-        .map(|s| cli::remote::resolve_url(s, cli.server_port))
+    cli::remote_base(cli)
 }
 
 mod api;
@@ -41,14 +39,20 @@ fn main() -> Result<()> {
 }
 
 fn run_main() -> Result<()> {
+    use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
+    // Logs go to stderr so a client command's stdout holds only its result:
+    // `--format json` output stays parseable. Colour only on a terminal, so
+    // redirected server logs carry no escape codes.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
-    let cli = Cli::parse();
+    let cli = parse_cli();
 
     match &cli.command {
         None => {
@@ -58,20 +62,23 @@ fn run_main() -> Result<()> {
             std::process::exit(ExitCode::BadInput as i32);
         }
         Some(Command::Server { dry_run: false, .. }) => {
-            let (dry_run, http_bind, control_window, strict_overrun) = match &cli.command {
-                Some(Command::Server {
-                    dry_run,
-                    http_bind,
-                    no_ui,
-                    strict_overrun,
-                }) => (
-                    *dry_run,
-                    http_bind.clone().or(Some("0.0.0.0:7707".to_string())),
-                    !*no_ui,
-                    *strict_overrun,
-                ),
-                _ => (false, Some("0.0.0.0:7707".to_string()), false, false),
-            };
+            let (dry_run, http_bind, control_window, strict_overrun, startup_vacuum) =
+                match &cli.command {
+                    Some(Command::Server {
+                        dry_run,
+                        http_bind,
+                        no_ui,
+                        strict_overrun,
+                        no_startup_vacuum,
+                    }) => (
+                        *dry_run,
+                        http_bind.clone().or(Some("0.0.0.0:7707".to_string())),
+                        !*no_ui,
+                        *strict_overrun,
+                        !*no_startup_vacuum,
+                    ),
+                    _ => (false, Some("0.0.0.0:7707".to_string()), false, false, true),
+                };
             if dry_run {
                 return dry_run_check(&cli.db);
             }
@@ -86,26 +93,20 @@ fn run_main() -> Result<()> {
                 http_bind,
                 control_window,
                 overrun_mode,
+                startup_vacuum,
             };
             engine::server::run_server_with_config(config)
         }
         Some(Command::Server { .. }) => dry_run_check(&cli.db),
         Some(_) => {
-            validate_client_target(&cli)?;
-            // Remote mode never opens a local database. Every command that
-            // reaches dispatch is remote-servable (checked above) and returns
-            // in its remote branch before touching SQLite, so a bare in-memory
-            // placeholder satisfies the handlers' `&Connection` without
-            // opening, creating, or migrating anything on disk. Local mode
-            // opens (and migrates) the on-disk database as before.
-            let conn = if cli.remote_server.is_some() {
-                rusqlite::Connection::open_in_memory()
-                    .context("opening in-memory client placeholder database")?
-            } else {
-                db::schema::open(&cli.db)
-                    .with_context(|| format!("opening database {} for s7trace", cli.db))?
+            let exit_code = match run_client(&cli) {
+                Ok(code) => code,
+                Err(e) => {
+                    let err = cli::output::classify(&e);
+                    cli::output::report_error(&err, machine_errors(&cli));
+                    err.code.exit_code()
+                }
             };
-            let exit_code = dispatch(&cli, &conn)?;
             std::process::exit(exit_code as i32);
         }
     }
@@ -117,25 +118,136 @@ fn validate_client_target(cli: &Cli) -> Result<()> {
         .as_ref()
         .expect("validate_client_target called without command");
     if cli.remote_server.is_none() && !cli.local_db {
-        eprintln!(
-            "error: client target not specified. Use `-r http://HOST:8080` for a server, or `--local-db` for direct local SQLite access."
-        );
-        std::process::exit(ExitCode::BadInput as i32);
+        return Err(cli::output::fail(
+            ErrorCode::InvalidArgument,
+            "client target not specified. Use `-r http://HOST:8080` for a server, or `--local-db` for direct local SQLite access.",
+        ));
     }
     if cli.remote_server.is_some() && !supports_remote(cmd) {
-        eprintln!(
-            "error: `{}` does not support remote mode. Use `--local-db` on the server host with the correct --db path, or use a dedicated supported remote command.",
-            command_name(cmd)
-        );
-        std::process::exit(ExitCode::BadInput as i32);
+        return Err(cli::output::fail(
+            ErrorCode::InvalidArgument,
+            format!(
+                "`{}` does not support remote mode. Use `--local-db` on the server host with the correct --db path, or use a dedicated supported remote command.",
+                command_name(cmd)
+            ),
+        ));
     }
     Ok(())
+}
+
+/// Commands whose output is JSON in every mode, so their errors are too.
+fn always_json(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Read { .. }
+            | Command::ReadRaw { .. }
+            | Command::CollectionStart { .. }
+            | Command::CollectionStop { .. }
+    )
+}
+
+/// Whether a failure is reported as the JSON envelope on stdout rather than
+/// text on stderr: with `--json`, for always-JSON commands, and whenever the
+/// caller asked for a JSON `--format`.
+fn machine_errors(cli: &Cli) -> bool {
+    use cli::format::Format;
+    let Some(cmd) = cli.command.as_ref() else {
+        return cli.json;
+    };
+    let json_format = match cmd {
+        Command::Sql { format, .. }
+        | Command::CommandList { format, .. }
+        | Command::CommandResult { format, .. }
+        | Command::Status { format } => *format != Format::Text,
+        _ => false,
+    };
+    cli.json || always_json(cmd) || json_format
+}
+
+/// Run a client command: check the target, open the database, dispatch.
+fn run_client(cli: &Cli) -> Result<ExitCode> {
+    validate_client_target(cli)?;
+    // Remote mode never opens a local database. Every command that reaches
+    // dispatch is remote-servable (checked above) and returns in its remote
+    // branch before touching SQLite, so a bare in-memory placeholder satisfies
+    // the handlers' `&Connection` without opening, creating, or migrating
+    // anything on disk. Local mode opens (and migrates) the on-disk database.
+    let conn = if cli.remote_server.is_some() {
+        rusqlite::Connection::open_in_memory()
+            .context("opening in-memory client placeholder database")?
+    } else {
+        db::schema::open(&cli.db)
+            .with_context(|| format!("opening database {} for s7trace", cli.db))?
+    };
+    dispatch(cli, &conn)
+}
+
+/// `--json` as seen before clap has parsed anything, so a usage error can be
+/// reported in the envelope too.
+fn json_requested() -> bool {
+    std::env::args().skip(1).any(|a| a == "--json")
+        || std::env::var("S7TRACE_JSON")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no" | "off" | "n" | "f"
+                )
+            })
+            .unwrap_or(false)
+}
+
+/// Parse the command line. With `--json`, a usage error becomes an
+/// `invalid_argument` envelope (exit 1) instead of clap's text (exit 2).
+fn parse_cli() -> Cli {
+    use clap::error::ErrorKind;
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let informational = matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            if informational || !json_requested() {
+                e.exit();
+            }
+            let message = usage_message(&e.to_string());
+            cli::output::report_error(
+                &cli::output::CliError::new(ErrorCode::InvalidArgument, message),
+                true,
+            );
+            std::process::exit(ExitCode::BadInput as i32);
+        }
+    }
+}
+
+/// clap's error text without the trailing usage and help hint, on one line:
+/// "the following required arguments were not provided: <COMMAND_ID>".
+fn usage_message(rendered: &str) -> String {
+    let message = rendered
+        .lines()
+        .take_while(|l| !l.starts_with("Usage:") && !l.starts_with("For more information"))
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let message = message.trim_start_matches("error: ");
+    if message.is_empty() {
+        "invalid arguments".into()
+    } else {
+        message.into()
+    }
 }
 
 fn supports_remote(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::Sql { .. }
+            | Command::SampleExport { .. }
+            | Command::CommandList { .. }
+            | Command::CommandWait { .. }
+            | Command::CommandResult { .. }
             | Command::CommandCancel { .. }
             | Command::TagAdd { .. }
             | Command::TagUpdate { .. }
@@ -167,6 +279,7 @@ fn supports_remote(cmd: &Command) -> bool {
 fn command_name(cmd: &Command) -> &'static str {
     match cmd {
         Command::Sql { .. } => "sql",
+        Command::SampleExport { .. } => "sample-export",
         Command::AdminSql { .. } => "admin-sql",
         Command::CommandList { .. } => "command-list",
         Command::CommandWait { .. } => "command-wait",
@@ -250,22 +363,45 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             format: fmt,
             limit,
             timeout_ms,
-        } => crate::handlers::sql::handle_sql(conn, cli, query, fmt, *limit, *timeout_ms),
+        } => crate::handlers::sql::handle_sql(conn, cli, query, *fmt, *limit, *timeout_ms),
+        Command::SampleExport {
+            tags,
+            plc,
+            since,
+            until,
+            format,
+            out,
+            page_rows,
+        } => crate::handlers::export::handle_sample_export(
+            cli,
+            conn,
+            tags,
+            plc.as_deref(),
+            since,
+            until,
+            *format,
+            out.as_deref(),
+            *page_rows,
+        ),
         Command::AdminSql { query } => crate::handlers::sql::handle_admin_sql(cli, conn, query),
         Command::CommandList { state, format: fmt } => {
-            crate::handlers::commands::handle_command_list(conn, state.as_deref(), fmt)
+            crate::handlers::commands::handle_command_list(cli, conn, state.as_deref(), *fmt)
         }
         Command::CommandWait {
             command_id,
             poll_ms,
             timeout_ms,
-        } => {
-            crate::handlers::commands::handle_command_wait(conn, *command_id, *poll_ms, *timeout_ms)
-        }
+        } => crate::handlers::commands::handle_command_wait(
+            cli,
+            conn,
+            *command_id,
+            *poll_ms,
+            *timeout_ms,
+        ),
         Command::CommandResult {
             command_id,
             format: fmt,
-        } => crate::handlers::commands::handle_command_result(conn, *command_id, fmt),
+        } => crate::handlers::commands::handle_command_result(cli, conn, *command_id, *fmt),
         Command::CommandCancel { command_id } => {
             crate::handlers::commands::handle_command_cancel(conn, cli, *command_id)
         }
@@ -357,8 +493,8 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             plc,
             address,
             data_type,
-            format: fmt,
-        } => crate::handlers::reads::handle_read(cli, conn, plc, address, data_type, fmt),
+            format: _,
+        } => crate::handlers::reads::handle_read(cli, conn, plc, address, data_type),
         Command::ReadRaw {
             plc,
             db,
@@ -373,10 +509,10 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             *db,
             *start,
             *len,
-            fmt,
+            *fmt,
             *save_probe,
         ),
-        Command::Status { format: fmt } => handlers::status::handle_status(cli, conn, fmt),
+        Command::Status { format: fmt } => handlers::status::handle_status(cli, conn, *fmt),
         Command::SetCreate {
             plc,
             name,
@@ -399,22 +535,29 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             // `--from-file` lives on the CLI host: resolve it to a tag-name list
             // here so the operation carries data the server can act on.
             let (tag_field, from_sql_field) = if let Some(path) = from_file {
-                let content = std::fs::read_to_string(path)
-                    .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+                let content = std::fs::read_to_string(path).map_err(|e| {
+                    cli::output::fail(ErrorCode::InvalidArgument, format!("reading {path}: {e}"))
+                })?;
                 let names: Vec<&str> = content
                     .lines()
                     .map(|l| l.trim())
                     .filter(|l| !l.is_empty() && !l.starts_with('#'))
                     .collect();
                 if names.is_empty() {
-                    return Err(anyhow::anyhow!("no tag names found in {path}"));
+                    return Err(cli::output::fail(
+                        ErrorCode::InvalidArgument,
+                        format!("no tag names found in {path}"),
+                    ));
                 }
                 (Some(names.join(",")), None)
             } else {
                 (tag.clone(), from_sql.clone())
             };
             if server_base(cli).is_some() && from_sql_field.is_some() {
-                return Err(anyhow::anyhow!("--from-sql not supported in remote mode"));
+                return Err(cli::output::fail(
+                    ErrorCode::InvalidArgument,
+                    "--from-sql not supported in remote mode",
+                ));
             }
             run_op(
                 cli,
@@ -433,7 +576,10 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             from_sql,
         } => {
             if server_base(cli).is_some() && from_sql.is_some() {
-                return Err(anyhow::anyhow!("--from-sql not supported in remote mode"));
+                return Err(cli::output::fail(
+                    ErrorCode::InvalidArgument,
+                    "--from-sql not supported in remote mode",
+                ));
             }
             run_op(
                 cli,
@@ -525,6 +671,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
                 )
             } else {
                 crate::handlers::history::handle_history_policy(
+                    cli,
                     conn,
                     *cycle_days,
                     *sample_days,
@@ -538,7 +685,7 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
             crate::handlers::history::handle_history_delete_dataset(conn, cli, dataset)
         }
         Command::HistoryVacuum { force } => {
-            crate::handlers::history::handle_history_vacuum(conn, *force)
+            crate::handlers::history::handle_history_vacuum(cli, conn, *force)
         }
         Command::PlcAdd {
             name,
@@ -632,39 +779,39 @@ fn dispatch(cli: &Cli, conn: &Connection) -> Result<ExitCode> {
 /// replaces the per-command "if remote { build JSON; enqueue; wait } else
 /// { local work }" boilerplate that used to be copy-pasted into every handler.
 fn run_op(cli: &Cli, conn: &Connection, op: engine::ops::Op) -> Result<ExitCode> {
-    if let Some(base) = server_base(cli) {
-        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
-        let id = cli::remote::enqueue_command(
-            &base,
-            "control",
-            &serde_json::to_string(&op)?,
-            Some("cli"),
-            None,
-            timeout,
-        )?;
-        println!("queued command_id={id}");
-        let (state, result, ok, err) =
-            cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
-        if ok {
-            println!("success {result}");
-            Ok(ExitCode::Ok)
-        } else {
-            println!("{state}: {result} {err}");
-            Ok(ExitCode::BadInput)
-        }
+    let (command_id, result) = if let Some(base) = server_base(cli) {
+        let (id, value) =
+            cli::queue::submit_and_wait(cli, &base, "control", &serde_json::to_value(&op)?, true)?;
+        (Some(id), op_result(value))
     } else {
         let out = engine::ops::execute(&engine::ops::ExecCtx::local(conn), op)?;
-        if out.ok {
-            if out.data.is_null() {
-                println!("success {}", out.message);
-            } else {
-                cli::format::print_json_ok(&out.data);
-            }
-            Ok(ExitCode::Ok)
-        } else {
-            println!("{}", out.message);
-            Ok(ExitCode::BadInput)
+        if !out.ok {
+            return Err(cli::output::CliError::new(
+                out.code.unwrap_or(ErrorCode::CommandFailed),
+                out.message,
+            )
+            .with_details(out.data)
+            .into());
         }
+        (
+            None,
+            serde_json::json!({ "message": out.message, "data": out.data }),
+        )
+    };
+    let message = result["message"].as_str().unwrap_or_default().to_string();
+    cli::output::emit(cli, result, command_id, || println!("success {message}"));
+    Ok(ExitCode::Ok)
+}
+
+/// An op's result as `{"message", "data"}`. A server older than this CLI
+/// stores only the message string; wrap it the same way.
+fn op_result(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(ref o) if o.contains_key("message") => value,
+        serde_json::Value::String(message) => {
+            serde_json::json!({ "message": message, "data": null })
+        }
+        other => serde_json::json!({ "message": "", "data": other }),
     }
 }
 
@@ -703,27 +850,80 @@ mod tests {
             server_port: 7707,
             local_db: true,
             remote_timeout_ms: 30_000,
+            json: false,
             command: None,
         }
     }
 
     #[test]
+    fn usage_message_keeps_the_missing_argument_names() {
+        let rendered = "error: the following required arguments were not provided:\n  <COMMAND_ID>\n\nUsage: s7trace command-result <COMMAND_ID>\n\nFor more information, try '--help'.\n";
+        assert_eq!(
+            usage_message(rendered),
+            "the following required arguments were not provided: <COMMAND_ID>"
+        );
+        assert_eq!(
+            usage_message("error: invalid value 'x' for '--format <FORMAT>'\n"),
+            "invalid value 'x' for '--format <FORMAT>'"
+        );
+    }
+    #[test]
     fn test_handle_sql_select() {
         let conn = db::schema::open_memory().unwrap();
         let cli = local_cli();
-        let result =
-            crate::handlers::sql::handle_sql(&conn, &cli, "SELECT 1 AS col", "json", 10, 5000);
+        let result = crate::handlers::sql::handle_sql(
+            &conn,
+            &cli,
+            "SELECT 1 AS col",
+            cli::format::Format::Json,
+            10,
+            5000,
+        );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_local_sql_reports_truncation_at_cap() {
+        let conn = db::schema::open_memory().unwrap();
+        let q = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) \
+                 SELECT i FROM n";
+        let (cols, rows, truncated) = crate::handlers::sql::query_local(&conn, q, 3).unwrap();
+        assert_eq!(cols, vec!["i"]);
+        assert_eq!(rows.len(), 3);
+        assert!(truncated);
+
+        // Exactly at the cap is complete, not truncated.
+        let (_, rows, truncated) = crate::handlers::sql::query_local(&conn, q, 5).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_local_sql_own_limit_cannot_widen_cap() {
+        let conn = db::schema::open_memory().unwrap();
+        // A trailing semicolon used to break the appended `LIMIT` text.
+        let q = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50) \
+                 SELECT i FROM n LIMIT 40;";
+        let (_, rows, truncated) = crate::handlers::sql::query_local(&conn, q, 10).unwrap();
+        assert_eq!(rows.len(), 10);
+        assert!(truncated);
     }
 
     #[test]
     fn test_handle_sql_rejects_write() {
         let conn = db::schema::open_memory().unwrap();
         let cli = local_cli();
-        let result =
-            crate::handlers::sql::handle_sql(&conn, &cli, "DELETE FROM tag", "json", 10, 5000);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
+        let result = crate::handlers::sql::handle_sql(
+            &conn,
+            &cli,
+            "DELETE FROM tag",
+            cli::format::Format::Json,
+            10,
+            5000,
+        );
+        let err = cli::output::classify(&result.unwrap_err());
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.code.exit_code(), ExitCode::BadInput);
     }
 
     #[test]
@@ -734,8 +934,10 @@ mod tests {
         cli.local_db = false;
         let result =
             crate::handlers::sql::handle_admin_sql(&cli, &conn, "UPDATE plc SET enabled = 0");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap() as i32, ExitCode::BadInput as i32);
+        let err = cli::output::classify(&result.unwrap_err());
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        // Nothing ran: the local database is untouched.
+        assert_eq!(err.code.exit_code(), ExitCode::BadInput);
     }
 
     #[test]
@@ -799,6 +1001,7 @@ signals:
             server_port: 7707,
             local_db: true,
             remote_timeout_ms: 30_000,
+            json: false,
             command: None,
         };
 
@@ -855,6 +1058,7 @@ signals:
             server_port: 7707,
             local_db: false,
             remote_timeout_ms: 30_000,
+            json: false,
             command: None,
         };
         // Remote path reads file first (before connecting to server); file-not-found

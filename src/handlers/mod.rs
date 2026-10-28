@@ -7,6 +7,7 @@
 pub mod collection;
 pub mod commands;
 pub mod events;
+pub mod export;
 pub mod history;
 pub mod import;
 pub mod reads;

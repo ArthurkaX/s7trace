@@ -135,6 +135,73 @@ pub(crate) fn handle_sample(db: &Arc<Mutex<Connection>>, query: &[(String, Strin
     Response::json(serde_json::json!({"tag_id": tag_id, "samples": out, "count": out.len()}))
 }
 
+/// One page of `sample-export`: `tag` (id or name, `plc` to pick among
+/// PLCs) or `tag_id`, `since_ts <= ts < until_ts`, after the cursor `after_ts`/`after_rowid`.
+/// Rows are `[rowid, ts, vi, vf, dataset_id, cycle_id, span_id]`; `more` says
+/// whether the next page has any.
+pub(crate) fn handle_export(db: &Arc<Mutex<Connection>>, query: &[(String, String)]) -> Response {
+    use crate::db::export;
+    let num = |key: &str| param_owned(query, key).and_then(|s| s.parse::<i64>().ok());
+    let tag_id = num("tag_id");
+    let tag = param_owned(query, "tag").unwrap_or_default();
+    if tag_id.is_none() && tag.is_empty() {
+        return Response::err(400, "missing tag or tag_id parameter");
+    }
+    let plc = param_owned(query, "plc");
+    let (Some(since), Some(until)) = (num("since_ts"), num("until_ts")) else {
+        return Response::err(400, "since_ts and until_ts are required");
+    };
+    let after = num("after_ts").zip(num("after_rowid"));
+    let limit = num("limit").unwrap_or(export::MAX_PAGE_ROWS);
+
+    let conn = db.lock();
+    // Later pages pass the id the first page resolved.
+    let found = match tag_id {
+        Some(id) => export::tag_by_id(&conn, id).map(|t| t.ok_or(export::TagLookup::NotFound)),
+        None => export::resolve_tag(&conn, &tag, plc.as_deref()),
+    };
+    let tag = match found {
+        Ok(Ok(t)) => t,
+        Ok(Err(export::TagLookup::NotFound)) => {
+            let what = tag_id.map_or(format!("tag '{tag}'"), |id| format!("tag id {id}"));
+            return Response::err(404, &format!("{what} not found"));
+        }
+        Ok(Err(export::TagLookup::Ambiguous(plcs))) => {
+            return Response::err(
+                400,
+                &format!("tag '{tag}' exists on PLCs {}; pass --plc", plcs.join(", ")),
+            )
+        }
+        Err(e) => return Response::err(500, &format!("tag lookup: {e}")),
+    };
+    let (rows, more) = match export::page(&conn, tag.id, since, until, after, limit) {
+        Ok(r) => r,
+        Err(e) => return Response::err(500, &format!("export: {e}")),
+    };
+    drop(conn);
+    let rows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!([
+                r.rowid,
+                r.ts,
+                r.vi,
+                r.vf,
+                r.dataset_id,
+                r.cycle_id,
+                r.span_id
+            ])
+        })
+        .collect();
+    Response::json(serde_json::json!({
+        "tag_id": tag.id,
+        "tag": tag.name,
+        "plc": tag.plc,
+        "rows": rows,
+        "more": more,
+    }))
+}
+
 fn run_sample_query(
     conn: &Connection,
     sql: &str,
@@ -307,7 +374,7 @@ pub(crate) fn handle_command_list(
     let conn = db.lock();
     let mut sql = String::from(
         "SELECT id, kind, COALESCE(requested_by, ''), state, COALESCE(request_json, ''),
-                created_ts
+                created_ts, finished_ts, error
          FROM command_request WHERE 1=1",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -333,6 +400,10 @@ pub(crate) fn handle_command_list(
                 "state": row.get::<_, String>(3).unwrap_or_default(),
                 "request_json": row.get::<_, String>(4).unwrap_or_default(),
                 "created_ts": row.get::<_, i64>(5).unwrap_or(0),
+                // Same fields as the local `command-list`, so the CLI renders
+                // both sources identically.
+                "finished_ts": row.get::<_, Option<i64>>(6).unwrap_or(None),
+                "error": row.get::<_, Option<String>>(7).unwrap_or(None),
             }));
         }
     }
@@ -401,6 +472,10 @@ pub(crate) fn handle_command_post(db: &Arc<Mutex<Connection>>, body: &[u8]) -> R
 
 pub(crate) fn handle_command_cancel(db: &Arc<Mutex<Connection>>, id: i64) -> Response {
     let conn = db.lock();
+    // `cancel` alone cannot tell an unknown id from one no longer pending.
+    if matches!(command_queue::get_request(&conn, id), Ok(None)) {
+        return Response::err(404, "command not found");
+    }
     match command_queue::cancel(&conn, id) {
         Ok(true) => Response::empty(204),
         Ok(false) => Response::err(409, "command not cancellable (not pending)"),
@@ -475,13 +550,15 @@ pub(crate) fn handle_set_show_api(
 
     let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = match &plc {
         Some(p) => (
-            "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
+            "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description,
+                    (SELECT name FROM plc WHERE plc.id = ms.plc_id)
              FROM metric_set ms JOIN plc ON plc.id = ms.plc_id
              WHERE ms.name = ?1 AND plc.name = ?2",
             vec![&set_name, p],
         ),
         None => (
-            "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description
+            "SELECT ms.id, ms.plc_id, ms.name, ms.enabled, ms.description,
+                    (SELECT name FROM plc WHERE plc.id = ms.plc_id)
              FROM metric_set ms WHERE ms.name = ?1",
             vec![&set_name],
         ),
@@ -493,7 +570,8 @@ pub(crate) fn handle_set_show_api(
         let name: String = row.get(2)?;
         let enabled: bool = row.get::<_, i64>(3)? != 0;
         let desc: Option<String> = row.get(4)?;
-        Ok((id, plc_id, name, enabled, desc))
+        let plc_name: Option<String> = row.get(5)?;
+        Ok((id, plc_id, name, enabled, desc, plc_name))
     }) {
         Ok(info) => info,
         Err(_) => {
@@ -507,7 +585,7 @@ pub(crate) fn handle_set_show_api(
         }
     };
 
-    let (id, plc_id, name, enabled, description) = set_info;
+    let (id, plc_id, name, enabled, description, plc_name) = set_info;
 
     // Members are keyed by set name in the view, so scope them by set id to
     // avoid pulling in a same-named set that belongs to another PLC.
@@ -538,6 +616,7 @@ pub(crate) fn handle_set_show_api(
     Response::json(serde_json::json!({
         "id": id,
         "plc_id": plc_id,
+        "plc": plc_name,
         "name": name,
         "enabled": enabled,
         "description": description,
@@ -680,5 +759,7 @@ pub(crate) fn handle_sql(db: &Arc<Mutex<Connection>>, query: &[(String, String)]
         "rows": rows,
         "count": rows.len(),
         "truncated": truncated,
+        "limit": limit,
+        "max_rows": SQL_MAX_ROWS,
     }))
 }

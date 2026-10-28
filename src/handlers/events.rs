@@ -4,6 +4,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::cli::args::{Cli, EventAction};
+use crate::cli::output::{self, fail};
 use crate::types::*;
 
 pub(crate) fn handle_event_add(
@@ -22,13 +23,17 @@ pub(crate) fn handle_event_add(
 
     // Remote mode not supported yet — event markers are local-only.
     if cli.remote_server.is_some() {
-        eprintln!("error: event markers are not supported via remote server yet");
-        return Ok(ExitCode::BadInput);
+        return Err(fail(
+            ErrorCode::InvalidArgument,
+            "event markers are not supported via remote server yet",
+        ));
     }
 
     if text.trim().is_empty() {
-        eprintln!("error: event text cannot be empty");
-        return Ok(ExitCode::BadInput);
+        return Err(fail(
+            ErrorCode::InvalidArgument,
+            "event text cannot be empty",
+        ));
     }
 
     // Resolve plc_id: either from --plc flag or auto-detect the first enabled PLC.
@@ -40,7 +45,10 @@ pub(crate) fn handle_event_add(
                 |row| row.get(0),
             )
             .map_err(|_| {
-                anyhow::anyhow!("PLC '{name}' not found. Create it first with 's7trace plc-add'.")
+                fail(
+                    ErrorCode::NotFound,
+                    format!("PLC '{name}' not found. Create it first with 's7trace plc-add'."),
+                )
             })?,
         None => conn
             .query_row(
@@ -49,8 +57,9 @@ pub(crate) fn handle_event_add(
                 |row| row.get(0),
             )
             .map_err(|_| {
-                anyhow::anyhow!(
-                    "no PLC found. Either create a PLC with 's7trace plc-add' or specify --plc."
+                fail(
+                    ErrorCode::NotFound,
+                    "no PLC found. Either create a PLC with 's7trace plc-add' or specify --plc.",
                 )
             })?,
     };
@@ -63,7 +72,12 @@ pub(crate) fn handle_event_add(
                 rusqlite::params![name, plc_id],
                 |row| row.get(0),
             )
-            .map_err(|_| anyhow::anyhow!("Dataset '{name}' not found for PLC id={plc_id}."))?,
+            .map_err(|_| {
+                fail(
+                    ErrorCode::NotFound,
+                    format!("Dataset '{name}' not found for PLC id={plc_id}."),
+                )
+            })?,
         ),
         None => None,
     };
@@ -77,6 +91,11 @@ pub(crate) fn handle_event_add(
     )?;
 
     let id = conn.last_insert_rowid();
-    println!("event id={id} plc_id={plc_id} kind={kind} ts={now_us}");
+    output::emit(
+        cli,
+        serde_json::json!({ "id": id, "plc_id": plc_id, "kind": kind, "ts": now_us }),
+        None,
+        || println!("event id={id} plc_id={plc_id} kind={kind} ts={now_us}"),
+    );
     Ok(ExitCode::Ok)
 }

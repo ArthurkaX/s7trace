@@ -20,10 +20,60 @@ pub fn resolve_url(host_or_url: &str, default_port: u16) -> String {
     format!("http://{}:{}", s, default_port)
 }
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
+use std::fmt;
 use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::time::{Duration, Instant};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+use crate::db::command_queue::CommandListRow;
+use crate::types::{coded, CommandKind, CommandResult, CommandState, ErrorCode};
+
+/// A failure talking to the server, kept typed so the CLI can tell an
+/// unreachable server from one that answered with an error.
+#[derive(Debug)]
+pub enum RemoteError {
+    /// No connection: refused, unresolvable host, reset or socket timeout.
+    Unavailable(String),
+    /// The server answered with a non-2xx status; `message` is its `error`.
+    Http { status: u16, message: String },
+    /// The response could not be read as HTTP/JSON.
+    Protocol(String),
+}
+
+impl RemoteError {
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            RemoteError::Unavailable(_) => ErrorCode::ServerUnavailable,
+            RemoteError::Http { status, .. } => match status {
+                400 => ErrorCode::InvalidArgument,
+                401 | 403 => ErrorCode::Unauthorized,
+                404 => ErrorCode::NotFound,
+                409 => ErrorCode::Conflict,
+                503 => ErrorCode::ServerUnavailable,
+                _ => ErrorCode::ServerError,
+            },
+            RemoteError::Protocol(_) => ErrorCode::ServerError,
+        }
+    }
+}
+
+impl fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RemoteError::Unavailable(m) => write!(f, "server unavailable: {m}"),
+            // A 4xx is about the request: the server's own message says it
+            // all, and `code` carries the status class.
+            RemoteError::Http { status, message } if (400..500).contains(status) => {
+                f.write_str(message)
+            }
+            RemoteError::Http { status, message } => write!(f, "server error {status}: {message}"),
+            RemoteError::Protocol(m) => write!(f, "invalid server response: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for RemoteError {}
 
 /// Connect to a remote s7trace server and enqueue a command.
 ///
@@ -48,61 +98,113 @@ pub fn enqueue_command(
     });
     let body_str = body.to_string();
     let resp = http_post(base_url, "/v1/command", &body_str, timeout)?;
-    let v: serde_json::Value = serde_json::from_str(&resp)
-        .with_context(|| format!("invalid JSON from /v1/command: {resp}"))?;
-    v["id"]
-        .as_i64()
-        .ok_or_else(|| anyhow!("/v1/command did not return id: {resp}"))
+    let v = parse_json("/v1/command", &resp)?;
+    v["id"].as_i64().ok_or_else(|| {
+        RemoteError::Protocol(format!("/v1/command did not return id: {resp}")).into()
+    })
 }
 
-/// Poll a single command until it leaves the 'pending' or 'running' state.
-/// Returns the final `state` ("ok", "failed", "cancelled", "rejected") and
-/// the `result` string from the server.
-pub fn wait_command(
-    base_url: &str,
-    id: i64,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> Result<(String, String, bool, String)> {
-    let started = Instant::now();
-    let url = format!("/v1/command/{id}");
-    loop {
-        let resp = http_get(base_url, &url, timeout)?;
-        let v: serde_json::Value = serde_json::from_str(&resp)
-            .with_context(|| format!("invalid JSON from {url}: {resp}"))?;
-        // Server returns state as Debug-formatted (e.g. "Pending", "Running",
-        // "Ok", "Failed", "Cancelled", "Rejected"). Normalize to lowercase.
-        let state_raw = v["command"]["state"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
-        let state = state_raw.to_lowercase();
-        let result_json = v["result"]["result_json"].as_str().unwrap_or("");
-        let ok = v["result"]["ok"].as_bool().unwrap_or(false);
-        let error = v["result"]["error"].as_str().unwrap_or("").to_string();
-        // The command is finished when there is a `result` row (which only
-        // appears after the worker writes command_result).
-        let finished = v.get("result").map(|r| !r.is_null()).unwrap_or(false);
-        if finished {
-            return Ok((state, result_json.to_string(), ok, error));
-        }
-        if state == "cancelled" || state == "rejected" {
-            return Ok((state, result_json.to_string(), ok, error));
-        }
-        if started.elapsed() > timeout {
-            return Err(anyhow!(
-                "command {id} still in state '{state}' after {:?}",
-                timeout
-            ));
-        }
-        std::thread::sleep(poll_interval);
+/// Server-side view of one command: its state and, once finished, its result.
+#[derive(Debug, Clone)]
+pub struct CommandStatus {
+    pub id: i64,
+    pub kind: Option<CommandKind>,
+    pub state: CommandState,
+    pub result: Option<CommandResult>,
+}
+
+impl CommandStatus {
+    /// Done, failed or cancelled: the state will not change any more.
+    pub fn finished(&self) -> bool {
+        self.result.is_some()
+            || matches!(
+                self.state,
+                CommandState::Done | CommandState::Bad | CommandState::Cancelled
+            )
     }
+
+    pub fn state_str(&self) -> &'static str {
+        match self.state {
+            CommandState::Pending => "pending",
+            CommandState::Running => "running",
+            CommandState::Done => "done",
+            CommandState::Bad => "bad",
+            CommandState::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// `GET /v1/command/{id}`.
+pub fn get_command(base_url: &str, id: i64, timeout: Duration) -> Result<CommandStatus> {
+    let url = format!("/v1/command/{id}");
+    let resp = http_get(base_url, &url, timeout)?;
+    let v = parse_json(&url, &resp)?;
+    parse_command_status(id, &v)
+}
+
+/// Parse the `GET /v1/command/{id}` body. The server writes `state` and `kind`
+/// in Rust Debug form (`"PlcRead"`), so both that and snake_case are accepted.
+fn parse_command_status(id: i64, v: &serde_json::Value) -> Result<CommandStatus> {
+    let state_raw = v["command"]["state"].as_str().unwrap_or("");
+    let state: CommandState =
+        serde_json::from_value(serde_json::Value::String(snake_case(state_raw))).map_err(|_| {
+            RemoteError::Protocol(format!("command {id}: unknown state '{state_raw}'"))
+        })?;
+    let kind = v["command"]["kind"]
+        .as_str()
+        .and_then(|k| serde_json::from_value(serde_json::Value::String(snake_case(k))).ok());
+    let result = match &v["result"] {
+        serde_json::Value::Null => None,
+        r => Some(CommandResult {
+            command_id: id,
+            ok: r["ok"].as_bool().unwrap_or(false),
+            result_json: r["result_json"].as_str().map(str::to_string),
+            error: r["error"].as_str().map(str::to_string),
+        }),
+    };
+    Ok(CommandStatus {
+        id,
+        kind,
+        state,
+        result,
+    })
+}
+
+fn snake_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `GET /v1/command?state=...`: the most recent commands, newest first.
+pub fn list_commands(
+    base_url: &str,
+    state: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<CommandListRow>> {
+    let url = match state {
+        Some(st) => format!("/v1/command?limit=100&state={}", urlencode(st)),
+        None => "/v1/command?limit=100".to_string(),
+    };
+    let resp = http_get(base_url, &url, timeout)?;
+    let v = parse_json(&url, &resp)?;
+    serde_json::from_value(v["commands"].clone())
+        .map_err(|e| RemoteError::Protocol(format!("{url}: {e}")).into())
 }
 
 /// Fetch /v1/status and return the raw JSON string.
 pub fn get_status(base_url: &str, timeout: Duration) -> Result<serde_json::Value> {
     let resp = http_get(base_url, "/v1/status", timeout)?;
-    serde_json::from_str(&resp).with_context(|| format!("invalid JSON from /v1/status: {resp}"))
+    parse_json("/v1/status", &resp)
 }
 
 /// Fetch /v1/tags?... and return the JSON array.
@@ -129,7 +231,7 @@ pub fn get_tags(
         format!("/v1/tags?{}", q.join("&"))
     };
     let resp = http_get(base_url, &url, timeout)?;
-    serde_json::from_str(&resp).with_context(|| format!("invalid JSON from {url}: {resp}"))
+    parse_json(&url, &resp)
 }
 
 /// Fetch /v1/sets?plc=... and return the JSON array.
@@ -144,7 +246,7 @@ pub fn get_set_list(
         "/v1/sets".to_string()
     };
     let resp = http_get(base_url, &url, timeout)?;
-    serde_json::from_str(&resp).with_context(|| format!("invalid JSON from {url}: {resp}"))
+    parse_json(&url, &resp)
 }
 
 /// Fetch /v1/set/{name} and return the JSON object.
@@ -161,15 +263,14 @@ pub fn get_set_show(
         url.push_str(&format!("?plc={}", urlencode(p)));
     }
     let resp = http_get(base_url, &url, timeout)?;
-    serde_json::from_str(&resp).with_context(|| format!("invalid JSON from {url}: {resp}"))
+    parse_json(&url, &resp)
 }
 
 /// POST /v1/command/{id}/cancel to cancel a pending command.
 pub fn cancel_command(base_url: &str, command_id: i64, timeout: Duration) -> Result<()> {
     let path = format!("/v1/command/{command_id}/cancel");
-    let resp = http_post(base_url, &path, "", timeout)?;
-    // Server returns 204 No Content on success
-    let _ = resp;
+    // 204 No Content on success; 409 when the command is no longer pending.
+    http_post(base_url, &path, "", timeout)?;
     Ok(())
 }
 
@@ -187,32 +288,17 @@ fn auth_header() -> String {
 }
 
 pub fn http_get(base_url: &str, path: &str, timeout: Duration) -> Result<String> {
-    let (host, port) = parse_base(base_url)?;
-    let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect_timeout(&addr.parse()?, timeout)
-        .with_context(|| format!("connect to {addr} failed"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
     let auth = auth_header();
+    let (host, port) = parse_base(base_url)?;
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\nAccept: application/json\r\n\r\n"
     );
-    stream.write_all(req.as_bytes())?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
-    parse_http_response(&buf)
+    exchange(&host, port, &req, timeout)
 }
 
 fn http_post(base_url: &str, path: &str, body: &str, timeout: Duration) -> Result<String> {
-    let (host, port) = parse_base(base_url)?;
-    let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect_timeout(&addr.parse()?, timeout)
-        .with_context(|| format!("connect to {addr} failed"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
     let auth = auth_header();
+    let (host, port) = parse_base(base_url)?;
     let req = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
@@ -223,10 +309,47 @@ fn http_post(base_url: &str, path: &str, body: &str, timeout: Duration) -> Resul
          \r\n{body}",
         len = body.len()
     );
-    stream.write_all(req.as_bytes())?;
+    exchange(&host, port, &req, timeout)
+}
+
+fn parse_json(url: &str, resp: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(resp)
+        .map_err(|e| RemoteError::Protocol(format!("invalid JSON from {url}: {e}: {resp}")).into())
+}
+
+/// Send one request and read the whole response. Any socket failure is
+/// [`RemoteError::Unavailable`]; a host name is resolved, not just an IP.
+fn exchange(host: &str, port: u16, req: &str, timeout: Duration) -> Result<String> {
+    let addr = format!("{host}:{port}");
+    let unavailable = |e: std::io::Error| RemoteError::Unavailable(format!("{addr}: {e}"));
+    // Try every resolved address: `localhost` may resolve to `::1` first
+    // while the server listens on 127.0.0.1 only.
+    let mut last_err = None;
+    let mut stream = None;
+    for sock in (host, port).to_socket_addrs().map_err(unavailable)? {
+        match TcpStream::connect_timeout(&sock, timeout) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let mut stream = match (stream, last_err) {
+        (Some(s), _) => s,
+        (None, Some(e)) => return Err(unavailable(e).into()),
+        (None, None) => return Err(RemoteError::Unavailable(format!("{addr}: no address")).into()),
+    };
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(unavailable)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(unavailable)?;
+    stream.write_all(req.as_bytes()).map_err(unavailable)?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
-    parse_http_response(&buf)
+    stream.read_to_end(&mut buf).map_err(unavailable)?;
+    Ok(parse_http_response(&buf)?)
 }
 
 fn parse_base(s: &str) -> Result<(String, u16)> {
@@ -234,22 +357,43 @@ fn parse_base(s: &str) -> Result<(String, u16)> {
     let s = s
         .strip_prefix("http://")
         .or_else(|| s.strip_prefix("https://"))
-        .ok_or_else(|| anyhow!("URL must start with http:// or https://: {s}"))?;
+        .ok_or_else(|| {
+            coded(
+                ErrorCode::InvalidArgument,
+                format!("URL must start with http:// or https://: {s}"),
+            )
+        })?;
     // No TLS support yet; warn if https
     if s.starts_with("https://") {
-        return Err(anyhow!("https is not supported (no TLS dependency): {s}"));
+        return Err(coded(
+            ErrorCode::InvalidArgument,
+            format!("https is not supported (no TLS dependency): {s}"),
+        ));
     }
     // strip trailing slash
     let s = s.trim_end_matches('/');
     if let Some((host_port, _path)) = s.split_once('/') {
-        let (h, p) = host_port
-            .split_once(':')
-            .ok_or_else(|| anyhow!("missing port in URL: {s}"))?;
-        let port: u16 = p.parse().context("invalid port")?;
+        let (h, p) = host_port.split_once(':').ok_or_else(|| {
+            coded(
+                ErrorCode::InvalidArgument,
+                format!("missing port in URL: {s}"),
+            )
+        })?;
+        let port: u16 = p.parse().map_err(|_| {
+            coded(
+                ErrorCode::InvalidArgument,
+                format!("invalid port in URL: {s}"),
+            )
+        })?;
         Ok((h.to_string(), port))
     } else {
         if let Some((h, p)) = s.split_once(':') {
-            let port: u16 = p.parse().context("invalid port")?;
+            let port: u16 = p.parse().map_err(|_| {
+                coded(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid port in URL: {s}"),
+                )
+            })?;
             Ok((h.to_string(), port))
         } else {
             Ok((s.to_string(), 80))
@@ -257,19 +401,29 @@ fn parse_base(s: &str) -> Result<(String, u16)> {
     }
 }
 
-fn parse_http_response(buf: &[u8]) -> Result<String> {
-    let s = std::str::from_utf8(buf).context("non-UTF8 HTTP response")?;
-    let mut parts = s.split("\r\n\r\n");
-    let head = parts.next().ok_or_else(|| anyhow!("empty HTTP response"))?;
-    let body = parts.next().unwrap_or("").to_string();
+fn parse_http_response(buf: &[u8]) -> std::result::Result<String, RemoteError> {
+    let s = std::str::from_utf8(buf)
+        .map_err(|_| RemoteError::Protocol("non-UTF8 HTTP response".into()))?;
+    let (head, body) = s.split_once("\r\n\r\n").unwrap_or((s, ""));
     let status_line = head
         .lines()
         .next()
-        .ok_or_else(|| anyhow!("missing status line"))?;
-    if !status_line.contains(" 200 ") && !status_line.contains(" 201 ") {
-        return Err(anyhow!("HTTP error: {status_line} body={body}"));
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| RemoteError::Protocol("empty HTTP response".into()))?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| RemoteError::Protocol(format!("bad status line: {status_line}")))?;
+    if !(200..300).contains(&status) {
+        // The server's errors are {"error": "..."}; fall back to the raw body.
+        let message = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or_else(|| body.trim().to_string());
+        return Err(RemoteError::Http { status, message });
     }
-    Ok(body)
+    Ok(body.to_string())
 }
 
 pub fn urlencode(s: &str) -> String {
@@ -290,6 +444,67 @@ pub fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_2xx_including_204_is_success() {
+        assert_eq!(
+            parse_http_response(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap(),
+            ""
+        );
+        // A body that itself contains a blank line is kept whole.
+        assert_eq!(
+            parse_http_response(b"HTTP/1.1 200 OK\r\n\r\na\r\n\r\nb").unwrap(),
+            "a\r\n\r\nb"
+        );
+    }
+
+    #[test]
+    fn http_error_carries_status_and_server_message() {
+        match parse_http_response(b"HTTP/1.1 409 Conflict\r\n\r\n{\"error\":\"not pending\"}") {
+            Err(e @ RemoteError::Http { status: 409, .. }) => {
+                assert_eq!(e.code(), ErrorCode::Conflict);
+                assert!(e.to_string().contains("not pending"));
+            }
+            other => panic!("expected 409, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_http_response(b""),
+            Err(RemoteError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn unreachable_server_is_unavailable() {
+        // Port 1 on localhost: nothing listens there.
+        let e = http_get(
+            "http://127.0.0.1:1",
+            "/v1/status",
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        let r = e.downcast_ref::<RemoteError>().expect("RemoteError");
+        assert_eq!(r.code(), ErrorCode::ServerUnavailable);
+    }
+
+    #[test]
+    fn command_status_accepts_debug_and_snake_case() {
+        let v = serde_json::json!({
+            "command": {"id": 3, "kind": "PlcRead", "state": "Running"},
+            "result": null,
+        });
+        let st = parse_command_status(3, &v).unwrap();
+        assert_eq!(st.kind, Some(CommandKind::PlcRead));
+        assert_eq!(st.state, CommandState::Running);
+        assert!(!st.finished());
+
+        let v = serde_json::json!({
+            "command": {"id": 3, "kind": "control", "state": "done"},
+            "result": {"ok": true, "result_json": "{}", "error": null},
+        });
+        let st = parse_command_status(3, &v).unwrap();
+        assert!(st.finished());
+        assert!(st.result.unwrap().ok);
+    }
 
     #[test]
     fn test_parse_base() {

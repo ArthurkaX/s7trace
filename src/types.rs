@@ -495,6 +495,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn error_code_names_match_serde() {
+        use ErrorCode::*;
+        for code in [
+            InvalidArgument,
+            InvalidAddress,
+            ServerRequired,
+            NotFound,
+            Conflict,
+            Unauthorized,
+            ServerUnavailable,
+            ServerError,
+            Timeout,
+            Pending,
+            Cancelled,
+            PlcError,
+            CommandFailed,
+            SqlError,
+            QueryTimeout,
+            Internal,
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());
+            let back: ErrorCode = serde_json::from_value(code.as_str().into()).unwrap();
+            assert_eq!(back, code);
+        }
+    }
+
+    #[test]
+    fn error_code_survives_context() {
+        use anyhow::Context;
+        let e = Err::<(), _>(coded(ErrorCode::NotFound, "no such PLC"))
+            .context("tag-add")
+            .unwrap_err();
+        assert_eq!(error_code(&e), Some(ErrorCode::NotFound));
+        assert_eq!(error_code(&anyhow::anyhow!("plain")), None);
+    }
+
+    #[test]
     fn test_parse_s7_word() {
         let a = S7Address::parse("DB5999.DBW22").unwrap();
         assert_eq!(a.db_num, 5999);
@@ -817,8 +854,147 @@ pub struct Problem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
     Ok = 0,
+    /// The request is wrong; change it before trying again.
     BadInput = 1,
+    /// The operation ran and failed (PLC error, failed or cancelled command).
     PlcError = 2,
-    Overload = 3,
+    /// Not finished or temporarily unavailable; wait or retry later.
+    Retry = 3,
     Internal = 4,
+}
+
+// ---------------------------------------------------------------------------
+// Error codes
+// ---------------------------------------------------------------------------
+
+/// Stable machine-readable error class. The CLI reports it as `error.code` in
+/// its JSON envelope; the server carries it through the command queue so a
+/// remote failure is classified the same way as a local one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// A flag or value in the request is wrong.
+    InvalidArgument,
+    /// The S7 address does not parse.
+    InvalidAddress,
+    /// The command needs a server (`-r HOST` or `S7TRACE_SERVER`).
+    ServerRequired,
+    /// A named PLC, tag, set, poll group, dataset or command does not exist.
+    NotFound,
+    /// The target exists but its state forbids the change.
+    Conflict,
+    /// The server rejected the credentials (`S7TRACE_TOKEN`).
+    Unauthorized,
+    /// The server could not be reached.
+    ServerUnavailable,
+    /// The server answered with an error or an unreadable response.
+    ServerError,
+    /// The command was queued but did not finish in time and may still run.
+    /// Follow it with `command-wait <command_id>` instead of resubmitting.
+    Timeout,
+    /// The command has not finished yet.
+    Pending,
+    /// The command was cancelled before it ran.
+    Cancelled,
+    /// Talking to the PLC failed.
+    PlcError,
+    /// The operation ran and failed.
+    CommandFailed,
+    /// The SQL query is invalid or failed.
+    SqlError,
+    /// The SQL query ran past its deadline and was interrupted.
+    QueryTimeout,
+    /// An unexpected failure inside s7trace.
+    Internal,
+}
+
+impl ErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorCode::InvalidArgument => "invalid_argument",
+            ErrorCode::InvalidAddress => "invalid_address",
+            ErrorCode::ServerRequired => "server_required",
+            ErrorCode::NotFound => "not_found",
+            ErrorCode::Conflict => "conflict",
+            ErrorCode::Unauthorized => "unauthorized",
+            ErrorCode::ServerUnavailable => "server_unavailable",
+            ErrorCode::ServerError => "server_error",
+            ErrorCode::Timeout => "timeout",
+            ErrorCode::Pending => "pending",
+            ErrorCode::Cancelled => "cancelled",
+            ErrorCode::PlcError => "plc_error",
+            ErrorCode::CommandFailed => "command_failed",
+            ErrorCode::SqlError => "sql_error",
+            ErrorCode::QueryTimeout => "query_timeout",
+            ErrorCode::Internal => "internal",
+        }
+    }
+
+    /// Whether the same request may succeed later without being changed.
+    /// For `timeout` the retry is a `command-wait`, not a resubmission.
+    pub fn retryable(self) -> bool {
+        matches!(
+            self,
+            ErrorCode::ServerUnavailable
+                | ErrorCode::Timeout
+                | ErrorCode::Pending
+                | ErrorCode::PlcError
+        )
+    }
+
+    pub fn exit_code(self) -> ExitCode {
+        match self {
+            ErrorCode::InvalidArgument
+            | ErrorCode::InvalidAddress
+            | ErrorCode::ServerRequired
+            | ErrorCode::NotFound
+            | ErrorCode::Conflict
+            | ErrorCode::Unauthorized
+            | ErrorCode::SqlError
+            | ErrorCode::QueryTimeout => ExitCode::BadInput,
+            ErrorCode::PlcError | ErrorCode::CommandFailed | ErrorCode::Cancelled => {
+                ExitCode::PlcError
+            }
+            ErrorCode::ServerUnavailable | ErrorCode::Timeout | ErrorCode::Pending => {
+                ExitCode::Retry
+            }
+            ErrorCode::ServerError | ErrorCode::Internal => ExitCode::Internal,
+        }
+    }
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An error that knows its [`ErrorCode`]. Wrap it in `anyhow::Error` (see
+/// [`coded`]); [`error_code`] finds it again through any added context.
+#[derive(Debug)]
+pub struct CodedError {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl fmt::Display for CodedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedError {}
+
+pub fn coded(code: ErrorCode, message: impl Into<String>) -> anyhow::Error {
+    CodedError {
+        code,
+        message: message.into(),
+    }
+    .into()
+}
+
+/// The code attached to `e` or anything in its context chain.
+pub fn error_code(e: &anyhow::Error) -> Option<ErrorCode> {
+    e.chain()
+        .find_map(|c| c.downcast_ref::<CodedError>().map(|c| c.code))
 }

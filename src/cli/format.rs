@@ -1,61 +1,107 @@
 /// Output formatting helpers for CLI commands.
 ///
-/// Default output is compact JSON. `--format table` is the only
-/// human-readable mode.
+/// `--format` is parsed by clap into [`Format`], so a misspelt value is
+/// rejected instead of silently falling back to some other output.
 ///
-/// Supported output formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Output formats shared by the listing/report commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Format {
-    /// Compact JSON output (default for all commands).
-    CompactJson,
-    /// Human-readable tables (--format table).
-    Table,
+    /// Human-readable text or tab-separated table.
+    #[value(alias = "table")]
+    Text,
+    /// One compact JSON document on a single line.
+    Json,
+    /// JSON Lines: one compact JSON object per record.
+    Jsonl,
 }
 
-impl Format {
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Format {
-        match s {
-            "table" => Format::Table,
-            _ => Format::CompactJson,
+/// `sample-export` row encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExportFormat {
+    /// One JSON object per sample.
+    Jsonl,
+    /// Comma-separated values with a header row.
+    Csv,
+}
+
+/// `read` always answers with one JSON object. The flag stays so scripts that
+/// already pass `--format json` keep working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReadFormat {
+    Json,
+}
+
+/// Byte encoding the server uses in a `read-raw` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RawFormat {
+    /// `bytes_hex`: one hex string.
+    #[value(alias = "raw")]
+    Hex,
+    /// `bytes_raw` plus `bytes_dec`: decimal byte values.
+    Dec,
+    /// `bytes_raw`: an array of byte values.
+    Json,
+}
+
+impl RawFormat {
+    /// The name the server's `read_raw` action expects.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RawFormat::Hex => "hex",
+            RawFormat::Dec => "dec",
+            RawFormat::Json => "json",
         }
     }
 }
 
-/// Print a successful result as compact JSON: {"ok":true,"result":...}
-/// Null fields in `result` are omitted (serialized with `skip_serializing_none`).
-pub fn print_json_ok(result: &serde_json::Value) {
-    let obj = serde_json::json!({
-        "ok": true,
-        "result": result,
-    });
-    println!("{}", serde_json::to_string(&obj).unwrap_or_default());
-}
-
-/// Print an error result as compact JSON: {"ok":false,"bad_class":...,"detail":...,"exit_code":N}
-pub fn print_json_error(bad_class: &str, detail: &str, exit_code: i32) {
-    let obj = serde_json::json!({
-        "ok": false,
-        "bad_class": bad_class,
-        "detail": detail,
-        "exit_code": exit_code,
-    });
-    println!("{}", serde_json::to_string(&obj).unwrap_or_default());
-}
-
-/// Print a timeout result per contract.
-pub fn print_json_timeout() {
-    print_json_error("timeout", "command did not complete in time", 3);
-}
-
-/// Print SQL result as columnar JSON: {"cols":[...],"rows":[[...],...]}
+/// Print SQL result as columnar JSON:
+/// {"cols":[...],"rows":[[...],...],"truncated":bool,"limit":N}
 /// One line, no pretty-print. Types preserved (null/integer/float/string).
-pub fn print_columnar_json(cols: &[String], rows: &[serde_json::Value]) {
+/// `truncated` is true when the row cap `limit` cut the result short.
+pub fn print_columnar_json(
+    cols: &[String],
+    rows: &[serde_json::Value],
+    truncated: bool,
+    limit: u64,
+) {
     let obj = serde_json::json!({
         "cols": cols,
         "rows": rows,
+        "truncated": truncated,
+        "limit": limit,
     });
     println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+}
+
+/// Print SQL result as JSON Lines: one object per row, keyed by column name.
+/// A repeated column name (e.g. `SELECT a.id, b.id`) gets a `:N` suffix so no
+/// value is silently overwritten.
+pub fn print_jsonl_rows(cols: &[String], rows: &[serde_json::Value]) {
+    let keys = unique_column_keys(cols);
+    for row in rows {
+        let obj: serde_json::Map<String, serde_json::Value> = match row {
+            serde_json::Value::Array(arr) => {
+                keys.iter().cloned().zip(arr.iter().cloned()).collect()
+            }
+            other => std::iter::once(("value".to_string(), other.clone())).collect(),
+        };
+        println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+    }
+}
+
+fn unique_column_keys(cols: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    cols.iter()
+        .map(|c| {
+            let n = seen.entry(c.as_str()).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                c.clone()
+            } else {
+                format!("{c}:{n}")
+            }
+        })
+        .collect()
 }
 
 /// Print as table (tab-separated columns, one row per line).
@@ -127,9 +173,35 @@ pub fn print_json_hex(plc: &str, db: u16, start: usize, len: usize, ts_us: i64, 
     println!("{}", serde_json::to_string(&output).unwrap_or_default());
 }
 
+/// Render a microsecond Unix timestamp from a JSON document for humans:
+/// `2026-10-28 12:19:46 UTC`, or `-` when it is null or absent. Printing the
+/// `serde_json::Value` with `{:?}` instead showed `Number(1793...)`.
+pub fn fmt_ts_us(v: &serde_json::Value) -> String {
+    match v.as_i64() {
+        Some(us) => fmt_ts(us),
+        None => "-".to_string(),
+    }
+}
+
+/// [`fmt_ts_us`] for a timestamp already in hand.
+pub fn fmt_ts(us: i64) -> String {
+    match chrono::DateTime::from_timestamp_micros(us) {
+        Some(t) => t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        None => us.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_render_as_utc_time() {
+        let v = serde_json::json!(1_793_190_000_123_456_i64);
+        assert_eq!(fmt_ts_us(&v), "2026-10-28 12:20:00 UTC");
+        assert_eq!(fmt_ts_us(&serde_json::Value::Null), "-");
+        assert_eq!(fmt_ts_us(&serde_json::json!({})["missing"]), "-");
+    }
 
     #[test]
     fn test_format_value_i16() {
@@ -153,6 +225,20 @@ mod tests {
         let rows: Vec<serde_json::Value> = vec![serde_json::json!([1, "x"])];
         // Just verify no panic
         print_table(&cols, &rows);
+    }
+
+    #[test]
+    fn test_format_rejects_unknown_value() {
+        use clap::ValueEnum;
+        assert_eq!(Format::from_str("table", false), Ok(Format::Text));
+        assert_eq!(Format::from_str("jsonl", false), Ok(Format::Jsonl));
+        assert!(Format::from_str("tabel", false).is_err());
+    }
+
+    #[test]
+    fn test_unique_column_keys() {
+        let cols = vec!["id".to_string(), "name".to_string(), "id".to_string()];
+        assert_eq!(unique_column_keys(&cols), vec!["id", "name", "id:2"]);
     }
 
     #[test]

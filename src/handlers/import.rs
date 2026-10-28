@@ -4,6 +4,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::cli::args::Cli;
+use crate::cli::output::{self, fail, CliError};
+use crate::cli::queue;
 use crate::plc::create_plc_client;
 use crate::server_base;
 use crate::types::*;
@@ -23,9 +25,8 @@ pub(crate) fn handle_tag_import(
 ) -> Result<ExitCode> {
     // Remote mode: read file locally, send yaml content to server
     if let Some(base) = server_base(cli) {
-        let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
-        let content =
-            std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("reading '{file}': {e}"))?;
+        let content = std::fs::read_to_string(file)
+            .map_err(|e| fail(ErrorCode::InvalidArgument, format!("reading '{file}': {e}")))?;
         let req = serde_json::json!({
             "action": "tag_import",
             "plc": plc,
@@ -37,33 +38,27 @@ pub(crate) fn handle_tag_import(
             "value_role": value_role,
             "validate": do_validate,
         });
-        let id = cli::remote::enqueue_command(
-            &base,
-            "control",
-            &req.to_string(),
-            Some("cli"),
-            None,
-            timeout,
-        )?;
-        println!("queued command_id={id}");
-        let (state, result, ok, err) =
-            cli::remote::wait_command(&base, id, timeout, std::time::Duration::from_millis(200))?;
-        if ok {
-            println!("success {result}");
-        } else {
-            println!("{state}: {result} {err}");
-            return Ok(ExitCode::BadInput);
-        }
+        let (id, result) = queue::submit_and_wait(cli, &base, "control", &req, true)?;
+        output::emit(cli, result.clone(), Some(id), || match &result {
+            serde_json::Value::String(s) => println!("success {s}"),
+            other => println!("success {other}"),
+        });
         return Ok(ExitCode::Ok);
     }
 
     // Validate store_mode and storage_hook up front
-    let _sm: StoreMode = store_mode
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!("invalid store mode: {e}"))?;
-    let _sh: StorageHook = storage_hook
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!("invalid storage hook: {e}"))?;
+    let _sm: StoreMode = store_mode.parse().map_err(|e: String| {
+        fail(
+            ErrorCode::InvalidArgument,
+            format!("invalid store mode: {e}"),
+        )
+    })?;
+    let _sh: StorageHook = storage_hook.parse().map_err(|e: String| {
+        fail(
+            ErrorCode::InvalidArgument,
+            format!("invalid storage hook: {e}"),
+        )
+    })?;
 
     // Resolve PLC once up front
     let plc_id: i64 = conn
@@ -73,15 +68,19 @@ pub(crate) fn handle_tag_import(
             |row| row.get(0),
         )
         .map_err(|_| {
-            anyhow::anyhow!("PLC '{plc}' not found. Create it first with 's7trace plc-add'.")
+            fail(
+                ErrorCode::NotFound,
+                format!("PLC '{plc}' not found. Create it first with 's7trace plc-add'."),
+            )
         })?;
 
     // Read file
-    let content =
-        std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("reading '{}': {}", file, e))?;
+    let content = std::fs::read_to_string(file)
+        .map_err(|e| fail(ErrorCode::InvalidArgument, format!("reading '{file}': {e}")))?;
 
     // Parse signals
-    let signals = cli::import::parse_signals(&content)?;
+    let signals = cli::import::parse_signals(&content)
+        .map_err(|e| fail(ErrorCode::InvalidArgument, format!("{file}: {e:#}")))?;
 
     // Import each signal, collecting errors
     let set_arg = set;
@@ -160,6 +159,7 @@ pub(crate) fn handle_tag_import(
     }
 
     // Optionally validate each imported tag synchronously
+    let mut validated: Vec<serde_json::Value> = Vec::new();
     if do_validate && !imported_tags.is_empty() {
         let plc_row: (String, String, i64, i64) = conn
             .query_row(
@@ -174,13 +174,25 @@ pub(crate) fn handle_tag_import(
                     ))
                 },
             )
-            .map_err(|_| anyhow::anyhow!("PLC '{plc}' not found"))?;
+            .map_err(|_| fail(ErrorCode::NotFound, format!("PLC '{plc}' not found")))?;
         let (host, plc_name, rack, slot) = plc_row;
         let client = create_plc_client(&plc_name, &host, rack as u16, slot as u16);
         let mut client = client.lock();
 
         for (tag_id, tag_name) in &imported_tags {
             let result = db::validation::validate_tag(conn, &mut *client, *tag_id)?;
+            validated.push(serde_json::json!({
+                "name": tag_name,
+                "tag_id": tag_id,
+                "ok": result.ok,
+                "value_i": result.value_i,
+                "value_f": result.value_f,
+                "bad_class": result.bad_class.as_ref().map(|b| b.to_string()),
+                "detail": result.detail,
+            }));
+            if cli.json {
+                continue;
+            }
             if result.ok {
                 let val_str = if let Some(v) = result.value_i {
                     if let Some(f) = result.value_f {
@@ -210,17 +222,40 @@ pub(crate) fn handle_tag_import(
 
     // Summary
     let set_name = set_arg.unwrap_or("default");
-    println!(
-        "imported={imported} failed={} set={set_name}",
-        failures.len()
-    );
-    for (name, reason) in &failures {
-        eprintln!("  failed: {name} ({reason})");
+    let failed: Vec<serde_json::Value> = failures
+        .iter()
+        .map(|(name, reason)| serde_json::json!({ "name": name, "reason": reason }))
+        .collect();
+    let summary = serde_json::json!({
+        "imported": imported,
+        "failed": failed,
+        "set": set_name,
+        "validated": validated,
+    });
+    if imported == 0 {
+        if !cli.json {
+            for (name, reason) in &failures {
+                eprintln!("  failed: {name} ({reason})");
+            }
+        }
+        return Err(CliError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "no signals imported from '{file}' ({} failed)",
+                failures.len()
+            ),
+        )
+        .with_details(summary)
+        .into());
     }
-
-    if imported > 0 {
-        Ok(ExitCode::Ok)
-    } else {
-        Ok(ExitCode::BadInput)
-    }
+    output::emit(cli, summary, None, || {
+        println!(
+            "imported={imported} failed={} set={set_name}",
+            failures.len()
+        );
+        for (name, reason) in &failures {
+            eprintln!("  failed: {name} ({reason})");
+        }
+    });
+    Ok(ExitCode::Ok)
 }

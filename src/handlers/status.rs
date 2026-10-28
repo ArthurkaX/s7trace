@@ -14,13 +14,15 @@ use crate::{cli, db, version};
 /// to each poll group's period instead.
 const STALE_AFTER_US: i64 = 60_000_000; // 60s
 
-pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<ExitCode> {
-    // Remote mode: fetch JSON from server and pretty-print.
+pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: Format) -> Result<ExitCode> {
+    // Remote mode: fetch JSON from server and print it or summarise it.
     if let Some(base) = server_base(cli) {
         let timeout = std::time::Duration::from_millis(cli.remote_timeout_ms);
         let v = cli::remote::get_status(&base, timeout)?;
-        if fmt == "json" || fmt == "jsonl" {
-            println!("{}", serde_json::to_string_pretty(&v)?);
+        if cli.json {
+            cli::output::print_ok(&v, None);
+        } else if fmt != Format::Text {
+            println!("{}", serde_json::to_string(&v)?);
         } else {
             // text mode: human-readable summary from the API JSON.
             println!("(remote server: {base})");
@@ -65,17 +67,20 @@ pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<E
                         };
                         format!(
                             "{} target={}ms actual={}ms{utilization} overruns={}",
-                            pg["name"], target, actual, pg["overrun_count"]
+                            pg["name"].as_str().unwrap_or("?"),
+                            target,
+                            actual,
+                            pg["overrun_count"]
                         )
                     })
                     .collect();
                 println!(
-                    "  {} (host={}, health={}, conn={}) last_ok_ts={:?}",
-                    plc["name"],
-                    plc["host"],
+                    "  {} (host={}, health={}, conn={}) last_ok={}",
+                    plc["name"].as_str().unwrap_or("?"),
+                    plc["host"].as_str().unwrap_or("?"),
                     plc["health"].as_str().unwrap_or("?"),
-                    plc["connectivity"],
-                    plc["last_ok_ts"]
+                    plc["connectivity"].as_str().unwrap_or("?"),
+                    cli::format::fmt_ts_us(&plc["last_ok_ts"])
                 );
                 for pg_line in pg_parts {
                     println!("    poll_group: {pg_line}");
@@ -98,14 +103,19 @@ pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<E
                     };
                     println!(
                         "    set {} enabled={} tags={}/{} poll={}",
-                        ms["name"], ms["enabled"], ms["tags_healthy"], ms["tags_total"], poll_desc
+                        ms["name"].as_str().unwrap_or("?"),
+                        ms["enabled"],
+                        // The server reports `tags_active`; older local
+                        // builds called it `tags_healthy`.
+                        ms.get("tags_active").unwrap_or(&ms["tags_healthy"]),
+                        ms["tags_total"],
+                        poll_desc
                     );
                 }
             }
         }
         return Ok(ExitCode::Ok);
     }
-    let out_fmt = Format::from_str(fmt);
 
     // Gather PLCs
     let mut stmt = conn
@@ -353,6 +363,30 @@ pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<E
         )
         .unwrap_or(0);
 
+    // Bad tags are collected up front so JSON output carries them as a field
+    // rather than text appended after the document.
+    let problems: Vec<(String, String, Option<String>, Option<String>)> = conn
+        .prepare(
+            "SELECT t.name, t.address, t.bad_class, t.bad_detail
+             FROM tag t WHERE t.bad = 1 LIMIT 20",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .flatten()
+        .collect();
+    let bad_tags_json: Vec<serde_json::Value> = problems
+        .iter()
+        .map(|(name, address, bc, bd)| {
+            serde_json::json!({
+                "name": name,
+                "address": address,
+                "bad_class": bc,
+                "bad_detail": bd,
+            })
+        })
+        .collect();
+
     let status = serde_json::json!({
         "service": "s7trace",
         "version": version::status_json(conn),
@@ -368,10 +402,15 @@ pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<E
         "config_apply": {
             "pending": pending_count,
         },
+        "bad_tags": bad_tags_json,
     });
 
-    match out_fmt {
-        Format::Table => {
+    if cli.json {
+        cli::output::print_ok(&status, None);
+        return Ok(ExitCode::Ok);
+    }
+    match fmt {
+        Format::Text => {
             let schema_version = version::schema_version(conn).unwrap_or_else(|| "unknown".into());
             println!(
                 "s7trace version={} schema={} api={}",
@@ -382,13 +421,13 @@ pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<E
             println!("PLCs:");
             for plc in &plcs {
                 println!(
-                    "  {} (host={}, enabled={}, health={}, conn={}) last_ok={:?}",
+                    "  {} (host={}, enabled={}, health={}, conn={}) last_ok={}",
                     plc["name"],
                     plc["host"],
                     plc["enabled"],
                     plc["health"].as_str().unwrap_or("?"),
                     plc["connectivity"],
-                    plc["last_ok_ts"]
+                    cli::format::fmt_ts_us(&plc["last_ok_ts"])
                 );
                 if let Some(err) = plc["last_error"].as_str() {
                     if !err.is_empty() {
@@ -440,39 +479,26 @@ pub(crate) fn handle_status(cli: &Cli, conn: &Connection, fmt: &str) -> Result<E
                     );
                 }
                 for ds in plc["datasets"].as_array().unwrap_or(&Vec::new()) {
-                    println!("    dataset {} started={:?}", ds["name"], ds["started_ts"]);
+                    println!(
+                        "    dataset {} started={}",
+                        ds["name"],
+                        cli::format::fmt_ts_us(&ds["started_ts"])
+                    );
                 }
             }
             println!("Tags: active={active_tags}, bad={bad_tags}");
             println!("Command queue pending={command_pending} running={command_running}");
             println!("Config apply pending: {pending_count}");
+            if !problems.is_empty() {
+                println!("\nProblems:");
+                for (name, addr, bc, bd) in &problems {
+                    let detail = bd.as_deref().unwrap_or_default();
+                    println!("  bad_tag: {name} ({addr}) class={bc:?} detail=\"{detail}\"");
+                }
+            }
         }
-        _ => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&status).unwrap_or_default()
-            );
-        }
-    }
-
-    // Show problems (bad tags)
-    let mut pstmt = conn.prepare(
-        "SELECT t.name, t.address, t.bad_class, t.bad_detail
-         FROM tag t WHERE t.bad = 1 LIMIT 20",
-    )?;
-    let has_problems = pstmt.exists([])?;
-    if has_problems {
-        println!("\nProblems:");
-        let problems = pstmt.query_map([], |row| {
-            let name: String = row.get(0)?;
-            let address: String = row.get(1)?;
-            let bc: Option<String> = row.get(2)?;
-            let bd: Option<String> = row.get(3)?;
-            Ok((name, address, bc, bd))
-        })?;
-        for (name, addr, bc, bd) in problems.flatten() {
-            let detail = bd.unwrap_or_default();
-            println!("  bad_tag: {name} ({addr}) class={bc:?} detail=\"{detail}\"");
+        Format::Json | Format::Jsonl => {
+            println!("{}", serde_json::to_string(&status).unwrap_or_default());
         }
     }
 

@@ -24,8 +24,6 @@ use std::sync::Arc;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use anyhow::anyhow;
-
 use crate::engine::poller::OverrunMode;
 use crate::engine::server::{PduCache, PlcRegistry, PollerRegistry, SampleBatch};
 use crate::engine::snapshot::Snapshot;
@@ -255,6 +253,9 @@ pub struct OpOutput {
     pub message: String,
     #[serde(default)]
     pub data: serde_json::Value,
+    /// Why it failed, when `ok` is false and the cause is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<ErrorCode>,
 }
 
 impl OpOutput {
@@ -263,6 +264,7 @@ impl OpOutput {
             ok: true,
             message: message.into(),
             data: serde_json::Value::Null,
+            code: None,
         }
     }
 
@@ -271,14 +273,16 @@ impl OpOutput {
             ok: true,
             message: message.into(),
             data,
+            code: None,
         }
     }
 
-    pub fn fail(message: impl Into<String>) -> Self {
+    pub fn fail(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             ok: false,
             message: message.into(),
             data: serde_json::Value::Null,
+            code: Some(code),
         }
     }
 }
@@ -356,8 +360,16 @@ fn resolve_tag_id(
                 rusqlite::params![plc, name],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(|_| anyhow!("tag '{name}' not found on PLC '{plc}'")),
-        _ => Err(anyhow!("provide --id or both --plc and --name")),
+            .map_err(|_| {
+                coded(
+                    ErrorCode::NotFound,
+                    format!("tag '{name}' not found on PLC '{plc}'"),
+                )
+            }),
+        _ => Err(coded(
+            ErrorCode::InvalidArgument,
+            "provide --id or both --plc and --name",
+        )),
     }
 }
 
@@ -383,16 +395,28 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
             metric_set,
         } => {
             if name.trim().is_empty() {
-                return Ok(OpOutput::fail("--name cannot be empty"));
+                return Ok(OpOutput::fail(
+                    ErrorCode::InvalidArgument,
+                    "--name cannot be empty",
+                ));
             }
-            let dt: DataType = data_type.parse().map_err(|e: String| anyhow!("{e}"))?;
-            let _sm: StoreMode = store_mode
+            let dt: DataType = data_type
                 .parse()
-                .map_err(|e: String| anyhow!("invalid store_mode: {e}"))?;
-            let _sh: StorageHook = storage_hook
-                .parse()
-                .map_err(|e: String| anyhow!("invalid storage_hook: {e}"))?;
-            let addr = S7Address::parse(&address).map_err(|e| anyhow!("invalid address: {e}"))?;
+                .map_err(|e: String| coded(ErrorCode::InvalidArgument, e))?;
+            let _sm: StoreMode = store_mode.parse().map_err(|e: String| {
+                coded(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid store_mode: {e}"),
+                )
+            })?;
+            let _sh: StorageHook = storage_hook.parse().map_err(|e: String| {
+                coded(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid storage_hook: {e}"),
+                )
+            })?;
+            let addr = S7Address::parse(&address)
+                .map_err(|e| coded(ErrorCode::InvalidAddress, format!("invalid address: {e}")))?;
 
             let inserted = db::validation::insert_tag(
                 conn,
@@ -427,7 +451,12 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 let reg = plcs.lock();
                 reg.get(&inserted.plc_id)
                     .map(|h| h.with_priority(PRIORITY_INTERACTIVE))
-                    .ok_or_else(|| anyhow!("PLC client not available for {}", inserted.plc_id))?
+                    .ok_or_else(|| {
+                        coded(
+                            ErrorCode::PlcError,
+                            format!("PLC client not available for {}", inserted.plc_id),
+                        )
+                    })?
             } else {
                 let (host, plc_name, rack, slot): (String, String, i64, i64) = conn
                     .query_row(
@@ -435,7 +464,7 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                         rusqlite::params![inserted.plc_id],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
-                    .map_err(|_| anyhow!("PLC '{plc}' not found"))?;
+                    .map_err(|_| coded(ErrorCode::NotFound, format!("PLC '{plc}' not found")))?;
                 create_plc_handle(&plc_name, &host, rack as u16, slot as u16)
             };
 
@@ -474,6 +503,7 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                     ok: false,
                     message: format!("bad bad_class={bc} detail=\"{det}\" tag_id={tag_id}"),
                     data: serde_json::json!({"bad_class": bc, "detail": det, "tag_id": tag_id}),
+                    code: Some(ErrorCode::PlcError),
                 })
             }
         }
@@ -491,8 +521,9 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
             let tag_id = resolve_tag_id(conn, tag_id, plc.as_deref(), name.as_deref())?;
             let now = now_us();
             if let Some(addr_str) = &address {
-                let addr =
-                    S7Address::parse(addr_str).map_err(|e| anyhow!("invalid address: {e}"))?;
+                let addr = S7Address::parse(addr_str).map_err(|e| {
+                    coded(ErrorCode::InvalidAddress, format!("invalid address: {e}"))
+                })?;
                 conn.execute(
                     "UPDATE tag SET address = ?1, db_num = ?2, byte_offset = ?3, updated_ts = ?4, desired_version = desired_version + 1 WHERE id = ?5",
                     rusqlite::params![addr_str, addr.db_num, addr.byte_offset, now, tag_id],
@@ -501,7 +532,7 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
             if let Some(dt) = &data_type {
                 let byte_size = dt
                     .parse::<DataType>()
-                    .map_err(|e: String| anyhow!("{e}"))?
+                    .map_err(|e: String| coded(ErrorCode::InvalidArgument, e))?
                     .byte_size() as i64;
                 conn.execute(
                     "UPDATE tag SET data_type = ?1, byte_size = ?2, updated_ts = ?3, desired_version = desired_version + 1 WHERE id = ?4",
@@ -515,7 +546,9 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                         rusqlite::params![pg],
                         |row| row.get(0),
                     )
-                    .map_err(|_| anyhow!("poll group '{pg}' not found"))?;
+                    .map_err(|_| {
+                        coded(ErrorCode::NotFound, format!("poll group '{pg}' not found"))
+                    })?;
                 conn.execute(
                     "UPDATE tag SET poll_group_id = ?1, updated_ts = ?2, desired_version = desired_version + 1 WHERE id = ?3",
                     rusqlite::params![pg_id, now, tag_id],
@@ -582,7 +615,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 rusqlite::params![now_us(), tag_id],
             )?;
             if conn.changes() == 0 {
-                return Ok(OpOutput::fail(format!("tag {tag_id}: not found")));
+                return Ok(OpOutput::fail(
+                    ErrorCode::NotFound,
+                    format!("tag {tag_id}: not found"),
+                ));
             }
             let _ = db::config_apply::schedule(
                 conn,
@@ -611,7 +647,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 )
                 .ok();
             if plc_id.is_none() {
-                return Ok(OpOutput::fail(format!("tag {tag_id}: not found")));
+                return Ok(OpOutput::fail(
+                    ErrorCode::NotFound,
+                    format!("tag {tag_id}: not found"),
+                ));
             }
             // Remove the tag and every row that references it. `metric_set_tag`
             // is ON DELETE CASCADE, but `sample`, `sample_rollup`,
@@ -673,7 +712,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 rusqlite::params![now_us(), tag_id],
             )?;
             if conn.changes() == 0 {
-                return Ok(OpOutput::fail(format!("tag {tag_id}: not found")));
+                return Ok(OpOutput::fail(
+                    ErrorCode::NotFound,
+                    format!("tag {tag_id}: not found"),
+                ));
             }
             let _ = db::config_apply::schedule(
                 conn,
@@ -732,7 +774,7 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 let reg = plcs.lock();
                 reg.get(&plc_id)
                     .map(|h| h.with_priority(PRIORITY_INTERACTIVE))
-                    .ok_or_else(|| anyhow!("PLC client not available"))?
+                    .ok_or_else(|| coded(ErrorCode::PlcError, "PLC client not available"))?
             };
             let result = db::validation::validate_tag(conn, &mut client, tag_id)?;
             if result.ok {
@@ -767,7 +809,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 ))
             } else {
                 let det = result.detail.as_deref().unwrap_or("");
-                Ok(OpOutput::fail(format!("revalidate failed: {det}")))
+                Ok(OpOutput::fail(
+                    ErrorCode::PlcError,
+                    format!("revalidate failed: {det}"),
+                ))
             }
         }
 
@@ -783,7 +828,7 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                     rusqlite::params![plc],
                     |row| row.get(0),
                 )
-                .map_err(|_| anyhow!("PLC '{plc}' not found"))?;
+                .map_err(|_| coded(ErrorCode::NotFound, format!("PLC '{plc}' not found")))?;
             let now = now_us();
             conn.execute(
                 "INSERT INTO metric_set (plc_id, name, enabled, description, created_ts, updated_ts)
@@ -809,15 +854,21 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                     rusqlite::params![set_name],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .map_err(|_| anyhow!("metric set '{set_name}' not found"))?;
+                .map_err(|_| {
+                    coded(
+                        ErrorCode::NotFound,
+                        format!("metric set '{set_name}' not found"),
+                    )
+                })?;
             let (set_id, plc_id) = set;
             let now = now_us();
 
             // Build the list of tag IDs to add, in priority order: file > sql > tag.
             let mut tag_ids: Vec<i64> = Vec::new();
             if let Some(path) = &from_file {
-                let content =
-                    std::fs::read_to_string(path).map_err(|e| anyhow!("reading {path}: {e}"))?;
+                let content = std::fs::read_to_string(path).map_err(|e| {
+                    coded(ErrorCode::InvalidArgument, format!("reading {path}: {e}"))
+                })?;
                 for line in content.lines() {
                     let name = line.trim();
                     if name.is_empty() || name.starts_with('#') {
@@ -829,13 +880,18 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                             rusqlite::params![plc_id, name],
                             |row| row.get(0),
                         )
-                        .map_err(|_| anyhow!("tag '{name}' not found"))?;
+                        .map_err(|_| {
+                            coded(ErrorCode::NotFound, format!("tag '{name}' not found"))
+                        })?;
                     tag_ids.push(id);
                 }
             } else if let Some(sql) = &from_sql {
                 let sql_upper = sql.trim().to_uppercase();
                 if !sql_upper.starts_with("SELECT") {
-                    return Err(anyhow!("--from-sql must be a SELECT query"));
+                    return Err(coded(
+                        ErrorCode::InvalidArgument,
+                        "--from-sql must be a SELECT query",
+                    ));
                 }
                 let mut stmt = conn.prepare(sql)?;
                 let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
@@ -856,12 +912,17 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                             rusqlite::params![plc_id, piece],
                             |row| row.get(0),
                         )
-                        .map_err(|_| anyhow!("tag '{piece}' not found"))?
+                        .map_err(|_| {
+                            coded(ErrorCode::NotFound, format!("tag '{piece}' not found"))
+                        })?
                     };
                     tag_ids.push(id);
                 }
             } else {
-                return Err(anyhow!("provide --tag, --from-sql, or --from-file"));
+                return Err(coded(
+                    ErrorCode::InvalidArgument,
+                    "provide --tag, --from-sql, or --from-file",
+                ));
             }
 
             let mut added = 0usize;
@@ -899,7 +960,12 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                     rusqlite::params![set_name],
                     |row| row.get(0),
                 )
-                .map_err(|_| anyhow!("metric set '{set_name}' not found"))?;
+                .map_err(|_| {
+                    coded(
+                        ErrorCode::NotFound,
+                        format!("metric set '{set_name}' not found"),
+                    )
+                })?;
             if let Some(sql) = &from_sql {
                 let mut stmt = conn.prepare(sql)?;
                 let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
@@ -933,7 +999,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                     serde_json::json!({"set": set_name}),
                 ))
             } else {
-                Err(anyhow!("provide --tag or --from-sql"))
+                Err(coded(
+                    ErrorCode::InvalidArgument,
+                    "provide --tag or --from-sql",
+                ))
             }
         }
 
@@ -944,7 +1013,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 rusqlite::params![now, set_name],
             )?;
             if conn.changes() == 0 {
-                return Ok(OpOutput::fail(format!("metric set '{set_name}' not found")));
+                return Ok(OpOutput::fail(
+                    ErrorCode::NotFound,
+                    format!("metric set '{set_name}' not found"),
+                ));
             }
             let set_id: i64 = conn.query_row(
                 "SELECT id FROM metric_set WHERE name = ?1",
@@ -975,7 +1047,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 rusqlite::params![now, set_name],
             )?;
             if conn.changes() == 0 {
-                return Ok(OpOutput::fail(format!("metric set '{set_name}' not found")));
+                return Ok(OpOutput::fail(
+                    ErrorCode::NotFound,
+                    format!("metric set '{set_name}' not found"),
+                ));
             }
             let set_id: i64 = conn.query_row(
                 "SELECT id FROM metric_set WHERE name = ?1",
@@ -1006,7 +1081,12 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 |row| row.get(0),
             ) {
                 Ok(id) => id,
-                Err(_) => return Ok(OpOutput::fail(format!("metric set '{set_name}' not found"))),
+                Err(_) => {
+                    return Ok(OpOutput::fail(
+                        ErrorCode::NotFound,
+                        format!("metric set '{set_name}' not found"),
+                    ))
+                }
             };
             conn.execute(
                 "DELETE FROM dataset_metric_set WHERE metric_set_id = ?1",
@@ -1039,7 +1119,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
             disabled,
         } => {
             if name.trim().is_empty() {
-                return Ok(OpOutput::fail("--name cannot be empty"));
+                return Ok(OpOutput::fail(
+                    ErrorCode::InvalidArgument,
+                    "--name cannot be empty",
+                ));
             }
             let exists: bool = conn
                 .query_row(
@@ -1050,7 +1133,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 .map(|c| c > 0)
                 .unwrap_or(false);
             if exists {
-                return Ok(OpOutput::fail(format!("PLC '{name}' already exists")));
+                return Ok(OpOutput::fail(
+                    ErrorCode::Conflict,
+                    format!("PLC '{name}' already exists"),
+                ));
             }
             let enabled = if disabled { 0 } else { 1 };
             conn.execute(
@@ -1085,10 +1171,16 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
 
         Op::PollGroupAdd { name, period_ms } => {
             if name.trim().is_empty() {
-                return Ok(OpOutput::fail("--name cannot be empty"));
+                return Ok(OpOutput::fail(
+                    ErrorCode::InvalidArgument,
+                    "--name cannot be empty",
+                ));
             }
             if period_ms < 1 {
-                return Ok(OpOutput::fail("--period-ms must be at least 1"));
+                return Ok(OpOutput::fail(
+                    ErrorCode::InvalidArgument,
+                    "--period-ms must be at least 1",
+                ));
             }
             let exists: bool = conn
                 .query_row(
@@ -1099,9 +1191,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 .map(|c| c > 0)
                 .unwrap_or(false);
             if exists {
-                return Ok(OpOutput::fail(format!(
-                    "poll group '{name}' already exists"
-                )));
+                return Ok(OpOutput::fail(
+                    ErrorCode::Conflict,
+                    format!("poll group '{name}' already exists"),
+                ));
             }
             conn.execute(
                 "INSERT INTO poll_group (name, period_ms) VALUES (?1, ?2)",
@@ -1119,7 +1212,10 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
             period_ms,
         } => {
             if period_ms < 50 {
-                return Ok(OpOutput::fail("--period-ms must be at least 50"));
+                return Ok(OpOutput::fail(
+                    ErrorCode::InvalidArgument,
+                    "--period-ms must be at least 50",
+                ));
             }
             let pg_id = match (poll_group_id, poll_group_name.as_deref()) {
                 (Some(id), _) => id,
@@ -1129,8 +1225,18 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                         rusqlite::params![name],
                         |row| row.get::<_, i64>(0),
                     )
-                    .map_err(|_| anyhow!("poll group '{name}' not found"))?,
-                _ => return Ok(OpOutput::fail("provide --id or --name")),
+                    .map_err(|_| {
+                        coded(
+                            ErrorCode::NotFound,
+                            format!("poll group '{name}' not found"),
+                        )
+                    })?,
+                _ => {
+                    return Ok(OpOutput::fail(
+                        ErrorCode::InvalidArgument,
+                        "provide --id or --name",
+                    ))
+                }
             };
             let plc_id: Option<i64> = conn
                 .query_row(
@@ -1151,7 +1257,7 @@ pub fn execute(ctx: &ExecCtx, op: Op) -> anyhow::Result<OpOutput> {
                 rusqlite::params![period_ms, pg_id],
             )?;
             if conn.changes() == 0 {
-                return Ok(OpOutput::fail("poll group not found"));
+                return Ok(OpOutput::fail(ErrorCode::NotFound, "poll group not found"));
             }
             let _ = db::config_apply::schedule(
                 conn,

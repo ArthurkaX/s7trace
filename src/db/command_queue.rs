@@ -14,7 +14,7 @@ pub use crate::types::CommandResult;
 /// Row returned by `list_pending` — a dedicated struct that does not
 /// carry request_json/plc_id (not displayed by the list command) and
 /// includes finished_ts and error.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommandListRow {
     pub id: i64,
     pub created_ts: TimestampUs,
@@ -190,6 +190,18 @@ pub fn finish_ok(conn: &Connection, command_id: i64, result_json: &str) -> Resul
 
 /// Finish a command with failure.
 pub fn finish_bad(conn: &Connection, command_id: i64, error: &str) -> Result<()> {
+    finish_bad_with(conn, command_id, error, None)
+}
+
+/// Finish a command with failure, storing `result_json` alongside the error:
+/// `{"code": ..., "message": ..., "data": ...}`, so a client can classify the
+/// failure without parsing the message.
+pub fn finish_bad_with(
+    conn: &Connection,
+    command_id: i64,
+    error: &str,
+    result_json: Option<&str>,
+) -> Result<()> {
     let now = now_us();
     conn.execute(
         "UPDATE command_request
@@ -200,9 +212,9 @@ pub fn finish_bad(conn: &Connection, command_id: i64, error: &str) -> Result<()>
 
     conn.execute(
         "INSERT INTO command_result (command_id, ok, result_json, error)
-         VALUES (?1, 0, NULL, ?2)
-         ON CONFLICT(command_id) DO UPDATE SET ok = 0, error = ?2",
-        params![command_id, error],
+         VALUES (?1, 0, ?3, ?2)
+         ON CONFLICT(command_id) DO UPDATE SET ok = 0, error = ?2, result_json = ?3",
+        params![command_id, error, result_json],
     )?;
 
     Ok(())

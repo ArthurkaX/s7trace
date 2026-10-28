@@ -27,12 +27,12 @@ pub(super) fn execute_control(
     let action = req["action"].as_str().unwrap_or("");
     match action {
         "tag_add" => {
-            let plc_id = req["plc_id"]
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("missing plc_id"))?;
-            let tag_id = req["tag_id"]
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("missing tag_id"))?;
+            let plc_id = req["plc_id"].as_i64().ok_or_else(|| {
+                crate::types::coded(crate::types::ErrorCode::InvalidArgument, "missing plc_id")
+            })?;
+            let tag_id = req["tag_id"].as_i64().ok_or_else(|| {
+                crate::types::coded(crate::types::ErrorCode::InvalidArgument, "missing tag_id")
+            })?;
 
             // Read tag metadata (only name+address+dt needed for snapshot)
             let (name, address, data_type_str): (String, String, String) = conn.query_row(
@@ -52,7 +52,12 @@ pub(super) fn execute_control(
                 let reg = plcs.lock();
                 reg.get(&plc_id)
                     .map(|h| h.with_priority(crate::plc::PRIORITY_INTERACTIVE))
-                    .ok_or_else(|| anyhow::anyhow!("PLC client not available for {plc_id}"))?
+                    .ok_or_else(|| {
+                        crate::types::coded(
+                            crate::types::ErrorCode::PlcError,
+                            format!("PLC client not available for {plc_id}"),
+                        )
+                    })?
             };
 
             let result = db::validation::validate_tag(conn, &mut client, tag_id)?;
@@ -125,11 +130,16 @@ pub(super) fn execute_control(
                         rusqlite::params![plc_name],
                         |row| row.get(0),
                     )
-                    .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?,
+                    .map_err(|_| {
+                        crate::types::coded(
+                            crate::types::ErrorCode::NotFound,
+                            format!("PLC '{plc_name}' not found"),
+                        )
+                    })?,
             };
-            let dataset = req["dataset"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing dataset"))?;
+            let dataset = req["dataset"].as_str().ok_or_else(|| {
+                crate::types::coded(crate::types::ErrorCode::InvalidArgument, "missing dataset")
+            })?;
 
             // Check no active dataset
             let active: i64 = conn.query_row(
@@ -147,8 +157,8 @@ pub(super) fn execute_control(
             // Create dataset
             let now = now_us();
             let n = conn.execute(
-                "INSERT INTO dataset (plc_id, name, state, created_ts, updated_ts)
-                 VALUES (?1, ?2, 'active', ?3, ?3)",
+                "INSERT INTO dataset (plc_id, name, state, started_ts, created_ts, updated_ts)
+                 VALUES (?1, ?2, 'active', ?3, ?3, ?3)",
                 rusqlite::params![plc_id, dataset, now],
             )?;
             info!(
@@ -207,6 +217,10 @@ pub(super) fn execute_control(
                     )?;
                 }
             }
+
+            crate::db::lifecycle::record_collection_start(
+                conn, plc_id, dataset_id, dataset, &set_names, now,
+            )?;
 
             // Build set_id filter for the poll group query
             let set_filter_clause: String = if set_names.is_empty() {
@@ -298,7 +312,12 @@ pub(super) fn execute_control(
                         rusqlite::params![plc_name],
                         |row| row.get(0),
                     )
-                    .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?,
+                    .map_err(|_| {
+                        crate::types::coded(
+                            crate::types::ErrorCode::NotFound,
+                            format!("PLC '{plc_name}' not found"),
+                        )
+                    })?,
             };
 
             // Stop all pollers for this PLC
@@ -317,11 +336,8 @@ pub(super) fn execute_control(
                 }
             }
 
-            // Mark dataset as stopped
-            conn.execute(
-                "UPDATE dataset SET state = 'stopped' WHERE plc_id = ?1 AND state = 'active'",
-                rusqlite::params![plc_id],
-            )?;
+            // Mark the dataset stopped, with the time and an event marker.
+            crate::db::lifecycle::stop_active_dataset(conn, plc_id, now_us())?;
 
             Ok((true, format!("collection stopped for PLC {plc_name}")))
         }
@@ -335,14 +351,25 @@ pub(super) fn execute_control(
                     rusqlite::params![name],
                     |row| row.get::<_, i64>(0),
                 )
-                .map_err(|_| anyhow::anyhow!("poll group '{name}' not found"))?
+                .map_err(|_| {
+                    crate::types::coded(
+                        crate::types::ErrorCode::NotFound,
+                        format!("poll group '{name}' not found"),
+                    )
+                })?
             } else {
-                return Err(anyhow::anyhow!("missing poll_group_id or poll_group"));
+                return Err(crate::types::coded(
+                    crate::types::ErrorCode::InvalidArgument,
+                    "missing poll_group_id or poll_group",
+                ));
             };
 
-            let period_ms = req["period_ms"]
-                .as_i64()
-                .ok_or_else(|| anyhow::anyhow!("missing period_ms"))?;
+            let period_ms = req["period_ms"].as_i64().ok_or_else(|| {
+                crate::types::coded(
+                    crate::types::ErrorCode::InvalidArgument,
+                    "missing period_ms",
+                )
+            })?;
 
             if period_ms < 50 {
                 return Ok((false, "period_ms must be at least 50".into()));
@@ -390,12 +417,12 @@ pub(super) fn execute_control(
         }
 
         "tag_import" => {
-            let plc_name = req["plc"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing plc"))?;
-            let yaml_content = req["yaml"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing yaml"))?;
+            let plc_name = req["plc"].as_str().ok_or_else(|| {
+                crate::types::coded(crate::types::ErrorCode::InvalidArgument, "missing plc")
+            })?;
+            let yaml_content = req["yaml"].as_str().ok_or_else(|| {
+                crate::types::coded(crate::types::ErrorCode::InvalidArgument, "missing yaml")
+            })?;
             let poll_group = req["poll_group"].as_str().unwrap_or("slow");
             let store_mode = req["store_mode"].as_str().unwrap_or("on_change");
             let storage_hook = req["storage_hook"].as_str().unwrap_or("on_change");
@@ -404,12 +431,18 @@ pub(super) fn execute_control(
             let set_arg = req["set"].as_str();
 
             // Validate store_mode and storage_hook
-            let _sm: StoreMode = store_mode
-                .parse()
-                .map_err(|e: String| anyhow::anyhow!("invalid store mode: {e}"))?;
-            let _sh: StorageHook = storage_hook
-                .parse()
-                .map_err(|e: String| anyhow::anyhow!("invalid storage hook: {e}"))?;
+            let _sm: StoreMode = store_mode.parse().map_err(|e: String| {
+                crate::types::coded(
+                    crate::types::ErrorCode::InvalidArgument,
+                    format!("invalid store mode: {e}"),
+                )
+            })?;
+            let _sh: StorageHook = storage_hook.parse().map_err(|e: String| {
+                crate::types::coded(
+                    crate::types::ErrorCode::InvalidArgument,
+                    format!("invalid storage hook: {e}"),
+                )
+            })?;
 
             // Resolve PLC
             let plc_id: i64 = conn
@@ -418,7 +451,12 @@ pub(super) fn execute_control(
                     rusqlite::params![plc_name],
                     |row| row.get(0),
                 )
-                .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found"))?;
+                .map_err(|_| {
+                    crate::types::coded(
+                        crate::types::ErrorCode::NotFound,
+                        format!("PLC '{plc_name}' not found"),
+                    )
+                })?;
 
             // Parse signals
             let signals = crate::cli::import::parse_signals(yaml_content)?;

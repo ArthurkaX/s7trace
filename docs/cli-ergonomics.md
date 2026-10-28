@@ -90,31 +90,22 @@ reviewable signal list.
 Address generation must remain reviewable before anything reaches a production
 PLC. Validation should use normal read-only `s7trace` reads.
 
-## Proposal 4: stable machine output
+## Proposal 4: stable machine output (implemented)
 
-`status --format json` and `sql --format jsonl` already provide structured
-output, but all commands do not yet share one stable envelope. Remote action
-commands currently print a queue line followed by a result line.
-
-A future machine mode could emit exactly one compact object containing command
-ID, terminal state, result, error class, and exit code, with diagnostics kept on
-stderr. Human output should remain the default for interactive use.
-
-## Remaining SQL caveat
-
-The local SQL path appends `LIMIT` text when it does not detect an existing
-limit. This is fragile for trailing semicolons and some `PRAGMA` statements.
-The remote endpoint applies its limit independently. A future implementation
-should limit rows without rewriting user SQL text.
+`--json` (or `S7TRACE_JSON=1`) makes every command print one compact envelope
+with the result or a stable error code, a retry hint and the queued
+`command_id`; `command-list`, `command-wait` and `command-result` work through
+`-r`, so a command that timed out can be followed remotely. `--format` is a
+closed list (`text`, `json`, `jsonl`), and logs go to stderr. Human output
+remains the default. See [`machine-output.md`](machine-output.md).
 
 ## Priority
 
 1. Declarative `set-apply` provides the largest reduction in round trips and
    configuration drift.
-2. Stable machine output improves scripting and LLM operation.
-3. Structure-aware expansion removes the most S7-specific source of human
+2. Structure-aware expansion removes the most S7-specific source of human
    address errors.
-4. Set-level cadence should follow only after its multi-set semantics are
+3. Set-level cadence should follow only after its multi-set semantics are
    explicit.
 
 See `fix.md` for resolved remote-address and `tag-enable` issues, plus the

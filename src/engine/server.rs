@@ -56,6 +56,9 @@ pub struct ServerConfig {
     pub control_window: bool,
     /// Overrun behavior: SkipMissedTicks (default) or Strict.
     pub overrun_mode: OverrunMode,
+    /// Compact the database before collection starts when retention has left
+    /// enough free space (see [`crate::engine::retention::vacuum_if_worthwhile`]).
+    pub startup_vacuum: bool,
 }
 
 /// The main s7trace server. Orchestrates all workers and pollers.
@@ -78,6 +81,7 @@ pub struct Server {
     http_bind: Option<String>,
     control_window: bool,
     overrun_mode: OverrunMode,
+    startup_vacuum: bool,
 }
 
 impl Server {
@@ -101,6 +105,7 @@ impl Server {
             http_bind: config.http_bind,
             control_window: config.control_window,
             overrun_mode: config.overrun_mode,
+            startup_vacuum: config.startup_vacuum,
         })
     }
 
@@ -159,6 +164,24 @@ impl Server {
     /// Run the server main loop. Blocks until shutdown.
     pub fn run(&mut self) -> Result<(), anyhow::Error> {
         info!("s7trace server starting");
+
+        // Before anything reads or writes: VACUUM needs the database to
+        // itself, and nothing is collecting yet to be stalled by it.
+        if self.startup_vacuum {
+            crate::engine::retention::vacuum_if_worthwhile(&self.db.lock());
+        }
+
+        // Mark the restart in event_marker (and the previous run's end, if it
+        // never got to write one), so the hole it leaves in poll_cycle is
+        // explained rather than inferred. Logged, not fatal: the markers must
+        // not keep collection from starting.
+        if let Err(e) = crate::db::lifecycle::record_server_start(
+            &self.db.lock(),
+            crate::types::now_us(),
+            crate::version::PACKAGE_VERSION,
+        ) {
+            warn!("could not record server_start: {e}");
+        }
 
         // Init PLC clients
         self.init_plc_clients()?;
@@ -390,6 +413,20 @@ impl Server {
                 })?;
         }
 
+        // History retention on its own connection and thread: a pass that
+        // works down a large backlog runs for minutes, and the monitor loop
+        // must keep supervising pollers meanwhile.
+        {
+            let db_path = self.db_path.clone();
+            let running = self.running.clone();
+            std::thread::Builder::new()
+                .name("retention".into())
+                .spawn(move || match db::schema::open(&db_path) {
+                    Ok(conn) => crate::engine::retention::retention_worker(&conn, &running),
+                    Err(e) => error!("retention: opening connection at {db_path}: {e}"),
+                })?;
+        }
+
         info!("all workers started, monitoring...");
 
         // Separate connection for the row counts below. They are full table
@@ -428,31 +465,6 @@ impl Server {
                         .query_row("SELECT COUNT(*) FROM poll_cycle", [], |r| r.get(0))
                         .unwrap_or(0);
                     self.health.set_db_totals(samples, cycles);
-                }
-            }
-
-            // Cycle retention, every 5 minutes, on the same second connection.
-            //
-            // Bounded to 20 batches a pass: at the default 10k rows that is
-            // 200k cycles per sweep, enough to work down a large backlog over a
-            // few hours without ever holding the database against the writer.
-            if tick.is_multiple_of(60) {
-                if let Some(ref c) = totals_conn {
-                    let policy = crate::engine::retention::load_policy(c);
-                    let n = policy
-                        .as_ref()
-                        .map(|p| crate::engine::retention::sweep(c, *p, now_us(), 20))
-                        .unwrap_or(0);
-                    // Span cleanup is independent of cycle retention. A user
-                    // may intentionally keep every cycle forever while still
-                    // expecting metadata orphaned by sample deletion to go.
-                    let batch_rows = policy.as_ref().map(|p| p.batch_rows).unwrap_or(10_000);
-                    let spans = crate::engine::retention::sweep_orphan_spans(c, batch_rows, 20);
-                    if n > 0 || spans > 0 {
-                        info!(
-                            "history retention: deleted {n} poll_cycle rows and {spans} orphan read_span rows"
-                        );
-                    }
                 }
             }
 
@@ -529,6 +541,11 @@ impl Server {
         // Stop all PLC actor threads (after pollers, so no in-flight reads).
         for handle in self.plcs.lock().values() {
             handle.stop();
+        }
+        if let Err(e) =
+            crate::db::lifecycle::record_server_stop(&self.db.lock(), crate::types::now_us())
+        {
+            warn!("could not record server_stop: {e}");
         }
 
         info!("s7trace server stopped");

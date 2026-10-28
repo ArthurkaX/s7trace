@@ -7,6 +7,8 @@ use tracing::info;
 const MIGRATION_0001: &str = include_str!("../../migrations/0001_initial.sql");
 /// poll_cycle retention config and the time-range indexes it needs.
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_poll_cycle_retention.sql");
+/// Daily poll_cycle summaries and dataset start/stop times.
+const MIGRATION_0003: &str = include_str!("../../migrations/0003_lifecycle_and_cycle_daily.sql");
 
 /// Embedded migrations, ordered. The first field is the schema version the
 /// migration brings the database *to*; each file ends by writing that value
@@ -18,10 +20,11 @@ const MIGRATION_0002: &str = include_str!("../../migrations/0002_poll_cycle_rete
 const EMBEDDED: &[(i64, &str, &str)] = &[
     (1, "0001_initial", MIGRATION_0001),
     (2, "0002_poll_cycle_retention", MIGRATION_0002),
+    (3, "0003_lifecycle_and_cycle_daily", MIGRATION_0003),
 ];
 
 /// Schema version this binary expects after all embedded migrations run.
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 /// Open or create the database, run pending migrations.
 pub fn open(path: &str) -> Result<Connection> {
@@ -239,7 +242,7 @@ mod tests {
         assert_eq!(schema_version(&conn), "1");
 
         apply_migrations(&conn, 1).unwrap();
-        assert_eq!(schema_version(&conn), "2");
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION.to_string());
 
         // The v2 additions are present...
         let idx: i64 = conn
@@ -272,7 +275,55 @@ mod tests {
 
         // ...and re-running the runner is a no-op rather than an error.
         // `ALTER TABLE ADD COLUMN` would fail if 0002 were applied twice.
+        apply_migrations(&conn, CURRENT_SCHEMA_VERSION).unwrap();
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn test_upgrade_to_v3_backfills_dataset_times() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        apply_migrations(&conn, 0).unwrap();
+        // Rewind to v2 by hand: drop what 0003 adds, keep the rest.
+        conn.execute_batch(
+            "DROP TABLE poll_cycle_daily;
+             UPDATE schema_meta SET value = '2' WHERE key = 'schema_version';
+             INSERT INTO plc (id, name, host) VALUES (1, 'p', 'h');
+             INSERT INTO poll_group (id, name, period_ms) VALUES (1, 'g', 100);
+             INSERT INTO tag (id, plc_id, name, address, db_num, byte_offset, byte_size,
+                              data_type, poll_group_id, created_ts, updated_ts)
+             VALUES (1, 1, 't', 'DB1.DBW0', 1, 0, 2, 'i16', 1, 0, 0);
+             INSERT INTO dataset (id, plc_id, name, state, created_ts, updated_ts)
+             VALUES (1, 1, 'old', 'stopped', 100, 100),
+                    (2, 1, 'empty', 'stopped', 200, 200),
+                    (3, 1, 'live', 'active', 300, 300);
+             INSERT INTO sample (dataset_id, tag_id, ts, vi) VALUES (1, 1, 150, 1), (1, 1, 170, 2);",
+        )
+        .unwrap();
+
         apply_migrations(&conn, 2).unwrap();
-        assert_eq!(schema_version(&conn), "2");
+        let times = |id: i64| -> (Option<i64>, Option<i64>) {
+            conn.query_row(
+                "SELECT started_ts, stopped_ts FROM dataset WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            times(1),
+            (Some(100), Some(170)),
+            "stopped at its last sample"
+        );
+        assert_eq!(
+            times(2),
+            (Some(200), Some(200)),
+            "no samples: stopped at its start"
+        );
+        assert_eq!(
+            times(3),
+            (Some(300), None),
+            "an active dataset has not stopped"
+        );
     }
 }

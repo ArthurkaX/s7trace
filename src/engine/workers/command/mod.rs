@@ -33,7 +33,7 @@ fn execute_command(
     kind: CommandKind,
     request_json: &str,
     overrun_mode: OverrunMode,
-) -> Result<(bool, String), anyhow::Error> {
+) -> Result<Settled, anyhow::Error> {
     use CommandKind::*;
 
     let req: serde_json::Value = serde_json::from_str(request_json)?;
@@ -53,10 +53,25 @@ fn execute_command(
             overrun_mode,
         );
         let out = crate::engine::ops::execute(&ctx, op)?;
-        return Ok((out.ok, out.message));
+        // Store the whole outcome as JSON, not just the message, so a remote
+        // client gets the same `data` and error `code` as a local run.
+        return Ok(if out.ok {
+            Settled {
+                ok: true,
+                payload: serde_json::json!({ "message": out.message, "data": out.data })
+                    .to_string(),
+                failure: None,
+            }
+        } else {
+            Settled {
+                ok: false,
+                failure: Some(failure_json(out.code, &out.message, &out.data)),
+                payload: out.message,
+            }
+        });
     }
 
-    match kind {
+    let (ok, payload) = match kind {
         Admin => admin::execute_admin(conn, pollers, &req),
         PlcRead => plc_read::execute_plc_read(conn, plcs, snapshot, cmd_id, &req),
         Control => control::execute_control(
@@ -74,7 +89,24 @@ fn execute_command(
             false,
             "server cannot execute SQL queries, use CLI directly".into(),
         )),
-    }
+    }?;
+    Ok(Settled {
+        ok,
+        payload,
+        failure: None,
+    })
+}
+
+/// A finished command: on success `payload` is the result JSON, on failure
+/// the error message, with `failure` holding its classified form.
+struct Settled {
+    ok: bool,
+    payload: String,
+    failure: Option<String>,
+}
+
+fn failure_json(code: Option<ErrorCode>, message: &str, data: &serde_json::Value) -> String {
+    serde_json::json!({ "code": code, "message": message, "data": data }).to_string()
 }
 
 /// Runs in a dedicated thread: claims pending commands, dispatches to
@@ -146,23 +178,32 @@ pub(crate) fn command_worker(
         };
 
         match result {
-            Ok(Ok((ok, msg))) => {
-                if ok {
-                    let conn = db.lock();
-                    if let Err(e) = db::command_queue::finish_ok(&conn, cmd.id, &msg) {
+            Ok(Ok(settled)) => {
+                let conn = db.lock();
+                if settled.ok {
+                    if let Err(e) = db::command_queue::finish_ok(&conn, cmd.id, &settled.payload) {
                         error!("cmd-worker: finish_ok id={} failed: {e}", cmd.id);
                     }
-                } else {
-                    let conn = db.lock();
-                    if let Err(e) = db::command_queue::finish_bad(&conn, cmd.id, &msg) {
-                        error!("cmd-worker: finish_bad id={} failed: {e}", cmd.id);
-                    }
+                } else if let Err(e) = db::command_queue::finish_bad_with(
+                    &conn,
+                    cmd.id,
+                    &settled.payload,
+                    settled.failure.as_deref(),
+                ) {
+                    error!("cmd-worker: finish_bad id={} failed: {e}", cmd.id);
                 }
             }
             Ok(Err(e)) => {
                 error!("cmd-worker: command id={} execution error: {e}", cmd.id);
+                let failure = error_code(&e)
+                    .map(|code| failure_json(Some(code), &e.to_string(), &serde_json::Value::Null));
                 let conn = db.lock();
-                if let Err(e2) = db::command_queue::finish_bad(&conn, cmd.id, &e.to_string()) {
+                if let Err(e2) = db::command_queue::finish_bad_with(
+                    &conn,
+                    cmd.id,
+                    &e.to_string(),
+                    failure.as_deref(),
+                ) {
                     error!("cmd-worker: finish_bad id={} failed: {e2}", cmd.id);
                 }
             }

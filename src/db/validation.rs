@@ -46,9 +46,12 @@ pub fn validate_tag(
         },
     )?;
 
-    let dt: DataType = data_type_str
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!("invalid data_type '{data_type_str}': {e}"))?;
+    let dt: DataType = data_type_str.parse().map_err(|e: String| {
+        crate::types::coded(
+            crate::types::ErrorCode::InvalidArgument,
+            format!("invalid data_type '{data_type_str}': {e}"),
+        )
+    })?;
     let bit_off = bit_offset.map(|b| b as u8);
 
     let now = now_us();
@@ -150,7 +153,12 @@ pub fn insert_tag(
             rusqlite::params![plc_name],
             |row| row.get(0),
         )
-        .map_err(|_| anyhow::anyhow!("PLC '{plc_name}' not found. Create it first."))?;
+        .map_err(|_| {
+            crate::types::coded(
+                crate::types::ErrorCode::NotFound,
+                format!("PLC '{plc_name}' not found. Create it first."),
+            )
+        })?;
 
     let poll_group_id: i64 = match conn.query_row(
         "SELECT id FROM poll_group WHERE name = ?1",
@@ -215,7 +223,15 @@ pub fn insert_tag(
             storage_hook,
             now,
         ],
-    )?;
+    )
+    .map_err(|e| match e.sqlite_error_code() {
+        // Tag names are unique per PLC: a second add is a conflict, not a fault.
+        Some(rusqlite::ErrorCode::ConstraintViolation) => crate::types::coded(
+            crate::types::ErrorCode::Conflict,
+            format!("tag '{name}' already exists on PLC '{plc_name}': {e}"),
+        ),
+        _ => e.into(),
+    })?;
     let tag_id = conn.last_insert_rowid();
 
     let set_name = metric_set.unwrap_or("default");

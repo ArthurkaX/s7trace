@@ -1,3 +1,4 @@
+use crate::cli::format::{ExportFormat, Format, RawFormat, ReadFormat};
 use crate::types::DATA_TYPE_HELP;
 /// CLI argument definitions using clap derive.
 use clap::{Parser, Subcommand};
@@ -27,6 +28,11 @@ use clap::{Parser, Subcommand};
         inspect   status  read  read-raw  sql  command-list  command-result  command-wait\n  \
         history   history-clean  history-policy  history-delete-dataset  history-vacuum\n  \
         admin     server  admin-sql  tag-revalidate\n\
+        \n\
+        MACHINE OUTPUT:\n  \
+        `--json` (or env S7TRACE_JSON=1): one JSON envelope per command with\n  \
+        error.code, error.retryable and command_id. After a timeout, follow the\n  \
+        command with `command-wait <id>` instead of resubmitting it.\n\
         \n\
         TARGETS:\n  \
         Server: `-r IP` or `-r http://IP:PORT` (or env S7TRACE_SERVER).\n  \
@@ -78,6 +84,20 @@ pub struct Cli {
     #[arg(long = "remote-timeout-ms", default_value_t = 30_000, global = true)]
     pub remote_timeout_ms: u64,
 
+    /// Machine-readable output: print exactly one JSON line on stdout,
+    /// `{"ok":true,"result":...}` or
+    /// `{"ok":false,"error":{"code":...,"message":...,"retryable":...}}`,
+    /// with `command_id` for queued commands. Takes precedence over
+    /// `--format`. Logs stay on stderr.
+    #[arg(
+        long = "json",
+        global = true,
+        env = "S7TRACE_JSON",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -100,6 +120,11 @@ pub enum Command {
         /// Use strict overrun mode: don't skip missed poll ticks (useful for commissioning).
         #[arg(long)]
         strict_overrun: bool,
+        /// Skip the startup VACUUM. By default the server compacts the
+        /// database before collection starts when at least a quarter of the
+        /// file is free space left by history retention.
+        #[arg(long)]
+        no_startup_vacuum: bool,
     },
     /// Execute a read-only SQL query through s7trace.
     Sql {
@@ -108,9 +133,10 @@ pub enum Command {
         /// Direct HTTP SQL, curl, and browser calls are forbidden.
         query: String,
 
-        /// Output format: table, json, jsonl.
-        #[arg(long = "format", default_value = "table")]
-        format: String,
+        /// Output format. `json` carries `truncated` and `limit`; `text` and
+        /// `jsonl` report truncation on stderr.
+        #[arg(long = "format", value_enum, default_value_t = Format::Text)]
+        format: Format,
 
         /// Maximum rows to return.
         #[arg(long = "limit", default_value_t = 200)]
@@ -120,6 +146,41 @@ pub enum Command {
         /// query that runs past the deadline is interrupted, not queued.
         #[arg(long = "timeout-ms", default_value_t = 5000)]
         timeout_ms: u64,
+    },
+
+    /// Export the samples of one or more tags over a time range, as JSON Lines
+    /// or CSV. Unlike `sql` it has no row cap: it reads in pages and streams,
+    /// merging the tags in timestamp order.
+    SampleExport {
+        /// Tag name or id. Repeat for several tags.
+        #[arg(long = "tag", required = true)]
+        tags: Vec<String>,
+
+        /// PLC name, when a tag name exists on several PLCs.
+        #[arg(long = "plc")]
+        plc: Option<String>,
+
+        /// Start of the range, inclusive: RFC 3339, `YYYY-MM-DD[ HH:MM[:SS]]`
+        /// (UTC), or Unix microseconds.
+        #[arg(long = "since")]
+        since: String,
+
+        /// End of the range, exclusive. Same forms as `--since`.
+        #[arg(long = "until")]
+        until: String,
+
+        /// Row encoding.
+        #[arg(long = "format", value_enum, default_value_t = ExportFormat::Jsonl)]
+        format: ExportFormat,
+
+        /// Write the rows to this file instead of stdout. Required with
+        /// `--json`, which prints a one-line summary envelope instead.
+        #[arg(long = "out")]
+        out: Option<std::path::PathBuf>,
+
+        /// Rows per request (at most 10000).
+        #[arg(long = "page-rows", default_value_t = 10000)]
+        page_rows: i64,
     },
 
     /// Execute write-capable SQL against the local database (maintenance only).
@@ -136,9 +197,9 @@ pub enum Command {
         #[arg(long = "state")]
         state: Option<String>,
 
-        /// Output format: text, json, jsonl.
-        #[arg(long = "format", default_value = "text")]
-        format: String,
+        /// Output format.
+        #[arg(long = "format", value_enum, default_value_t = Format::Text)]
+        format: Format,
     },
 
     /// Wait for a queued command to complete.
@@ -166,9 +227,9 @@ pub enum Command {
         /// Command ID.
         command_id: i64,
 
-        /// Output format: text, json, jsonl.
-        #[arg(long = "format", default_value = "text")]
-        format: String,
+        /// Output format.
+        #[arg(long = "format", value_enum, default_value_t = Format::Text)]
+        format: Format,
     },
 
     /// Validate and add a new tag.
@@ -321,9 +382,9 @@ pub enum Command {
         #[arg(long = "type", help = DATA_TYPE_HELP)]
         data_type: String,
 
-        /// Output format.
-        #[arg(long = "format", default_value = "json")]
-        format: String,
+        /// Output format (always JSON).
+        #[arg(long = "format", value_enum, default_value_t = ReadFormat::Json)]
+        format: ReadFormat,
     },
 
     /// One-off raw DB byte read for offset diagnostics.
@@ -344,9 +405,9 @@ pub enum Command {
         #[arg(long = "len", default_value_t = 32)]
         len: usize,
 
-        /// Output format: hex, json.
-        #[arg(long = "format", default_value = "hex")]
-        format: String,
+        /// Byte encoding in the JSON result.
+        #[arg(long = "format", value_enum, default_value_t = RawFormat::Hex)]
+        format: RawFormat,
 
         /// Save as a diagnostic probe.
         #[arg(long = "save-probe")]
@@ -355,9 +416,9 @@ pub enum Command {
 
     /// Runtime health, bad tags, current plans.
     Status {
-        /// Output format: text, json, jsonl.
-        #[arg(long = "format", default_value = "text")]
-        format: String,
+        /// Output format.
+        #[arg(long = "format", value_enum, default_value_t = Format::Text)]
+        format: Format,
     },
 
     /// Create a new metric set.
